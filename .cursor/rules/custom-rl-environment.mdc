@@ -1,0 +1,23 @@
+---
+description: Use Custom_RL environment and architecture during exploration and reasoning
+alwaysApply: true
+---
+
+# Custom_RL Environment Context
+
+When exploring, planning, or implementing in this project, use the Custom_RL environment as the core context for your reasoning.
+
+## Project Structure
+
+- **Environment**: `custom_rl/envs/ode_control_env.py` — generic Gymnasium env wrapping ODE plants
+- **Plants**: `custom_rl/plants/` — `ODEPlant` interface; CartPole in `cartpole.py`
+- **Rewards**: `custom_rl/rewards/` — pluggable reward functions (dense/sparse) injected via env
+- **Integration**: `custom_rl/integration/rk4.py` — RK4 ODE integrator
+- **Registration**: `custom_rl/envs/registration.py` — `register_envs()` and `CustomODECartPole-v0`
+
+## Conventions to Follow
+
+1. **Exploration**: Use this ODE control framework when considering RL or control tasks — plants, rewards, and env are modular and swappable.
+2. **Thinking**: Assume Gymnasium compatibility (reset/step API, np_random seeding, bounded spaces) and SB3 best practices (normalized action space, finite observation bounds).
+3. **Changes**: Keep plant, reward, and training logic decoupled; prefer dependency injection (e.g. `reward_fn`) over env-internal logic.
+4. **Verification**: Run `scripts/check_env.py` and `check_env(env.unwrapped)` for env compliance.
