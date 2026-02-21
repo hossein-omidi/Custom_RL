@@ -18,7 +18,7 @@ class DenseBalanceReward:
     def __init__(
         self,
         theta_scale: float = 1.0,
-        x_scale: float = 0.1,
+        x_scale: float = 0.4,
         alive_bonus: float = 1.0,
     ):
         self.theta_scale = theta_scale
