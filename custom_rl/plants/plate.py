@@ -42,7 +42,7 @@ class PlatePlant(ODEPlant):
         n_max: int = 2,
         omega_min: float = 50,
         omega_max: float = 2000.0,
-        ac_min: float = -10.0,
+        ac_min: float = 0,
         ac_max: float = 10.0,
         eta_limit: float = 0.1,
         eta_obs_limit: float = 1e6,
@@ -100,7 +100,7 @@ class PlatePlant(ODEPlant):
         )
 
         # Trajectory input
-        self.t_original = np.arange(0.0, 10.0, 0.02, dtype=np.float64)
+        self.t_original = np.arange(0.0, 20.0, 0.02, dtype=np.float64)
         self.x_traj = 0.1 * np.sin(2.0 * np.pi * 0.2 * self.t_original)
         self.y_traj = 0.1 * np.cos(2.0 * np.pi * 0.2 * self.t_original)
 

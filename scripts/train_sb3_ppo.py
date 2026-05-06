@@ -23,8 +23,8 @@ def main() -> None:
 
     parser.add_argument(
         "--reward",
-        default="dense",
-        choices=["dense", "quadratic", "sparse"],
+        default="productive",
+        choices=["dense", "productive", "quadratic", "sparse"],
         help="Reward function for the plate environment",
     )
 
