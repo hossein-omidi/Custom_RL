@@ -7,40 +7,91 @@ from typing import Any
 import gymnasium as gym
 
 from custom_rl.envs.ode_control_env import ODEControlEnv
-from custom_rl.plants.cartpole import CartPolePlant
-from custom_rl.rewards.cartpole_rewards import get_cartpole_reward
+from custom_rl.plants.plate import PlatePlant
+from custom_rl.rewards.plate_rewards import get_plate_reward
 
-# Default dirs for train/eval/plot (single source of truth)
-DEFAULT_LOG_DIR = "logs/ppo_cartpole"
-DEFAULT_MODEL_DIR = "models/ppo_cartpole"
+
+# Default dirs for train/eval/plot
+DEFAULT_LOG_DIR = "logs/ppo_plate"
+DEFAULT_MODEL_DIR = "models/ppo_plate"
 DEFAULT_TRAJ_DIR = "eval_trajectories"
 DEFAULT_PLOT_DIR = "plots"
 
 
-def make_cartpole_env(**kwargs: Any) -> ODEControlEnv:
+def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     """
-    Factory for CustomODECartPole env. Used by gymnasium.make().
+    Factory for CustomODEPlate env. Used by gymnasium.make().
 
     Kwargs:
-        reward_id: "dense" | "sparse"
-        dt: integration step size
-        n_substeps: RK4 substeps per env step
-        max_episode_steps: truncation length
-        process_noise_std: std of Gaussian noise added to state (0 = deterministic)
-        obs_noise_std: std of Gaussian noise added to observations (0 = perfect)
-        plant kwargs: mass_cart, mass_pole, length, gravity, force_max, etc.
+        reward_id: "dense" | "quadratic" | "sparse"
+
+        Environment kwargs:
+            dt
+            n_substeps
+            max_episode_steps
+            process_noise_std
+            obs_noise_std
+
+        Plant kwargs:
+            N, L1, L2, h, E, nu, rho,
+            m_max, n_max,
+            omega_min, omega_max,
+            ac_min, ac_max,
+            eta_limit, eta_obs_limit, eta_dot_obs_limit
+
+        Reward kwargs:
+            eta_weight
+            eta_dot_weight
+            action_weight
+            eta_scale
+            eta_dot_scale
+            alive_bonus
+            termination_penalty
     """
-    kwargs = dict(kwargs)  # Copy to avoid mutating caller's dict
+    kwargs = dict(kwargs)
+
     reward_id = kwargs.pop("reward_id", "dense")
-    dt = kwargs.pop("dt", 0.02)
+
+    dt = kwargs.pop("dt", 0.001)
     n_substeps = kwargs.pop("n_substeps", 1)
-    max_episode_steps = kwargs.pop("max_episode_steps", 500)
+    max_episode_steps = kwargs.pop("max_episode_steps", 10000)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
     obs_noise_std = kwargs.pop("obs_noise_std", 0.0)
 
-    plant_kwargs = {k: v for k, v in kwargs.items() if k in {"mass_cart", "mass_pole", "length", "gravity", "force_max", "x_limit", "theta_limit_rad"}}
-    plant = CartPolePlant(**plant_kwargs)
-    reward_fn = get_cartpole_reward(reward_id)
+    plant_keys = {
+        "N",
+        "L1",
+        "L2",
+        "h",
+        "E",
+        "nu",
+        "rho",
+        "m_max",
+        "n_max",
+        "omega_min",
+        "omega_max",
+        "ac_min",
+        "ac_max",
+        "eta_limit",
+        "eta_obs_limit",
+        "eta_dot_obs_limit",
+    }
+
+    reward_keys = {
+        "eta_weight",
+        "eta_dot_weight",
+        "action_weight",
+        "eta_scale",
+        "eta_dot_scale",
+        "alive_bonus",
+        "termination_penalty",
+    }
+
+    plant_kwargs = {k: v for k, v in kwargs.items() if k in plant_keys}
+    reward_kwargs = {k: v for k, v in kwargs.items() if k in reward_keys}
+
+    plant = PlatePlant(**plant_kwargs)
+    reward_fn = get_plate_reward(reward_id, **reward_kwargs)
 
     return ODEControlEnv(
         plant=plant,
@@ -54,10 +105,13 @@ def make_cartpole_env(**kwargs: Any) -> ODEControlEnv:
 
 
 def register_envs() -> None:
-    """Register all custom RL environments with Gymnasium. Call before gymnasium.make()."""
-    gym.register(
-        id="CustomODECartPole-v0",
-        entry_point="custom_rl.envs.registration:make_cartpole_env",
-        max_episode_steps=500,
-        kwargs={"reward_id": "dense"},
-    )
+    """Register custom RL environment with Gymnasium. Call before gymnasium.make()."""
+    env_id = "CustomODEPlate-v0"
+
+    if env_id not in gym.envs.registry:
+        gym.register(
+            id=env_id,
+            entry_point="custom_rl.envs.registration:make_plate_env",
+            max_episode_steps=10000,
+            kwargs={"reward_id": "dense"},
+        )
