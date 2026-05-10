@@ -44,7 +44,7 @@ class PlatePlant(ODEPlant):
         omega_max: float = 2000.0,
         ac_min: float = 0,
         ac_max: float = 10.0,
-        eta_limit: float = 0.1,
+        eta_limit: float = 0.01,
         eta_obs_limit: float = 1e6,
         eta_dot_obs_limit: float = 1e6,
     ):
