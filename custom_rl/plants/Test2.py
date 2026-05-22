@@ -560,8 +560,8 @@ def test_nonzero_cutting(plant: PlatePlant) -> dict:
     x0 = np.zeros(state_dim, dtype=np.float64)
     x0[0] = 1e-5
 
-    omega_test = 0.5 * (low[0] + high[0])
-    ac_test = min(max(2.5, low[1]), high[1])
+    omega_test = 800
+    ac_test = 14
 
     u_cut = physical_to_normalized_action(
         plant,
