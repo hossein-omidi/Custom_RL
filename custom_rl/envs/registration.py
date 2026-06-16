@@ -7,6 +7,7 @@ from typing import Any
 import gymnasium as gym
 
 from custom_rl.envs.ode_control_env import ODEControlEnv
+from custom_rl.plants import f_nonlinear2
 from custom_rl.plants.plate import PlatePlant
 from custom_rl.rewards.plate_rewards import get_plate_reward
 
@@ -64,6 +65,11 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     max_episode_steps = kwargs.pop("max_episode_steps", None)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
     obs_noise_std = kwargs.pop("obs_noise_std", 0.0)
+    integrator = kwargs.pop("integrator", "dde_rk4")
+    delay_mode = kwargs.pop("delay_mode", "constant_tau")
+
+    if delay_mode in {"constant_tau", "spindle_phase"}:
+        f_nonlinear2.DELAY_MODE = delay_mode
 
     plant_keys = {
         "N",
@@ -163,6 +169,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         max_episode_steps=max_episode_steps,
         process_noise_std=process_noise_std,
         obs_noise_std=obs_noise_std,
+        integrator=integrator,
     )
 
 

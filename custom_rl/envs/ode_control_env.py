@@ -8,8 +8,9 @@ import gymnasium as gym
 import numpy as np
 from gymnasium import spaces
 
-from custom_rl.integration.rk4 import integrate
+from custom_rl.integration import get_integrator
 from custom_rl.plants.base import ODEPlant
+from custom_rl.plants import f_nonlinear2
 
 
 def default_reward(
@@ -47,6 +48,7 @@ class ODEControlEnv(gym.Env):
         max_episode_steps: int = 500,
         process_noise_std: float = 0.0,
         obs_noise_std: float = 0.0,
+        integrator: str = "dde_rk4",
     ):
         """
         Args:
@@ -57,6 +59,7 @@ class ODEControlEnv(gym.Env):
             max_episode_steps: truncation after this many steps
             process_noise_std: std of Gaussian noise added to state after dynamics (0 = deterministic)
             obs_noise_std: std of Gaussian noise added to observations (0 = perfect observation)
+            integrator: "dde_rk4" (default) or "rk4"
         """
         super().__init__()
         self.plant = plant
@@ -67,6 +70,7 @@ class ODEControlEnv(gym.Env):
         self._step_dt = dt * n_substeps
         self.process_noise_std = process_noise_std
         self.obs_noise_std = obs_noise_std
+        self._integrate = get_integrator(integrator)
 
         # Plant provides the sensor part of the observation.
         self._sensor_observation_space = plant.get_observation_space()
@@ -113,6 +117,12 @@ class ODEControlEnv(gym.Env):
         self._step_count = 0
         self._prev_action_norm[:] = 0.0
 
+        if hasattr(self.plant, "record_modal_state"):
+            omega0 = float(self.plant._scale_action(self._prev_action_norm)[0])
+            self.plant.record_modal_state(self._t, self._state, omega=omega0)
+        else:
+            f_nonlinear2.record_modal_state(self._t, self._state)
+
         sensor_obs = self.plant.state_to_obs(self._state)
         sensor_obs = self._add_obs_noise_sensor(sensor_obs)
         sensor_obs = self._clip_sensor_obs(sensor_obs)
@@ -127,14 +137,19 @@ class ODEControlEnv(gym.Env):
         action = self._clamp_action(action)
 
         x_prev = self._state.copy()
-        self._state = integrate(
-            self.plant.dynamics,
-            self._t,
-            self._state,
-            action,
-            self.dt,
-            n_steps=self.n_substeps,
-        )
+        if hasattr(self.plant, "_modal_state_history"):
+            f_nonlinear2.bind_modal_history(self.plant._modal_state_history)
+        try:
+            self._state = self._integrate(
+                self.plant.dynamics,
+                self._t,
+                self._state,
+                action,
+                self.dt,
+                n_steps=self.n_substeps,
+            )
+        finally:
+            f_nonlinear2.unbind_modal_history()
         # Add process noise (stochastic dynamics)
         if hasattr(self.plant, "apply_process_noise"):
             self._state = self.plant.apply_process_noise(
@@ -148,6 +163,12 @@ class ODEControlEnv(gym.Env):
             )
         self._t += self._step_dt
         self._step_count += 1
+
+        if hasattr(self.plant, "record_modal_state"):
+            omega_phys = float(self.plant._scale_action(action)[0])
+            self.plant.record_modal_state(self._t, self._state, omega=omega_phys)
+        else:
+            f_nonlinear2.record_modal_state(self._t, self._state)
 
         terminated, truncated_term, term_info = self.plant.termination(
             self._t, self._state
@@ -208,19 +229,19 @@ class ODEControlEnv(gym.Env):
 
         info: dict[str, Any] = {"t": self._t, **term_info}
         # Expose sensor-level diagnostics for evaluation/plotting.
-        info["sensor_obs_norm"] = np.asarray(sensor_obs_norm, dtype=np.float64)
+        info["sensor_obs_norm"] = np.asarray(sensor_obs_norm, dtype=np.float64).copy()
         if sensor_w is not None and sensor_w_dot is not None:
-            info["sensor_w"] = np.asarray(sensor_w, dtype=np.float64)
-            info["sensor_w_dot"] = np.asarray(sensor_w_dot, dtype=np.float64)
+            info["sensor_w"] = np.asarray(sensor_w, dtype=np.float64).copy()
+            info["sensor_w_dot"] = np.asarray(sensor_w_dot, dtype=np.float64).copy()
         if action_phys is not None:
-            info["action_phys"] = np.asarray(action_phys, dtype=np.float64).reshape(-1)
+            info["action_phys"] = np.asarray(action_phys, dtype=np.float64).reshape(-1).copy()
         if hasattr(self.plant, "get_interface_metadata"):
             info["interface"] = self.plant.get_interface_metadata()
         if hasattr(self.plant, "tool_position_at"):
             x_tool, y_tool = self.plant.tool_position_at(self._t)
             info["tool_position"] = np.array([x_tool, y_tool], dtype=np.float64)
-        info["action_norm"] = np.asarray(action, dtype=np.float64)
-        info["prev_action_norm"] = np.asarray(self._prev_action_norm, dtype=np.float64)
+        info["action_norm"] = np.asarray(action, dtype=np.float64).copy()
+        info["prev_action_norm"] = np.asarray(self._prev_action_norm, dtype=np.float64).copy()
         # reward_fn may attach breakdown into reward_info["reward_components"]
         if "reward_components" in reward_info:
             info["reward_components"] = reward_info["reward_components"]

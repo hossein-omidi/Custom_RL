@@ -46,6 +46,7 @@ def load_config(name: str) -> dict[str, Any]:
     cfg["mc_dir"] = str(run_dir / "eval_mc")
     cfg["plot_dir"] = str(run_dir / "plots")
     cfg["report_dir"] = str(run_dir / "reports")
+    cfg["stability_dir"] = str(run_dir / "stability_lobes")
 
     return cfg
 

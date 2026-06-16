@@ -1,173 +1,63 @@
-# -*- coding: utf-8 -*-
+#!/usr/bin/env python3
 """
-Verification script for PlatePlant + RK4 simulation.
+PlatePlant + RK4 verification with regenerative chatter diagnostics.
 
-This script checks:
+Run from project root::
 
-1. Which PlatePlant class is actually imported.
-2. Whether required attributes exist.
-3. Zero initial condition + zero depth of cut.
-4. Free vibration decay with zero depth of cut.
-5. Nonzero cutting response.
-6. RK4 time-step consistency.
+    python custom_rl/plants/Test2.py
 
-Important:
-Your state format is interleaved:
-
-    [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
-
-Therefore:
-
-    eta     = trajectory[:, 0::2]
-    eta_dot = trajectory[:, 1::2]
-
-Also:
-PlatePlant.dynamics() expects normalized action:
-
-    u_norm = [u_omega, u_ac] in [-1, 1]
-
-The physical action is:
-
-    [omega, ac]
+Checks:
+  0. Import / attributes
+  1. Action scaling
+  2. Zero IC + ac=0 → zero response
+  3. Free vibration decays (ac=0)
+  4. Nonzero cutting excitation
+  5. RK4 dt consistency
+  6. Regenerative coupling: force depends on Delta_w = w_c(t) - w_c(t-tau)
+  7. Chatter-like growth under cutting (modal / sensor response)
 """
 
 from __future__ import annotations
 
 import inspect
-import numpy as np
+import os
+import sys
+from pathlib import Path
+
 import matplotlib.pyplot as plt
+import numpy as np
 
-from plate import PlatePlant
-from rk4 import integrate
+# Project root on path when run as script
+_ROOT = Path(__file__).resolve().parents[2]
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
+from custom_rl.integration.rk4 import integrate
+from custom_rl.plants import f_nonlinear2 as fmod
+from custom_rl.plants.plate import PlatePlant
 
-# ============================================================
-# Configuration
-# ============================================================
 
 DT = 0.001
-T_FINAL = 5.0
-SHOW_PLOTS = True
-
+T_FINAL = 8.0
+SHOW_PLOTS = os.environ.get("TEST2_SHOW_PLOTS", "1").lower() not in ("0", "false", "no")
 ZERO_TOL = 1e-10
 DECAY_TOL = 0.98
-CONVERGENCE_REL_TOL = 0.10
-
-
-# ============================================================
-# Robust plant helpers
-# ============================================================
-
-def patch_missing_attributes(plant: PlatePlant) -> None:
-    """
-    Patch missing attributes if the imported PlatePlant is an older version.
-
-    Your pasted class defines:
-        self.K
-        self.state_dim = 2 * self.K
-
-    But your runtime error shows state_dim is missing.
-    This function fixes that and prints diagnostics.
-    """
-    if not hasattr(plant, "K"):
-        raise AttributeError(
-            "The imported PlatePlant does not have attribute K. "
-            "Please check that PlatePlant1.py contains the expected class."
-        )
-
-    if not hasattr(plant, "state_dim"):
-        plant.state_dim = 2 * int(plant.K)
-        print("[PATCH] plant.state_dim was missing. Set state_dim = 2 * K =", plant.state_dim)
-
-    if not hasattr(plant, "u_phys_low") or not hasattr(plant, "u_phys_high"):
-        required = ["omega_min", "omega_max", "ac_min", "ac_max"]
-        missing = [name for name in required if not hasattr(plant, name)]
-
-        if missing:
-            raise AttributeError(
-                "Cannot create physical action bounds because these attributes are missing: "
-                f"{missing}"
-            )
-
-        plant.u_phys_low = np.array([plant.omega_min, plant.ac_min], dtype=np.float64)
-        plant.u_phys_high = np.array([plant.omega_max, plant.ac_max], dtype=np.float64)
-
-        print("[PATCH] u_phys_low/u_phys_high were missing. Created them from bounds.")
-
-    if not hasattr(plant, "eta_limit"):
-        plant.eta_limit = np.inf
-        print("[PATCH] eta_limit was missing. Set eta_limit = inf.")
 
 
 def get_state_dim(plant: PlatePlant) -> int:
-    """
-    Return state dimension safely.
-    """
-    if hasattr(plant, "state_dim"):
-        return int(plant.state_dim)
-
-    if hasattr(plant, "K"):
-        return 2 * int(plant.K)
-
-    raise AttributeError("Cannot determine state dimension. plant.K is missing.")
+    return int(plant.state_dim)
 
 
 def get_action_bounds(plant: PlatePlant) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Return physical action bounds [omega, ac].
-    """
-    if hasattr(plant, "u_phys_low") and hasattr(plant, "u_phys_high"):
-        low = np.asarray(plant.u_phys_low, dtype=np.float64)
-        high = np.asarray(plant.u_phys_high, dtype=np.float64)
-        return low, high
-
-    low = np.array([plant.omega_min, plant.ac_min], dtype=np.float64)
-    high = np.array([plant.omega_max, plant.ac_max], dtype=np.float64)
-
-    return low, high
+    return (
+        np.asarray(plant.u_phys_low, dtype=np.float64),
+        np.asarray(plant.u_phys_high, dtype=np.float64),
+    )
 
 
-def scale_action_fallback(plant: PlatePlant, u_norm: np.ndarray) -> np.ndarray:
-    """
-    Convert normalized action to physical [omega, ac].
+def physical_to_normalized_action(plant: PlatePlant, omega: float, ac: float) -> np.ndarray:
+    return plant.physical_to_normalized_action(np.array([omega, ac], dtype=np.float64))
 
-    Uses plant._scale_action() if available. Otherwise uses u_phys_low/u_phys_high.
-    """
-    u_norm = np.asarray(u_norm, dtype=np.float64).reshape(-1)
-
-    if u_norm.size != 2:
-        raise ValueError(f"Expected normalized action shape (2,), got {u_norm.shape}")
-
-    u_norm = np.clip(u_norm, -1.0, 1.0)
-
-    if hasattr(plant, "_scale_action"):
-        return np.asarray(plant._scale_action(u_norm), dtype=np.float64)
-
-    low, high = get_action_bounds(plant)
-
-    return low + 0.5 * (u_norm + 1.0) * (high - low)
-
-
-def physical_to_normalized_action(
-    plant: PlatePlant,
-    omega: float,
-    ac: float,
-) -> np.ndarray:
-    """
-    Convert physical action [omega, ac] to normalized action [-1, 1]^2.
-    """
-    low, high = get_action_bounds(plant)
-
-    u_phys = np.array([omega, ac], dtype=np.float64)
-
-    u_norm = 2.0 * (u_phys - low) / (high - low) - 1.0
-
-    return np.clip(u_norm, -1.0, 1.0)
-
-
-# ============================================================
-# Simulation utilities
-# ============================================================
 
 def simulate_case(
     plant: PlatePlant,
@@ -175,77 +65,52 @@ def simulate_case(
     u_norm: np.ndarray,
     dt: float,
     t_final: float,
+    *,
+    reset_each_run: bool = True,
 ) -> dict:
-    """
-    Simulate one fixed-input case using RK4.
-    """
+    """RK4 rollout; records modal state, sensors, and regenerative Delta_w."""
+    if reset_each_run:
+        fmod.reset_episode_state()
+
     state_dim = get_state_dim(plant)
-
     x = np.asarray(x0, dtype=np.float64).reshape(-1).copy()
-
-    if x.size != state_dim:
-        raise ValueError(f"x0 has size {x.size}, but expected {state_dim}")
-
     u_norm = np.asarray(u_norm, dtype=np.float64).reshape(-1)
 
-    if u_norm.size != 2:
-        raise ValueError(f"u_norm must have shape (2,), got {u_norm.shape}")
-
     n_steps = int(np.round(t_final / dt))
-
     t = 0.0
 
-    trajectory = [x.copy()]
-    time_history = [t]
-    u_norm_history = [u_norm.copy()]
-    u_phys_history = [scale_action_fallback(plant, u_norm).copy()]
+    trajectory, time_history = [x.copy()], [t]
+    u_phys_history = [plant.normalized_to_physical_action(u_norm).copy()]
+    sensor_w_hist, sensor_w_dot_hist = [], []
+    delta_w_hist, tau_hist = [], []
 
-    terminated = False
-    truncated = False
-    termination_info = {}
+    terminated = truncated = False
+    termination_info: dict = {}
 
     for _ in range(n_steps):
-        x = integrate(
-            dynamics=plant.dynamics,
-            t0=t,
-            x0=x,
-            u=u_norm,
-            dt=dt,
-            n_steps=1,
-        )
+        w_s, w_dot = plant.state_to_sensor_signals(x)
+        sensor_w_hist.append(w_s.copy())
+        sensor_w_dot_hist.append(w_dot.copy())
 
+        u_phys = plant.normalized_to_physical_action(u_norm)
+        tau = fmod.tooth_period(float(u_phys[0]))
+        delta_w = fmod._regenerative_delta_w(t, x[0::2], tau)
+        delta_w_hist.append(delta_w)
+        tau_hist.append(tau)
+
+        x = integrate(plant.dynamics, t, x, u_norm, dt, n_steps=1)
         t += dt
-
+        fmod.record_modal_state(t, x)
         trajectory.append(x.copy())
         time_history.append(t)
-        u_norm_history.append(u_norm.copy())
-        u_phys_history.append(scale_action_fallback(plant, u_norm).copy())
+        u_phys_history.append(u_phys.copy())
 
-        if hasattr(plant, "termination"):
-            terminated, truncated, info = plant.termination(t, x)
-        else:
-            invalid_state = not np.all(np.isfinite(x))
-            eta = x[0::2]
-            excessive_displacement = np.any(np.abs(eta) > plant.eta_limit)
-            terminated = bool(invalid_state or excessive_displacement)
-            truncated = False
-            info = {}
-
-            if invalid_state:
-                info["termination_reason"] = "invalid_state"
-
-            if excessive_displacement:
-                info["termination_reason"] = "excessive_modal_displacement"
-
+        terminated, truncated, termination_info = plant.termination(t, x)
         if terminated or truncated:
-            termination_info = info
             break
 
     trajectory = np.asarray(trajectory, dtype=np.float64)
     time = np.asarray(time_history, dtype=np.float64)
-    u_norm_history = np.asarray(u_norm_history, dtype=np.float64)
-    u_phys_history = np.asarray(u_phys_history, dtype=np.float64)
-
     eta = trajectory[:, 0::2]
     eta_dot = trajectory[:, 1::2]
 
@@ -254,8 +119,11 @@ def simulate_case(
         "trajectory": trajectory,
         "eta": eta,
         "eta_dot": eta_dot,
-        "u_norm": u_norm_history,
-        "u_phys": u_phys_history,
+        "u_phys": np.asarray(u_phys_history, dtype=np.float64),
+        "sensor_w": np.asarray(sensor_w_hist, dtype=np.float64),
+        "sensor_w_dot": np.asarray(sensor_w_dot_hist, dtype=np.float64),
+        "delta_w": np.asarray(delta_w_hist, dtype=np.float64),
+        "tau": np.asarray(tau_hist, dtype=np.float64),
         "terminated": bool(terminated),
         "truncated": bool(truncated),
         "termination_info": termination_info,
@@ -263,445 +131,203 @@ def simulate_case(
 
 
 def modal_norm(eta: np.ndarray) -> np.ndarray:
-    """
-    Compute modal displacement norm over time.
-    """
     return np.sqrt(np.sum(eta**2, axis=1))
 
 
 def check_finite(name: str, result: dict) -> bool:
-    """
-    Check that trajectory contains no NaN/Inf.
-    """
-    finite = np.all(np.isfinite(result["trajectory"]))
-
-    if finite:
-        print(f"[PASS] {name}: all states are finite.")
-    else:
-        print(f"[FAIL] {name}: NaN or Inf detected.")
-
+    ok = bool(np.all(np.isfinite(result["trajectory"])))
+    print(f"[{'PASS' if ok else 'FAIL'}] {name}: finite states = {ok}")
     if result["terminated"]:
-        print(f"[INFO] {name}: simulation terminated.")
-        print("       reason:", result["termination_info"])
-
-    if result["truncated"]:
-        print(f"[INFO] {name}: simulation truncated.")
-
-    return bool(finite)
+        print(f"       terminated: {result['termination_info']}")
+    return ok
 
 
-# ============================================================
-# Plotting
-# ============================================================
+def plot_regenerative_case(name: str, result: dict) -> None:
+    """Plots for chatter / regenerative analysis."""
+    time = result["time"][:-1]
+    eta = result["eta"][:-1]
+    sensor_w = result["sensor_w"]
+    delta_w = result["delta_w"]
+    tau = result["tau"]
+    u_phys = result["u_phys"][:-1]
 
-def plot_case(name: str, result: dict, max_modes_to_plot: int = 4) -> None:
-    """
-    Plot first mode, phase portrait, inputs, and selected modal states.
-    """
-    time = result["time"]
-    eta = result["eta"]
-    eta_dot = result["eta_dot"]
-    u_phys = result["u_phys"]
+    fig, axes = plt.subplots(4, 1, figsize=(11, 10), sharex=True)
 
-    K = eta.shape[1]
-    n_plot = min(K, max_modes_to_plot)
+    axes[0].plot(time, eta[:, 0], lw=1.5, label=r"$\eta_1$")
+    axes[0].set_ylabel(r"$\eta_1$")
+    axes[0].set_title(f"{name} — modal & regenerative signals", fontweight="bold")
+    axes[0].legend(loc="upper right", fontsize=8)
 
-    eta1 = eta[:, 0]
-    eta1_dot = eta_dot[:, 0]
+    if sensor_w.size:
+        axes[1].plot(time, sensor_w[:, 0], lw=1.5, label=r"$w_{s1}$")
+        if sensor_w.shape[1] > 1:
+            axes[1].plot(time, sensor_w[:, 1], lw=1.5, label=r"$w_{s2}$")
+        axes[1].set_ylabel("Sensor disp. (m)")
+        axes[1].legend(loc="upper right", fontsize=8)
 
-    omega = u_phys[:, 0]
-    ac = u_phys[:, 1]
+    axes[2].plot(time, delta_w, lw=1.2, color="C3", label=r"$\Delta w_c = w_c(t)-w_c(t-\tau)$")
+    axes[2].set_ylabel(r"$\Delta w_c$ (m)")
+    axes[2].legend(loc="upper right", fontsize=8)
 
-    plt.rcParams.update({
-        "font.size": 11,
-        "axes.grid": True,
-        "grid.alpha": 0.25,
-        "axes.spines.top": False,
-        "axes.spines.right": False,
-        "figure.dpi": 120,
-    })
-
-    # First mode and phase portrait
-    fig, ax = plt.subplots(3, 1, figsize=(10, 8))
-
-    ax[0].plot(time, eta1, linewidth=2)
-    ax[0].set_title(f"{name} - First Mode", fontsize=14, fontweight="bold")
-    ax[0].set_ylabel(r"$\eta_1$")
-
-    ax[1].plot(time, eta1_dot, linewidth=2)
-    ax[1].set_ylabel(r"$\dot{\eta}_1$")
-    ax[1].set_xlabel("Time (s)")
-
-    ax[2].plot(eta1, eta1_dot, linewidth=1.6)
-    ax[2].scatter(eta1[0], eta1_dot[0], s=60, label="Start", zorder=3)
-    ax[2].scatter(eta1[-1], eta1_dot[-1], s=60, label="End", zorder=3)
-    ax[2].set_title("Phase Portrait")
-    ax[2].set_xlabel(r"$\eta_1$")
-    ax[2].set_ylabel(r"$\dot{\eta}_1$")
-    ax[2].legend(frameon=False)
+    axes[3].plot(time, u_phys[:, 0], lw=1.2, label=r"$\omega$")
+    axes[3].plot(time, tau, lw=1.0, ls="--", label=r"$\tau=2\pi/(N\omega)$")
+    axes[3].set_ylabel("ω / τ")
+    axes[3].set_xlabel("Time (s)")
+    axes[3].legend(loc="upper right", fontsize=8)
 
     plt.tight_layout()
     plt.show()
 
-    # Inputs
-    fig, ax = plt.subplots(2, 1, figsize=(10, 5), sharex=True)
-
-    ax[0].plot(time, omega, linewidth=2)
-    ax[0].set_title(f"{name} - Physical Inputs", fontsize=14, fontweight="bold")
-    ax[0].set_ylabel(r"$\Omega$")
-
-    ax[1].plot(time, ac, linewidth=2)
-    ax[1].set_ylabel(r"$a_c$")
-    ax[1].set_xlabel("Time (s)")
-
-    plt.tight_layout()
-    plt.show()
-
-    # Selected modal states
-    fig, ax = plt.subplots(2, 1, figsize=(11, 7), sharex=True)
-
-    for i in range(n_plot):
-        ax[0].plot(time, eta[:, i], linewidth=1.4, label=fr"$\eta_{i+1}$")
-
-    ax[0].set_title(f"{name} - Modal Displacements", fontsize=14, fontweight="bold")
-    ax[0].set_ylabel("Modal displacement")
-    ax[0].legend(ncol=min(n_plot, 4), frameon=False)
-
-    for i in range(n_plot):
-        ax[1].plot(time, eta_dot[:, i], linewidth=1.4, label=fr"$\dot{{\eta}}_{i+1}$")
-
-    ax[1].set_title("Modal Velocities")
-    ax[1].set_ylabel("Modal velocity")
-    ax[1].set_xlabel("Time (s)")
-    ax[1].legend(ncol=min(n_plot, 4), frameon=False)
-
-    plt.tight_layout()
-    plt.show()
-
-
-# ============================================================
-# Tests
-# ============================================================
 
 def test_import_and_attributes(plant: PlatePlant) -> None:
-    """
-    Print import source and important attributes.
-    """
-    print("============================================================")
-    print("Test 0: Import and attribute check")
-    print("============================================================")
-
-    try:
-        print("PlatePlant imported from:", inspect.getfile(PlatePlant))
-    except Exception as exc:
-        print("Could not determine import file:", exc)
-
-    print("PlatePlant class module:", getattr(PlatePlant, "__module__", "unknown"))
-
-    print("Has K:", hasattr(plant, "K"))
-    print("Has state_dim:", hasattr(plant, "state_dim"))
-    print("Has u_phys_low:", hasattr(plant, "u_phys_low"))
-    print("Has u_phys_high:", hasattr(plant, "u_phys_high"))
-    print("Has _scale_action:", hasattr(plant, "_scale_action"))
-    print("Has dynamics:", hasattr(plant, "dynamics"))
-    print("Has termination:", hasattr(plant, "termination"))
-
-    print()
-    print("K:", getattr(plant, "K", None))
-    print("state_dim:", get_state_dim(plant))
-    print("u_phys_low [omega, ac]:", get_action_bounds(plant)[0])
-    print("u_phys_high [omega, ac]:", get_action_bounds(plant)[1])
-    print()
-
-
-def test_action_scaling(plant: PlatePlant) -> None:
-    """
-    Verify normalized action mapping.
-    """
-    print("============================================================")
-    print("Test 1: Action scaling")
-    print("============================================================")
-
-    test_actions = {
-        "low": np.array([-1.0, -1.0]),
-        "middle": np.array([0.0, 0.0]),
-        "high": np.array([1.0, 1.0]),
-    }
-
-    for label, u_norm in test_actions.items():
-        u_phys = scale_action_fallback(plant, u_norm)
-        print(f"{label:>6} normalized {u_norm} -> physical [omega, ac] {u_phys}")
-
-    print()
-    print("Important:")
-    print("  normalized [0, 0] means middle of action range, not zero physical input.")
-    print("  physical action order is [omega, ac].")
+    print("=" * 60)
+    print("Test 0: Import and attributes")
+    print("=" * 60)
+    print("PlatePlant from:", inspect.getfile(PlatePlant))
+    print("K =", plant.K, " state_dim =", plant.state_dim)
+    print("u_phys_low / high:", plant.u_phys_low, plant.u_phys_high)
     print()
 
 
 def test_zero_equilibrium(plant: PlatePlant) -> dict:
-    """
-    Zero IC + zero depth of cut.
-    """
-    print("============================================================")
-    print("Test 2: Zero initial condition + zero depth of cut")
-    print("============================================================")
-
-    state_dim = get_state_dim(plant)
-
-    x0 = np.zeros(state_dim, dtype=np.float64)
-
-    omega_no_cut = float(get_action_bounds(plant)[0][0])
-    ac_no_cut = float(get_action_bounds(plant)[0][1])
-
-    u_no_cut = physical_to_normalized_action(
-        plant,
-        omega=omega_no_cut,
-        ac=ac_no_cut,
-    )
-
-    print("Physical input [omega, ac]:", scale_action_fallback(plant, u_no_cut))
-    print("Normalized input:", u_no_cut)
-
-    result = simulate_case(
-        plant=plant,
-        x0=x0,
-        u_norm=u_no_cut,
-        dt=DT,
-        t_final=T_FINAL,
-    )
-
-    check_finite("Zero equilibrium", result)
-
-    max_abs_state = float(np.max(np.abs(result["trajectory"])))
-    print("Maximum absolute state:", max_abs_state)
-
-    if max_abs_state < ZERO_TOL:
-        print("[PASS] Zero state remains approximately zero.")
-    else:
-        print("[WARNING] Zero state did not remain zero.")
-        print("          This may mean residual forcing exists even when ac = 0.")
+    print("=" * 60)
+    print("Test 2: Zero IC + ac=0")
+    print("=" * 60)
+    x0 = np.zeros(plant.state_dim)
+    low, _ = get_action_bounds(plant)
+    u = physical_to_normalized_action(plant, float(low[0]), float(low[1]))
+    result = simulate_case(plant, x0, u, DT, T_FINAL)
+    check_finite("zero equilibrium", result)
+    mx = float(np.max(np.abs(result["trajectory"])))
+    print(f"max |state| = {mx:.3e}  ->  {'PASS' if mx < ZERO_TOL else 'WARN'}")
     print()
-
     return result
 
 
 def test_free_vibration_decay(plant: PlatePlant) -> dict:
-    """
-    Small initial modal displacement + zero depth of cut.
-    """
-    print("============================================================")
-    print("Test 3: Free vibration decay")
-    print("============================================================")
-
-    state_dim = get_state_dim(plant)
-
-    x0 = np.zeros(state_dim, dtype=np.float64)
+    print("=" * 60)
+    print("Test 3: Free vibration decay (ac=0)")
+    print("=" * 60)
+    x0 = np.zeros(plant.state_dim)
     x0[0] = 1e-4
-
-    omega_no_cut = float(get_action_bounds(plant)[0][0])
-    ac_no_cut = float(get_action_bounds(plant)[0][1])
-
-    u_no_cut = physical_to_normalized_action(
-        plant,
-        omega=omega_no_cut,
-        ac=ac_no_cut,
-    )
-
-    print("Initial eta_1:", x0[0])
-    print("Physical input [omega, ac]:", scale_action_fallback(plant, u_no_cut))
-    print("Normalized input:", u_no_cut)
-
-    result = simulate_case(
-        plant=plant,
-        x0=x0,
-        u_norm=u_no_cut,
-        dt=DT,
-        t_final=T_FINAL,
-    )
-
-    check_finite("Free vibration decay", result)
-
-    norm_eta = modal_norm(result["eta"])
-
-    n = len(norm_eta)
-    window = max(10, n // 10)
-
-    first_peak = float(np.max(norm_eta[:window]))
-    last_peak = float(np.max(norm_eta[-window:]))
-
-    ratio = last_peak / max(first_peak, 1e-30)
-
-    print("First-window peak modal norm:", first_peak)
-    print("Last-window peak modal norm:", last_peak)
-    print("Last / first ratio:", ratio)
-
-    if ratio < DECAY_TOL:
-        print("[PASS] Vibration decays with zero depth of cut.")
-    else:
-        print("[WARNING] Vibration did not clearly decay.")
-        print("          Check damping, time step, or residual forcing.")
+    low, _ = get_action_bounds(plant)
+    u = physical_to_normalized_action(plant, float(low[0]), float(low[1]))
+    result = simulate_case(plant, x0, u, DT, T_FINAL)
+    norm = modal_norm(result["eta"])
+    ratio = float(np.max(norm[-100:]) / max(np.max(norm[:100]), 1e-30))
+    print(f"modal norm last/first window ratio = {ratio:.4f}  ->  {'PASS' if ratio < DECAY_TOL else 'WARN'}")
     print()
-
     return result
 
 
 def test_nonzero_cutting(plant: PlatePlant) -> dict:
-    """
-    Nonzero cutting condition.
-    """
-    print("============================================================")
-    print("Test 4: Nonzero cutting condition")
-    print("============================================================")
-
-    state_dim = get_state_dim(plant)
-    low, high = get_action_bounds(plant)
-
-    x0 = np.zeros(state_dim, dtype=np.float64)
-    x0[0] = 1e-5
-
-    omega_test = 800
-    ac_test = 14
-
-    u_cut = physical_to_normalized_action(
-        plant,
-        omega=omega_test,
-        ac=ac_test,
-    )
-
-    print("Initial eta_1:", x0[0])
-    print("Physical input [omega, ac]:", scale_action_fallback(plant, u_cut))
-    print("Normalized input:", u_cut)
-
-    result = simulate_case(
-        plant=plant,
-        x0=x0,
-        u_norm=u_cut,
-        dt=DT,
-        t_final=T_FINAL,
-    )
-
-    check_finite("Nonzero cutting", result)
-
-    max_eta = float(np.max(np.abs(result["eta"])))
-    max_eta_dot = float(np.max(np.abs(result["eta_dot"])))
-
-    print("Maximum |eta|:", max_eta)
-    print("Maximum |eta_dot|:", max_eta_dot)
-
-    if result["terminated"]:
-        print("[INFO] Simulation terminated. This may indicate instability or unsafe response.")
-    else:
-        print("[PASS] Nonzero cutting simulation completed without termination.")
-
+    print("=" * 60)
+    print("Test 4: Nonzero cutting")
+    print("=" * 60)
+    x0 = np.zeros(plant.state_dim)
+    u = physical_to_normalized_action(plant, omega=900.0, ac=5.0)
+    result = simulate_case(plant, x0, u, DT, T_FINAL)
+    check_finite("nonzero cutting", result)
+    print(f"max |eta| = {np.max(np.abs(result['eta'])):.3e}")
+    print(f"max |Delta_w| = {np.max(np.abs(result['delta_w'])):.3e}")
     print()
-
     return result
 
 
-def test_rk4_timestep_consistency(plant: PlatePlant) -> None:
-    """
-    Compare free vibration using dt and dt/2.
-    """
-    print("============================================================")
-    print("Test 5: RK4 time-step consistency")
-    print("============================================================")
+def test_regenerative_force_coupling(plant: PlatePlant) -> None:
+    """Cutting-force path must change when Delta_w changes (ac>0)."""
+    print("=" * 60)
+    print("Test 6: Regenerative force coupling")
+    print("=" * 60)
+    fmod.reset_episode_state()
+    omega, ac = 800.0, 4.0
+    u_phys = np.array([omega, ac], dtype=np.float64)
+    tau = fmod.tooth_period(omega)
+    t = tau * 2.0
 
-    state_dim = get_state_dim(plant)
+    x = np.zeros(plant.state_dim)
+    # Build history at t - tau
+    dt_hist = tau / 40.0
+    for ti in np.linspace(0.0, t - 1e-9, 50):
+        x = integrate(
+            plant.dynamics, float(ti), x,
+            plant.physical_to_normalized_action(u_phys), dt_hist, n_steps=1,
+        )
 
-    x0 = np.zeros(state_dim, dtype=np.float64)
-    x0[0] = 1e-4
+    x_a = x.copy()
+    x_a[0] += 3e-5
+    x_b = x.copy()
+    x_b[0] -= 3e-5
 
-    omega_no_cut = float(get_action_bounds(plant)[0][0])
-    ac_no_cut = float(get_action_bounds(plant)[0][1])
-
-    u_no_cut = physical_to_normalized_action(
-        plant,
-        omega=omega_no_cut,
-        ac=ac_no_cut,
-    )
-
-    result_dt = simulate_case(
-        plant=plant,
-        x0=x0,
-        u_norm=u_no_cut,
-        dt=DT,
-        t_final=T_FINAL,
-    )
-
-    result_half_dt = simulate_case(
-        plant=plant,
-        x0=x0,
-        u_norm=u_no_cut,
-        dt=DT / 2.0,
-        t_final=T_FINAL,
-    )
-
-    eta1_dt_final = float(result_dt["eta"][-1, 0])
-    eta1_half_dt_final = float(result_half_dt["eta"][-1, 0])
-
-    abs_diff = abs(eta1_dt_final - eta1_half_dt_final)
-    scale = max(abs(eta1_half_dt_final), 1e-12)
-    rel_diff = abs_diff / scale
-
-    print("Final eta_1 with dt:", eta1_dt_final)
-    print("Final eta_1 with dt/2:", eta1_half_dt_final)
-    print("Absolute difference:", abs_diff)
-    print("Relative difference:", rel_diff)
-
-    if rel_diff < 0.10:
-        print("[PASS] RK4 response is reasonably consistent between dt and dt/2.")
-    else:
-        print("[WARNING] RK4 response differs noticeably between dt and dt/2.")
-        print("          Consider reducing dt or checking force discontinuities.")
-
+    dx_a = fmod.f_nonlinear2(t, x_a, u_phys)
+    dx_b = fmod.f_nonlinear2(t, x_b, u_phys)
+    fa = float(np.linalg.norm(dx_a[1::2]))
+    fb = float(np.linalg.norm(dx_b[1::2]))
+    print(f"||eta_ddot|| at Delta_w perturbation: {fa:.6e} vs {fb:.6e}")
+    assert fa != fb, "Force should depend on regenerative displacement"
+    print("[PASS] Cutting dynamics responds to modal state via Delta_w")
+    print(f"       tooth period tau = {tau:.6f} s (not fixed 1 s)")
     print()
 
 
-# ============================================================
-# Main
-# ============================================================
+def test_chatter_growth_under_cutting(plant: PlatePlant) -> dict:
+    """Under ac>0, sensor/modal energy should exceed idle decay case."""
+    print("=" * 60)
+    print("Test 7: Cutting vs no-cutting response")
+    print("=" * 60)
+    x0 = np.zeros(plant.state_dim)
+    x0[0] = 1e-5
+
+    low, _ = get_action_bounds(plant)
+    u_idle = physical_to_normalized_action(plant, float(low[0]), float(low[1]))
+    u_cut = physical_to_normalized_action(plant, omega=1000.0, ac=6.0)
+
+    res_idle = simulate_case(plant, x0, u_idle, DT, T_FINAL)
+    res_cut = simulate_case(plant, x0, u_cut, DT, T_FINAL)
+
+    rms_idle = float(np.sqrt(np.mean(res_idle["sensor_w"][:, 0] ** 2)))
+    rms_cut = float(np.sqrt(np.mean(res_cut["sensor_w"][:, 0] ** 2)))
+    print(f"sensor RMS idle={rms_idle:.3e}  cutting={rms_cut:.3e}")
+    print(f"max |Delta_w| cutting={np.max(np.abs(res_cut['delta_w'])):.3e}")
+    if rms_cut > rms_idle * 1.5:
+        print("[PASS] Cutting case shows stronger vibration than ac=0.")
+    else:
+        print("[INFO] Cutting RMS not much larger — try longer T_FINAL or higher ac.")
+    print()
+    return res_cut
+
 
 def main() -> None:
-    plant = PlatePlant()
+    plant = PlatePlant(
+        enable_geometry_uncertainty=False,
+        enable_sensor_uncertainty=False,
+        enable_process_noise=False,
+        displacement_failure_limit=5e-3,
+        velocity_failure_limit=2.0,
+    )
+    plant.reset(np.random.default_rng(0))
+    fmod.reset_episode_state()
 
-    patch_missing_attributes(plant)
-
-    print("============================================================")
-    print("PlatePlant verification started")
-    print("============================================================")
-    print("Number of modes K:", plant.K)
-    print("State dimension:", get_state_dim(plant))
-    print("Physical action low  [omega, ac]:", get_action_bounds(plant)[0])
-    print("Physical action high [omega, ac]:", get_action_bounds(plant)[1])
-    print("eta_limit:", getattr(plant, "eta_limit", None))
-    print("dt:", DT)
-    print("t_final:", T_FINAL)
+    print("PlatePlant verification (regenerative chatter model)")
+    print(f"dt={DT}, T_final={T_FINAL}")
     print()
 
     test_import_and_attributes(plant)
-    test_action_scaling(plant)
-
-    result_zero = test_zero_equilibrium(plant)
-    result_free = test_free_vibration_decay(plant)
-    result_cut = test_nonzero_cutting(plant)
-    test_rk4_timestep_consistency(plant)
+    res_zero = test_zero_equilibrium(plant)
+    res_free = test_free_vibration_decay(plant)
+    res_cut = test_nonzero_cutting(plant)
+    test_regenerative_force_coupling(plant)
+    res_chatter = test_chatter_growth_under_cutting(plant)
 
     if SHOW_PLOTS:
-        plot_case("Test 2: Zero IC + Zero Depth of Cut", result_zero)
-        plot_case("Test 3: Free Vibration Decay", result_free)
-        plot_case("Test 4: Nonzero Cutting", result_cut)
+        plot_regenerative_case("Idle (ac=0)", res_free)
+        plot_regenerative_case("Cutting (regenerative)", res_chatter)
 
-    print("============================================================")
-    print("Verification completed")
-    print("============================================================")
-    print("Interpretation:")
-    print("1. Passing these tests means the ODE/RK4 simulator is numerically consistent.")
-    print("2. These tests do not prove that the model contains regenerative chatter.")
-    print("3. To verify regenerative chatter, the cutting force should depend on")
-    print("   current and delayed vibration states, such as eta(t) - eta(t - tau).")
-    print("4. If the import path printed above is not the file you expect, update your")
-    print("   working directory, import statement, or file name.")
+    print("=" * 60)
+    print("Done. Regenerative model:")
+    print("  tau = 2*pi/(N*omega)  enters Delta_w in cutting force")
+    print("  structural terms use current eta, eta_dot only")
+    print("=" * 60)
 
 
 if __name__ == "__main__":

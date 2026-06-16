@@ -44,7 +44,7 @@ class PlatePlant(ODEPlant):
         η̈_k + 2ζ_k ω_k η̇_k + ω_k² η_k + λ_k η_k³ = F_k(t)
 
     Cutting force projection (moving tool on plate surface):
-        F_k(t) = W_k(x_tool(t), y_tool(t)) / M_modal · F_normal(t; ω, a_c, path)
+        F_k(t) = W_k(x_tool(t), y_tool(t)) / M_modal · F_scalar(t; ω, a_c, path, Δw)
 
     **Physical sensor model (agent-facing)**
 
@@ -281,6 +281,7 @@ class PlatePlant(ODEPlant):
         self.t_original = np.array([0.0], dtype=np.float64)
         self.x_traj = np.array([0.0], dtype=np.float64)
         self.y_traj = np.array([0.0], dtype=np.float64)
+        self._modal_state_history: list[tuple[float, np.ndarray]] = []
 
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
@@ -444,7 +445,7 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.t_original = self.t_original
         f_nonlinear2.x_traj = self.x_traj
         f_nonlinear2.y_traj = self.y_traj
-        f_nonlinear2.reset_episode_state()
+        f_nonlinear2.reset_episode_state(self._modal_state_history)
 
         return {
             "pass_line_index": self.current_pass_line_index,
@@ -561,6 +562,17 @@ class PlatePlant(ODEPlant):
         y_c = float(np.interp(float(t), self.t_original, self.y_traj))
         return x_c, y_c
 
+    def record_modal_state(
+        self,
+        t: float,
+        x: np.ndarray,
+        omega: float | None = None,
+    ) -> None:
+        """Store accepted modal state and spindle speed for regenerative delay."""
+        f_nonlinear2.record_modal_state(t, x, history=self._modal_state_history)
+        if omega is not None:
+            f_nonlinear2.record_omega(t, float(omega))
+
     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
         State derivative: dx/dt = dynamics(t, x, u).
@@ -578,7 +590,11 @@ class PlatePlant(ODEPlant):
 
         u_phys = self._scale_action(u)
 
-        x_dot = f_nonlinear2.f_nonlinear2(t, x, u_phys)
+        f_nonlinear2.bind_modal_history(self._modal_state_history)
+        try:
+            x_dot = f_nonlinear2.f_nonlinear2(t, x, u_phys)
+        finally:
+            f_nonlinear2.unbind_modal_history()
         x_dot = np.asarray(x_dot, dtype=np.float64).reshape(-1)
 
         if x_dot.size != self.state_dim:

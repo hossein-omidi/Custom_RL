@@ -41,6 +41,15 @@ from scripts.plot_results import plot_learning_curve, plot_mc_research_suite, pl
 ENV_ID = "CustomODEPlate-v0"
 
 
+def _validate_model_env(model: PPO, env: gym.Env, model_path: Path) -> None:
+    if tuple(model.observation_space.shape) != tuple(env.observation_space.shape):
+        raise ValueError(
+            f"Checkpoint {model_path} expects obs {model.observation_space.shape}, "
+            f"env provides {env.observation_space.shape}. "
+            "Retrain with: python training.py --config <name>"
+        )
+
+
 def _build_env_kwargs(cfg: dict) -> dict:
     env_kwargs = dict(cfg["env"])
     env_kwargs.update(cfg["reward"])
@@ -140,6 +149,7 @@ def run_trajectory_eval(cfg: dict, selections: list) -> None:
         print(f"[trajectories] seed {seed} ← {model_path} ({sel.source})")
         model = PPO.load(str(model_path), device="cpu")
         env = gym.make(ENV_ID, **env_kwargs)
+        _validate_model_env(model, env, model_path)
         metadata = _get_metadata(env, cfg, str(model_path), sel.source)
 
         trajectories = []
@@ -275,6 +285,7 @@ def run_monte_carlo(cfg: dict, selections: list) -> None:
         print(f"[monte_carlo] seed {seed}, {n_rollouts} rollouts ← {model_path}")
         model = PPO.load(str(model_path), device="cpu")
         env = gym.make(ENV_ID, **env_kwargs)
+        _validate_model_env(model, env, model_path)
         max_steps = int(env.unwrapped.max_episode_steps)
 
         episodes = [

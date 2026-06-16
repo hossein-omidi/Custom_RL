@@ -16,6 +16,7 @@ def make_config(
     reward: dict[str, Any],
     train: dict[str, Any] | None = None,
     eval_cfg: dict[str, Any] | None = None,
+    stability_lobe: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """
     Build a full CONFIG dict with standard directory layout under runs/<name>/.
@@ -52,6 +53,20 @@ def make_config(
     }
     default_eval.update(eval_cfg)
 
+    default_stability = {
+        "omega_grid": [300.0, 600.0, 900.0, 1200.0, 1500.0, 1800.0],
+        "ac_grid": [0.5, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0],
+        "n_rollouts": 5,
+        "seeds": list(seeds),
+        "horizon_steps": 120,
+        "transient_fraction": 0.25,
+        "unstable_threshold": 0.5,
+        "rms_unstable_factor": 3.0,
+        "controller_modes": ["uncontrolled"],
+    }
+    if stability_lobe:
+        default_stability.update(stability_lobe)
+
     return {
         "config_name": name,
         "description": description,
@@ -63,4 +78,5 @@ def make_config(
         "reward": dict(reward),
         "train": default_train,
         "eval": default_eval,
+        "stability_lobe": default_stability,
     }
