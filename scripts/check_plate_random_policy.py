@@ -37,8 +37,22 @@ def main() -> None:
     print("Environment created successfully.")
     print("Observation space:", env.observation_space)
     print("Action space:", env.action_space)
+    plant = env.unwrapped.plant
+    expected_obs_dim = 2 * plant.n_sensors + 2
+
     print("Initial observation shape:", obs.shape)
+    print("Expected sensor-based observation dim:", expected_obs_dim)
+    print("Internal modal state dim (not exposed):", plant.state_dim)
+    print("Pass line index:", info.get("pass_line_index"))
+    print("Pass x (m):", info.get("pass_x"))
+    print("Pass duration (s):", info.get("pass_duration"))
+    print("Auto max episode steps:", env.unwrapped.max_episode_steps)
     print("Initial info:", info)
+
+    assert obs.shape == (expected_obs_dim,), (
+        f"Observation must be sensor-based with prev action, got {obs.shape}."
+    )
+    assert obs.shape != (plant.state_dim,), "PPO observation must not expose raw modal state."
 
     assert env.observation_space.contains(obs), (
         "Initial observation is outside observation_space."

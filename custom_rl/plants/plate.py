@@ -12,21 +12,55 @@ from custom_rl.plants import f_nonlinear2
 from custom_rl.plants.compute_mode_shapes import compute_mode_shapes
 from custom_rl.plants.compute_natural_frequencies import compute_natural_frequencies
 from custom_rl.plants.compute_nonlinear_stiffness import compute_nonlinear_stiffness
+from custom_rl.plants.mode_ordering import (
+    build_sensor_displacement_matrix,
+    flatten_mode_matrix,
+    mode_index_map,
+)
+from custom_rl.plants.pass_schedule import (
+    build_straight_pass_trajectory,
+    pass_line_x_positions,
+)
+from custom_rl.plants.stochasticity import (
+    GeometryNominal,
+    GeometryUncertaintyConfig,
+    ProcessNoiseConfig,
+    SensorUncertaintyConfig,
+    absolute_to_relative_sensor_coords,
+    build_process_noise_vector,
+    process_noise_info,
+    sample_episode_geometry,
+    sample_sensor_coords,
+)
 
 
 class PlatePlant(ODEPlant):
     """
-    Nonlinear plate vibration plant.
+    Nonlinear plate vibration plant for milling chatter RL.
 
-    State:
-        [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+    **Internal dynamics (modal, hidden from agent)**
 
-    Normalized action:
-        u = [u_omega, u_ac], each in [-1, 1]
+    For each mode k:
+        η̈_k + 2ζ_k ω_k η̇_k + ω_k² η_k + λ_k η_k³ = F_k(t)
 
-    Physical action passed to f_nonlinear2:
-        omega in [omega_min, omega_max]
-        ac    in [ac_min, ac_max]
+    Cutting force projection (moving tool on plate surface):
+        F_k(t) = W_k(x_tool(t), y_tool(t)) / M_modal · F_normal(t; ω, a_c, path)
+
+    **Physical sensor model (agent-facing)**
+
+        w_s(t)     = Σ_k W_k(x_s, y_s) η_k(t)  = S_disp @ η
+        ẇ_s(t)     = S_disp @ η̇
+
+    **Normalization**
+
+        w_s_norm     = w_s / disp_norm_scale
+        ẇ_s_norm     = ẇ_s / vel_norm_scale
+        u_phys       = u_low + 0.5(u_norm + 1)(u_high - u_low)
+
+    **PPO interface**
+
+        Observation: [w_s_norm..., ẇ_s_norm..., prev_u_ω, prev_u_ac]
+        Action:      [u_ω, u_ac] ∈ [-1, 1]²
     """
 
     def __init__(
@@ -44,9 +78,34 @@ class PlatePlant(ODEPlant):
         omega_max: float = 2000.0,
         ac_min: float = 0,
         ac_max: float = 10.0,
+        # Legacy modal safety (optional internal numerical guard)
         eta_limit: float = 0.01,
-        eta_obs_limit: float = 1e6,
-        eta_dot_obs_limit: float = 1e6,
+        eta_dot_limit: float = 1.0,
+        eta_obs_limit: float = 1e6,  # unused for the PPO observation now
+        eta_dot_obs_limit: float = 1e6,  # unused for the PPO observation now
+        use_eta_internal_safety: bool = False,
+        # Sensor model configuration
+        sensor_coords: list[tuple[float, float]] | None = None,
+        disp_norm_scale: float = 1e-3,
+        vel_norm_scale: float = 1e-2,
+        obs_clip: float | None = 10.0,
+        displacement_failure_limit: float = 1e-3,
+        velocity_failure_limit: float = 0.5,
+        # Straight-line full-surface pass schedule (one pass per RL episode)
+        n_pass_lines: int = 100,
+        pass_margin: float = 0.01,
+        feed_speed: float = 0.05,
+        traj_dt: float = 0.02,
+        pass_sampling: str = "random",
+        pass_complete_tolerance: float = 1e-6,
+        # Structured uncertainty (see custom_rl.plants.stochasticity)
+        enable_geometry_uncertainty: bool = True,
+        enable_sensor_uncertainty: bool = True,
+        enable_process_noise: bool = True,
+        geometry_uncertainty: GeometryUncertaintyConfig | None = None,
+        sensor_uncertainty: SensorUncertaintyConfig | None = None,
+        process_noise: ProcessNoiseConfig | None = None,
+        sensor_coords_relative: list[tuple[float, float]] | None = None,
     ):
         """
         Args:
@@ -63,18 +122,86 @@ class PlatePlant(ODEPlant):
             omega_max: maximum physical spindle/angular input
             ac_min: minimum physical control coefficient/input
             ac_max: maximum physical control coefficient/input
-            eta_limit: modal displacement safety limit for termination
-            eta_obs_limit: observation bound for modal displacement
-            eta_dot_obs_limit: observation bound for modal velocity
+            eta_limit: optional internal modal safety limit (not used for main termination)
+            eta_obs_limit: legacy unused observation bound
+            eta_dot_obs_limit: legacy unused observation bound
+            use_eta_internal_safety: if True, also terminate on |eta_k| > eta_limit
+            sensor_coords: list of (x_s, y_s) sensor positions in the plate plane
+            disp_norm_scale: normalization scale for sensor displacement in obs/reward
+            vel_norm_scale: normalization scale for sensor velocity in obs/reward
+            obs_clip: clip normalized sensor obs to [-obs_clip, obs_clip] (None disables)
+            displacement_failure_limit: physical termination limit on |w_sensors| (m)
+            velocity_failure_limit: physical termination limit on |w_dot_sensors| (m/s)
+            n_pass_lines: number of parallel straight passes across plate width
+            pass_margin: edge margin for pass-line x grid (m)
+            feed_speed: tool feed along pass from upper to lower edge (m/s)
+            traj_dt: sampling period for reference tool trajectory (s)
+            pass_sampling: "random" or "sequential" pass-line selection each reset
+            pass_complete_tolerance: time tolerance for pass-completion truncation (s)
+            enable_geometry_uncertainty: sample L1,L2,h,E,rho once per episode
+            enable_sensor_uncertainty: jitter sensor relative positions each reset
+            enable_process_noise: diagonal modal noise after RK4 (unmodeled disturbance)
+            geometry_uncertainty: optional GeometryUncertaintyConfig override
+            sensor_uncertainty: optional SensorUncertaintyConfig override
+            process_noise: optional ProcessNoiseConfig override
+            sensor_coords_relative: optional (x/L1, y/L2) nominal sensor layout
         """
         self.N = N
-        self.L1 = L1
-        self.L2 = L2
-        self.h = h
 
-        self.E = E
-        self.nu = nu
-        self.rho = rho
+        self._geometry_nominal = GeometryNominal(
+            L1=float(L1),
+            L2=float(L2),
+            h=float(h),
+            E=float(E),
+            nu=float(nu),
+            rho=float(rho),
+        )
+
+        geom_cfg = geometry_uncertainty or GeometryUncertaintyConfig()
+        self.geometry_uncertainty = GeometryUncertaintyConfig(
+            enable=bool(enable_geometry_uncertainty and geom_cfg.enable),
+            rel_std_L1=geom_cfg.rel_std_L1,
+            rel_std_L2=geom_cfg.rel_std_L2,
+            rel_std_h=geom_cfg.rel_std_h,
+            rel_std_E=geom_cfg.rel_std_E,
+            rel_std_rho=geom_cfg.rel_std_rho,
+            max_rel_deviation=geom_cfg.max_rel_deviation,
+        )
+
+        if sensor_coords_relative is not None:
+            rel_positions = tuple(
+                (float(x), float(y)) for x, y in sensor_coords_relative
+            )
+        elif sensor_coords is not None:
+            coords_tmp = np.asarray(sensor_coords, dtype=np.float64)
+            rel_positions = absolute_to_relative_sensor_coords(
+                coords_tmp, L1, L2
+            )
+        else:
+            rel_positions = SensorUncertaintyConfig().rel_positions
+
+        sensor_cfg = sensor_uncertainty or SensorUncertaintyConfig()
+        self.sensor_uncertainty = SensorUncertaintyConfig(
+            enable=bool(enable_sensor_uncertainty and sensor_cfg.enable),
+            rel_positions=rel_positions,
+            rel_jitter_std=sensor_cfg.rel_jitter_std,
+            edge_margin_frac=sensor_cfg.edge_margin_frac,
+        )
+
+        proc_cfg = process_noise or ProcessNoiseConfig()
+        self.process_noise = ProcessNoiseConfig(
+            enable=bool(enable_process_noise and proc_cfg.enable),
+            eta_std_per_sqrt_s=proc_cfg.eta_std_per_sqrt_s,
+            eta_dot_std_per_sqrt_s=proc_cfg.eta_dot_std_per_sqrt_s,
+            clip_sigma=proc_cfg.clip_sigma,
+        )
+
+        self.L1 = float(L1)
+        self.L2 = float(L2)
+        self.h = float(h)
+        self.E = float(E)
+        self.nu = float(nu)
+        self.rho = float(rho)
 
         self.m_max = m_max
         self.n_max = n_max
@@ -87,8 +214,73 @@ class PlatePlant(ODEPlant):
         self.ac_max = ac_max
 
         self.eta_limit = eta_limit
+        self.eta_dot_limit = float(eta_dot_limit)
+        self.use_eta_internal_safety = bool(use_eta_internal_safety)
         self.eta_obs_limit = eta_obs_limit
         self.eta_dot_obs_limit = eta_dot_obs_limit
+
+        if sensor_coords is not None:
+            coords = np.asarray(sensor_coords, dtype=np.float64)
+            if coords.ndim != 2 or coords.shape[1] != 2:
+                raise ValueError(
+                    f"sensor_coords must have shape (n_sensors, 2), got {coords.shape}."
+                )
+            if np.any(coords[:, 0] < 0.0) or np.any(coords[:, 0] > self.L1):
+                raise ValueError("All sensor x-coordinates must satisfy 0 <= x_s <= L1.")
+            if np.any(coords[:, 1] < 0.0) or np.any(coords[:, 1] > self.L2):
+                raise ValueError("All sensor y-coordinates must satisfy 0 <= y_s <= L2.")
+            self.sensor_coords = coords
+        else:
+            self.sensor_coords, _ = sample_sensor_coords(
+                np.random.default_rng(0),
+                self.L1,
+                self.L2,
+                SensorUncertaintyConfig(
+                    enable=False,
+                    rel_positions=rel_positions,
+                ),
+            )
+
+        self.n_sensors = int(self.sensor_coords.shape[0])
+        self._episode_geometry: dict[str, float] = {}
+        self._episode_sensor_info: dict[str, Any] = {}
+
+        self.disp_norm_scale = float(disp_norm_scale)
+        self.vel_norm_scale = float(vel_norm_scale)
+        if self.disp_norm_scale <= 0.0 or self.vel_norm_scale <= 0.0:
+            raise ValueError("disp_norm_scale and vel_norm_scale must be > 0.")
+
+        self.obs_clip = obs_clip if obs_clip is None else float(obs_clip)
+        self.displacement_failure_limit = float(displacement_failure_limit)
+        self.velocity_failure_limit = float(velocity_failure_limit)
+
+        if self.velocity_failure_limit <= 0.0:
+            raise ValueError("velocity_failure_limit must be > 0.")
+
+        self.n_pass_lines = int(n_pass_lines)
+        if self.n_pass_lines < 1:
+            raise ValueError("n_pass_lines must be >= 1.")
+
+        self.pass_margin = float(pass_margin)
+        self.feed_speed = float(feed_speed)
+        self.traj_dt = float(traj_dt)
+        if self.feed_speed <= 0.0 or self.traj_dt <= 0.0:
+            raise ValueError("feed_speed and traj_dt must be > 0.")
+
+        if pass_sampling not in {"random", "sequential"}:
+            raise ValueError('pass_sampling must be "random" or "sequential".')
+        self.pass_sampling = pass_sampling
+        self.pass_complete_tolerance = float(pass_complete_tolerance)
+
+        self._pass_counter = 0
+        self.current_pass_line_index = 0
+        self.current_pass_x = 0.0
+        self.pass_duration = 0.0
+        self.pass_x_positions = np.array([], dtype=np.float64)
+
+        self.t_original = np.array([0.0], dtype=np.float64)
+        self.x_traj = np.array([0.0], dtype=np.float64)
+        self.y_traj = np.array([0.0], dtype=np.float64)
 
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
@@ -99,15 +291,36 @@ class PlatePlant(ODEPlant):
             dtype=np.float64,
         )
 
-        # Trajectory input
-        self.t_original = np.arange(0.0, 20.0, 0.02, dtype=np.float64)
-        self.x_traj = 0.1 * np.sin(2.0 * np.pi * 0.2 * self.t_original)
-        self.y_traj = 0.1 * np.cos(2.0 * np.pi * 0.2 * self.t_original)
+        self._rebuild_modal_physics()
+        self._rebuild_pass_grid()
+        self._configure_pass_line(0)
 
-        # Modal mass
+    def _rebuild_pass_grid(self) -> None:
+        """Rebuild pass-line x grid for current episode geometry L1."""
+        self.pass_x_positions = pass_line_x_positions(
+            self.n_pass_lines,
+            self.L1,
+            margin=self.pass_margin,
+        )
+
+    def _rebuild_sensor_matrix(self) -> None:
+        """Rebuild S_disp from current mode shapes and sensor coordinates."""
+        self.S_disp = build_sensor_displacement_matrix(
+            self.W_mn,
+            self.sensor_coords,
+            self.m_max,
+            self.n_max,
+        )
+
+    def _rebuild_modal_physics(self) -> None:
+        """
+        Recompute modal parameters and sync f_nonlinear2 for current geometry.
+
+        Called at construction and whenever episode-constant Θ_geom is resampled.
+        """
         M_modal = self.L1 * self.L2 * self.rho * self.h
+        self.M_modal = M_modal
 
-        # Mode shapes
         W_mn, V_mn = compute_mode_shapes(
             self.L1,
             self.L2,
@@ -115,8 +328,9 @@ class PlatePlant(ODEPlant):
             self.m_max,
             self.n_max,
         )
+        self.W_mn = W_mn
+        self.V_mn = V_mn
 
-        # Natural frequencies
         omega_mn = compute_natural_frequencies(
             self.E,
             self.nu,
@@ -128,7 +342,6 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
-        # Nonlinear stiffness
         lambda_mn, _lambda_prime_mn = compute_nonlinear_stiffness(
             self.E,
             self.nu,
@@ -141,11 +354,13 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
-        omega_vec = np.asarray(omega_mn.T.reshape(self.K), dtype=np.float64)
-        lambda_vec = np.asarray(lambda_mn.T.reshape(self.K), dtype=np.float64)
+        omega_vec = flatten_mode_matrix(omega_mn, self.m_max, self.n_max)
+        lambda_vec = flatten_mode_matrix(lambda_mn, self.m_max, self.n_max)
+        self.omega_vec = omega_vec
+        self.lambda_vec = lambda_vec
+        self.mode_index_map = mode_index_map(self.m_max, self.n_max)
 
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
-
         cf = 0.3
 
         xi_base = np.array(
@@ -158,32 +373,103 @@ class PlatePlant(ODEPlant):
             dtype=np.float64,
         ) / 2.5
 
-        # Set required variables inside the existing f_nonlinear2 module.
-        # This preserves your original nonlinear dynamics implementation.
         f_nonlinear2.m_max = self.m_max
         f_nonlinear2.n_max = self.n_max
         f_nonlinear2.N = self.N
         f_nonlinear2.K = self.K
-
         f_nonlinear2.zeta_vec = zeta_vec
         f_nonlinear2.lambda_vec = lambda_vec
         f_nonlinear2.omega_vec = omega_vec
-
         f_nonlinear2.xi_base = xi_base
         f_nonlinear2.delta_base = delta_base
         f_nonlinear2.W_mn = W_mn
         f_nonlinear2.cf = cf
+        f_nonlinear2.t_original = self.t_original
+        f_nonlinear2.x_traj = self.x_traj
+        f_nonlinear2.y_traj = self.y_traj
+        f_nonlinear2.M_modal = M_modal
+        f_nonlinear2.decimal_places = 1
+
+        self._rebuild_sensor_matrix()
+
+    def apply_process_noise(
+        self,
+        x: np.ndarray,
+        rng: np.random.Generator,
+        step_dt: float,
+    ) -> np.ndarray:
+        """
+        Add bounded diagonal modal process noise after deterministic integration.
+
+        x_{k+1} = Φ(x_k, u_k) + w_k,  w_k ~ N(0, Q(Δt)),  Q ∝ Δt I (modal blocks).
+        """
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        noise = build_process_noise_vector(
+            rng,
+            self.state_dim,
+            self.K,
+            step_dt,
+            self.process_noise,
+        )
+        return x + noise
+
+    def get_process_noise_info(self, step_dt: float) -> dict[str, Any]:
+        """Return process-noise metadata for logging and Monte Carlo analysis."""
+        return process_noise_info(self.process_noise, step_dt)
+
+    def _configure_pass_line(self, line_index: int) -> dict[str, Any]:
+        """Select a pass line and install the straight reference tool trajectory."""
+        if line_index < 0 or line_index >= self.n_pass_lines:
+            raise ValueError(
+                f"line_index must be in [0, {self.n_pass_lines}), got {line_index}."
+            )
+
+        self.current_pass_line_index = int(line_index)
+        self.current_pass_x = float(self.pass_x_positions[line_index])
+
+        t_original, x_traj, y_traj, pass_duration = build_straight_pass_trajectory(
+            x_line=self.current_pass_x,
+            L2=self.L2,
+            feed_speed=self.feed_speed,
+            dt=self.traj_dt,
+            y_start=self.L2,
+            y_end=0.0,
+        )
+
+        self.t_original = t_original
+        self.x_traj = x_traj
+        self.y_traj = y_traj
+        self.pass_duration = float(pass_duration)
 
         f_nonlinear2.t_original = self.t_original
         f_nonlinear2.x_traj = self.x_traj
         f_nonlinear2.y_traj = self.y_traj
+        f_nonlinear2.reset_episode_state()
 
-        f_nonlinear2.M_modal = M_modal
-        f_nonlinear2.decimal_places = 1
+        return {
+            "pass_line_index": self.current_pass_line_index,
+            "pass_x": self.current_pass_x,
+            "pass_duration": self.pass_duration,
+            "n_pass_lines": self.n_pass_lines,
+            "feed_speed": self.feed_speed,
+            "y_start": float(self.L2),
+            "y_end": 0.0,
+        }
+
+    def recommended_max_episode_steps(self, step_dt: float, safety_margin: int = 10) -> int:
+        """Episode horizon covering one full pass plus a small safety margin."""
+        if step_dt <= 0.0:
+            raise ValueError("step_dt must be > 0.")
+        if self.pass_duration <= 0.0:
+            return max(safety_margin, 1)
+        return int(np.ceil(self.pass_duration / step_dt)) + int(safety_margin)
 
     def _scale_action(self, u: np.ndarray) -> np.ndarray:
         """
         Map normalized action from [-1, 1]^2 to physical action [omega, ac].
+
+        Affine map (SB3-compatible):
+            u_phys = u_low + 0.5 * (u_norm + 1) * (u_high - u_low)
         """
         u = np.asarray(u, dtype=np.float64).reshape(-1)
 
@@ -199,6 +485,81 @@ class PlatePlant(ODEPlant):
         )
 
         return np.asarray(u_phys, dtype=np.float64)
+
+    def normalized_to_physical_action(self, u_norm: np.ndarray) -> np.ndarray:
+        """Public alias for action denormalization (agent → plant)."""
+        return self._scale_action(u_norm)
+
+    def physical_to_normalized_action(self, u_phys: np.ndarray) -> np.ndarray:
+        """
+        Inverse affine map: physical [omega, ac] → normalized [-1, 1]^2.
+
+        Used for logging, plotting, and verification of the action interface.
+        """
+        u_phys = np.asarray(u_phys, dtype=np.float64).reshape(-1)
+        if u_phys.size != 2:
+            raise ValueError(f"Expected physical action shape (2,), got {u_phys.shape}.")
+
+        span = self.u_phys_high - self.u_phys_low
+        u_norm = 2.0 * (u_phys - self.u_phys_low) / np.maximum(span, 1e-12) - 1.0
+        return np.clip(u_norm, -1.0, 1.0).astype(np.float64, copy=False)
+
+    def sensor_obs_norm_to_physical(
+        self,
+        sensor_obs_norm: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Denormalize sensor observation block to physical (w_s, w_dot_s) in SI units.
+
+        Inverse of state_to_sensor_obs_norm (without clipping).
+        """
+        sensor_obs_norm = np.asarray(sensor_obs_norm, dtype=np.float64).reshape(-1)
+        n = self.n_sensors
+        if sensor_obs_norm.size < 2 * n:
+            raise ValueError(
+                f"sensor_obs_norm must have length >= {2 * n}, got {sensor_obs_norm.size}."
+            )
+        w = sensor_obs_norm[:n] * self.disp_norm_scale
+        w_dot = sensor_obs_norm[n : 2 * n] * self.vel_norm_scale
+        return w.astype(np.float64, copy=False), w_dot.astype(np.float64, copy=False)
+
+    def get_interface_metadata(self) -> dict[str, Any]:
+        """
+        Contract summary for agent ↔ environment interface (paper / debugging).
+
+        Internal state: modal η (hidden from agent).
+        Agent observation: normalized physical sensors + previous normalized action.
+        Agent action: normalized [u_ω, u_ac] ∈ [-1,1]².
+        """
+        return {
+            "state_representation": "modal_eta_internal",
+            "observation_layout": [
+                "w_s1_norm",
+                "w_s2_norm",
+                "...",
+                "w_dot_s1_norm",
+                "w_dot_s2_norm",
+                "...",
+                "prev_u_omega_norm",
+                "prev_u_ac_norm",
+            ],
+            "action_layout": ["u_omega_norm", "u_ac_norm"],
+            "sensor_coords": self.sensor_coords.tolist(),
+            "disp_norm_scale_m": float(self.disp_norm_scale),
+            "vel_norm_scale_m_s": float(self.vel_norm_scale),
+            "physical_action_low": self.u_phys_low.tolist(),
+            "physical_action_high": self.u_phys_high.tolist(),
+            "displacement_failure_limit_m": float(self.displacement_failure_limit),
+            "velocity_failure_limit_m_s": float(self.velocity_failure_limit),
+            "n_modal_modes": int(self.K),
+            "n_sensors": int(self.n_sensors),
+        }
+
+    def tool_position_at(self, t: float) -> tuple[float, float]:
+        """Reference cutter position (x, y) on the plate at simulation time t."""
+        x_c = float(np.interp(float(t), self.t_original, self.x_traj))
+        y_c = float(np.interp(float(t), self.t_original, self.y_traj))
+        return x_c, y_c
 
     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         """
@@ -230,61 +591,147 @@ class PlatePlant(ODEPlant):
 
     def reset(self, rng) -> tuple[np.ndarray, dict[str, Any]]:
         """
-        Sample initial modal displacement and velocity.
+        Start a new straight-line pass episode with structured uncertainty.
+
+        Episode-constant (until termination):
+            Θ_geom = (L1, L2, h, E, ρ) — geometry/material scatter
+
+        Per-reset layout (fixed within episode):
+            pass line x-position, sensor coordinates on sampled plate
+
+        Initial condition: stationary plate (η = 0, η̇ = 0).
         """
-        eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
-        eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
+        geom = sample_episode_geometry(
+            rng,
+            self._geometry_nominal,
+            self.geometry_uncertainty,
+        )
+        self._episode_geometry = geom
+        self.L1 = geom["L1"]
+        self.L2 = geom["L2"]
+        self.h = geom["h"]
+        self.E = geom["E"]
+        self.rho = geom["rho"]
+
+        self._rebuild_modal_physics()
+        self._rebuild_pass_grid()
+
+        sensor_coords, sensor_info = sample_sensor_coords(
+            rng,
+            self.L1,
+            self.L2,
+            self.sensor_uncertainty,
+        )
+        self.sensor_coords = sensor_coords
+        self._episode_sensor_info = sensor_info
+        self._rebuild_sensor_matrix()
+
+        if self.pass_sampling == "random":
+            line_index = int(rng.integers(0, self.n_pass_lines))
+        else:
+            line_index = int(self._pass_counter % self.n_pass_lines)
+            self._pass_counter += 1
+
+        pass_info = self._configure_pass_line(line_index)
 
         x0 = np.zeros(self.state_dim, dtype=np.float64)
-        x0[0::2] = eta0
-        x0[1::2] = eta_dot0
 
-        return x0, {}
+        info: dict[str, Any] = {
+            **geom,
+            **sensor_info,
+            **pass_info,
+            "sensor_coords": self.sensor_coords.tolist(),
+            "pass_sampling": self.pass_sampling,
+            "geometry_uncertainty_enabled": self.geometry_uncertainty.enable,
+            "sensor_uncertainty_enabled": self.sensor_uncertainty.enable,
+            "process_noise_enabled": self.process_noise.enable,
+        }
+        return x0, info
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         """
-        Terminate if modal displacement becomes unsafe or state becomes invalid.
+        Episode end conditions for one straight pass.
+
+        Truncation (non-failure):
+            - pass_complete: tool reached the lower edge / pass duration elapsed
+
+        Termination (failure):
+            - invalid_state: NaN/Inf in modal state
+            - excessive_sensor_displacement: |w_s| above physical limit
+            - excessive_sensor_velocity: |w_dot_s| above physical limit
+            - excessive_modal_displacement_internal: optional modal guard
         """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-        eta = x[0::2]
-
         invalid_state = not np.all(np.isfinite(x))
-        excessive_displacement = np.any(np.abs(eta) > self.eta_limit)
 
-        terminated = bool(invalid_state or excessive_displacement)
+        info: dict[str, Any] = {
+            "pass_line_index": self.current_pass_line_index,
+            "pass_x": self.current_pass_x,
+            "pass_duration": self.pass_duration,
+            "sim_time": float(t),
+        }
 
-        info: dict[str, Any] = {}
+        # Successful completion of the milling pass (one grid line).
+        if t >= self.pass_duration - self.pass_complete_tolerance:
+            info["termination_reason"] = "pass_complete"
+            return False, True, info
+
+        w_sensors, w_dot_sensors = self.state_to_sensor_signals(x)
+
+        excessive_sensor_displacement = bool(
+            np.any(np.abs(w_sensors) > self.displacement_failure_limit)
+        )
+        excessive_sensor_velocity = bool(
+            np.any(np.abs(w_dot_sensors) > self.velocity_failure_limit)
+        )
+
+        eta = x[0::2]
+        eta_dot = x[1::2]
+        excessive_modal_displacement = bool(np.any(np.abs(eta) > self.eta_limit))
+        excessive_modal_velocity = bool(np.any(np.abs(eta_dot) > self.eta_dot_limit))
+        excessive_internal_modal = self.use_eta_internal_safety and (
+            excessive_modal_displacement or excessive_modal_velocity
+        )
 
         if invalid_state:
             info["termination_reason"] = "invalid_state"
+            return True, False, info
 
-        if excessive_displacement:
-            info["termination_reason"] = "excessive_modal_displacement"
+        if excessive_sensor_displacement:
+            info["termination_reason"] = "excessive_sensor_displacement"
+            info["max_abs_sensor_displacement"] = float(np.max(np.abs(w_sensors)))
+            return True, False, info
 
-        return terminated, False, info
+        if excessive_sensor_velocity:
+            info["termination_reason"] = "excessive_sensor_velocity"
+            info["max_abs_sensor_velocity"] = float(np.max(np.abs(w_dot_sensors)))
+            return True, False, info
+
+        if excessive_internal_modal:
+            info["termination_reason"] = "excessive_modal_state_internal"
+            return True, False, info
+
+        return False, False, info
 
     def get_observation_space(self) -> spaces.Space:
         """
-        Return Gymnasium observation space.
+        Return Gymnasium observation space for the sensor-based PPO inputs.
 
-        Observation:
-            [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+        Note: this space covers *only* the sensor part.
+        The env will append previous action commands.
+
+        Sensor ordering (normalized):
+            [w_s1_norm, w_s2_norm, ..., w_sN_norm,
+             w_dot_s1_norm, w_dot_s2_norm, ..., w_dot_sN_norm]
         """
-        low = np.zeros(self.state_dim, dtype=np.float64)
-        high = np.zeros(self.state_dim, dtype=np.float64)
+        if self.obs_clip is None:
+            low = np.full((2 * self.n_sensors,), -np.inf, dtype=np.float64)
+            high = np.full((2 * self.n_sensors,), np.inf, dtype=np.float64)
+        else:
+            low = np.full((2 * self.n_sensors,), -self.obs_clip, dtype=np.float64)
+            high = np.full((2 * self.n_sensors,), self.obs_clip, dtype=np.float64)
 
-        low[0::2] = -self.eta_obs_limit
-        high[0::2] = self.eta_obs_limit
-
-        low[1::2] = -self.eta_dot_obs_limit
-        high[1::2] = self.eta_dot_obs_limit
-
-        return spaces.Box(
-            low=low,
-            high=high,
-            shape=(self.state_dim,),
-            dtype=np.float64,
-        )
+        return spaces.Box(low=low, high=high, shape=(2 * self.n_sensors,), dtype=np.float64)
 
     def get_action_space(self) -> spaces.Space:
         """
@@ -302,8 +749,53 @@ class PlatePlant(ODEPlant):
 
     def state_to_obs(self, x: np.ndarray) -> np.ndarray:
         """
-        Map internal state to observation.
-
-        Here, observation is equal to the full modal state.
+        Map internal modal state to normalized sensor observation.
         """
-        return np.asarray(x, dtype=np.float64).reshape(-1)
+        # For the agent observation, apply the optional clipping.
+        return self.state_to_sensor_obs_norm(x, clip_for_observation=True)
+
+    def state_to_sensor_obs_norm(
+        self,
+        x: np.ndarray,
+        *,
+        clip_for_observation: bool,
+    ) -> np.ndarray:
+        """
+        Convert internal modal state to normalized sensor signals.
+
+        clip_for_observation=True:
+            Apply obs_clip to match the Gym observation bounds.
+        clip_for_observation=False:
+            Do not clip; intended for reward computation consistency.
+        """
+        w_sensors, w_dot_sensors = self.state_to_sensor_signals(x)
+
+        w_norm = w_sensors / self.disp_norm_scale
+        w_dot_norm = w_dot_sensors / self.vel_norm_scale
+
+        if clip_for_observation and self.obs_clip is not None:
+            w_norm = np.clip(w_norm, -self.obs_clip, self.obs_clip)
+            w_dot_norm = np.clip(w_dot_norm, -self.obs_clip, self.obs_clip)
+
+        # Ordering required:
+        #   [w_s1, w_s2, ..., w_dot_s1, w_dot_s2, ...]
+        return np.concatenate([w_norm, w_dot_norm]).astype(np.float64, copy=False)
+
+    def state_to_sensor_signals(self, x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Reconstruct physical sensor signals from modal coordinates:
+            w_sensors(t)      = S_disp @ eta(t)
+            w_dot_sensors(t) = S_disp @ eta_dot(t)
+        """
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        if x.size != self.state_dim:
+            raise ValueError(
+                f"PlatePlant expects internal state shape ({self.state_dim},), got {x.shape}."
+            )
+
+        eta = x[0::2]
+        eta_dot = x[1::2]
+
+        w_sensors = self.S_disp @ eta
+        w_dot_sensors = self.S_disp @ eta_dot
+        return w_sensors, w_dot_sensors

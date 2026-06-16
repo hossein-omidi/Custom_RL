@@ -68,8 +68,32 @@ class ODEControlEnv(gym.Env):
         self.process_noise_std = process_noise_std
         self.obs_noise_std = obs_noise_std
 
-        self.observation_space = plant.get_observation_space()
+        # Plant provides the sensor part of the observation.
+        self._sensor_observation_space = plant.get_observation_space()
+        self._sensor_obs_dim = int(np.prod(self._sensor_observation_space.shape))
+
         self.action_space = plant.get_action_space()
+        self._prev_action_norm = np.zeros(self.action_space.shape, dtype=np.float64)
+
+        # Full PPO observation:
+        #   [sensor displacement/velocity (normalized), prev_action_norm (omega/ac)]
+        if isinstance(self._sensor_observation_space, spaces.Box) and isinstance(self.action_space, spaces.Box):
+            low = np.concatenate(
+                [
+                    np.asarray(self._sensor_observation_space.low, dtype=np.float64).reshape(-1),
+                    np.asarray(self.action_space.low, dtype=np.float64).reshape(-1),
+                ]
+            )
+            high = np.concatenate(
+                [
+                    np.asarray(self._sensor_observation_space.high, dtype=np.float64).reshape(-1),
+                    np.asarray(self.action_space.high, dtype=np.float64).reshape(-1),
+                ]
+            )
+            self.observation_space = spaces.Box(low=low, high=high, dtype=np.float64)
+        else:
+            # Fallback: keep sensor space only (should not happen for the current plate env).
+            self.observation_space = self._sensor_observation_space
 
         self._state: np.ndarray = np.zeros(0)
         self._t: float = 0.0
@@ -87,9 +111,13 @@ class ODEControlEnv(gym.Env):
         self._state, info = self.plant.reset(rng)
         self._t = 0.0
         self._step_count = 0
-        obs = self.plant.state_to_obs(self._state)
-        obs = self._add_obs_noise(obs)
-        obs = self._clip_obs(obs)
+        self._prev_action_norm[:] = 0.0
+
+        sensor_obs = self.plant.state_to_obs(self._state)
+        sensor_obs = self._add_obs_noise_sensor(sensor_obs)
+        sensor_obs = self._clip_sensor_obs(sensor_obs)
+
+        obs = np.concatenate([sensor_obs, self._prev_action_norm]).astype(np.float64, copy=False)
         return obs, info
 
     def step(
@@ -108,8 +136,16 @@ class ODEControlEnv(gym.Env):
             n_steps=self.n_substeps,
         )
         # Add process noise (stochastic dynamics)
-        if self.process_noise_std > 0:
-            self._state = self._state + self.process_noise_std * self.np_random.standard_normal(self._state.shape)
+        if hasattr(self.plant, "apply_process_noise"):
+            self._state = self.plant.apply_process_noise(
+                self._state,
+                self.np_random,
+                self._step_dt,
+            )
+        elif self.process_noise_std > 0:
+            self._state = self._state + self.process_noise_std * self.np_random.standard_normal(
+                self._state.shape
+            )
         self._t += self._step_dt
         self._step_count += 1
 
@@ -119,6 +155,44 @@ class ODEControlEnv(gym.Env):
         truncated_time = self._step_count >= self.max_episode_steps
         truncated = truncated_term or truncated_time
 
+        # Sensor reconstruction for reward/diagnostics.
+        # (The PPO observation will be constructed after updating prev_action_norm.)
+        # Use unclipped normalized sensor signals for reward.
+        if hasattr(self.plant, "state_to_sensor_obs_norm"):
+            sensor_obs_norm = self.plant.state_to_sensor_obs_norm(
+                self._state,
+                clip_for_observation=False,
+            )
+        else:
+            # Fallback (older plant behavior).
+            sensor_obs_norm = self.plant.state_to_obs(self._state)
+        sensor_w = None
+        sensor_w_dot = None
+        if hasattr(self.plant, "state_to_sensor_signals"):
+            sensor_w, sensor_w_dot = self.plant.state_to_sensor_signals(self._state)
+
+        # Physical action values (for productivity terms).
+        action_phys = None
+        if hasattr(self.plant, "_scale_action"):
+            action_phys = np.asarray(self.plant._scale_action(action), dtype=np.float64)
+
+        reward_info: dict[str, Any] = {
+            **term_info,
+            "sensor_obs_norm": np.asarray(sensor_obs_norm, dtype=np.float64),
+        }
+        if sensor_w is not None and sensor_w_dot is not None:
+            reward_info["sensor_w"] = np.asarray(sensor_w, dtype=np.float64)
+            reward_info["sensor_w_dot"] = np.asarray(sensor_w_dot, dtype=np.float64)
+
+        reward_info["action_norm"] = np.asarray(action, dtype=np.float64)
+        reward_info["prev_action_norm"] = np.asarray(self._prev_action_norm, dtype=np.float64)
+        reward_info["action_phys"] = (
+            np.asarray(action_phys, dtype=np.float64).reshape(-1) if action_phys is not None else None
+        )
+        if hasattr(self.plant, "u_phys_low") and hasattr(self.plant, "u_phys_high"):
+            reward_info["action_phys_low"] = np.asarray(self.plant.u_phys_low, dtype=np.float64)
+            reward_info["action_phys_high"] = np.asarray(self.plant.u_phys_high, dtype=np.float64)
+
         reward = self.reward_fn(
             self._t - self._step_dt,
             x_prev,
@@ -126,16 +200,38 @@ class ODEControlEnv(gym.Env):
             self._state,
             terminated,
             truncated,
-            term_info,
+            reward_info,
         )
 
-        info: dict[str, Any] = {"t": self._t, "state": self._state.copy(), **term_info}
+        # Update prev action AFTER reward: prev_action_norm(t+1) = action(t)
+        self._prev_action_norm = np.asarray(action, dtype=np.float64).copy()
+
+        info: dict[str, Any] = {"t": self._t, **term_info}
+        # Expose sensor-level diagnostics for evaluation/plotting.
+        info["sensor_obs_norm"] = np.asarray(sensor_obs_norm, dtype=np.float64)
+        if sensor_w is not None and sensor_w_dot is not None:
+            info["sensor_w"] = np.asarray(sensor_w, dtype=np.float64)
+            info["sensor_w_dot"] = np.asarray(sensor_w_dot, dtype=np.float64)
+        if action_phys is not None:
+            info["action_phys"] = np.asarray(action_phys, dtype=np.float64).reshape(-1)
+        if hasattr(self.plant, "get_interface_metadata"):
+            info["interface"] = self.plant.get_interface_metadata()
+        if hasattr(self.plant, "tool_position_at"):
+            x_tool, y_tool = self.plant.tool_position_at(self._t)
+            info["tool_position"] = np.array([x_tool, y_tool], dtype=np.float64)
+        info["action_norm"] = np.asarray(action, dtype=np.float64)
+        info["prev_action_norm"] = np.asarray(self._prev_action_norm, dtype=np.float64)
+        # reward_fn may attach breakdown into reward_info["reward_components"]
+        if "reward_components" in reward_info:
+            info["reward_components"] = reward_info["reward_components"]
         if truncated_time:
             info["TimeLimit.truncated"] = True
 
-        obs = self.plant.state_to_obs(self._state)
-        obs = self._add_obs_noise(obs)
-        obs = self._clip_obs(obs)
+        # PPO observation (sensor part + prev action).
+        sensor_obs = self.plant.state_to_obs(self._state)
+        sensor_obs = self._add_obs_noise_sensor(sensor_obs)
+        sensor_obs = self._clip_sensor_obs(sensor_obs)
+        obs = np.concatenate([sensor_obs, self._prev_action_norm]).astype(np.float64, copy=False)
         return obs, float(reward), terminated, truncated, info
 
     def _clamp_action(self, action: np.ndarray) -> np.ndarray:
@@ -145,16 +241,16 @@ class ODEControlEnv(gym.Env):
             return np.clip(action, low, high)
         return action
 
-    def _clip_obs(self, obs: np.ndarray) -> np.ndarray:
-        """Clip observation to observation_space bounds (Gymnasium compliance)."""
-        if isinstance(self.observation_space, spaces.Box):
-            low = np.asarray(self.observation_space.low, dtype=np.float64)
-            high = np.asarray(self.observation_space.high, dtype=np.float64)
-            return np.clip(np.asarray(obs, dtype=np.float64), low, high)
-        return np.asarray(obs, dtype=np.float64)
+    def _clip_sensor_obs(self, sensor_obs: np.ndarray) -> np.ndarray:
+        """Clip sensor observation to sensor observation_space bounds."""
+        if isinstance(self._sensor_observation_space, spaces.Box):
+            low = np.asarray(self._sensor_observation_space.low, dtype=np.float64).reshape(-1)
+            high = np.asarray(self._sensor_observation_space.high, dtype=np.float64).reshape(-1)
+            return np.clip(np.asarray(sensor_obs, dtype=np.float64).reshape(-1), low, high)
+        return np.asarray(sensor_obs, dtype=np.float64).reshape(-1)
 
-    def _add_obs_noise(self, obs: np.ndarray) -> np.ndarray:
-        """Add observation noise (stochastic observations)."""
+    def _add_obs_noise_sensor(self, sensor_obs: np.ndarray) -> np.ndarray:
+        """Add observation noise to the sensor part only."""
         if self.obs_noise_std > 0:
-            return obs + self.obs_noise_std * self.np_random.standard_normal(obs.shape)
-        return obs
+            return np.asarray(sensor_obs, dtype=np.float64) + self.obs_noise_std * self.np_random.standard_normal(sensor_obs.shape)
+        return np.asarray(sensor_obs, dtype=np.float64)

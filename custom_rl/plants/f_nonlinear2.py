@@ -20,6 +20,9 @@ The implementation is adapted for RL training:
 from __future__ import annotations
 
 import numpy as np
+import bisect
+
+from custom_rl.plants.mode_ordering import iter_mode_indices
 
 
 # ============================================================
@@ -47,7 +50,7 @@ y_traj = None
 M_modal = None
 
 # Kept for compatibility, but no longer allowed to grow globally.
-decimal_places = 1
+decimal_places = .1
 tau_floored = None
 
 
@@ -71,6 +74,54 @@ MAX_FORCE = 1e5
 
 
 # ============================================================
+# State-delay configuration
+# ============================================================
+
+STATE_DELAY = 0           # seconds; set this to desired delay (>0)
+_state_history = []          # list of (t, x_copy) in increasing time order
+_MAX_HISTORY = 100000        # prevent unbounded memory growth
+
+
+def _get_delayed_state(t_current: float, delay: float):
+    """
+    Return state vector at time t_current - delay using linear interpolation
+    from the stored history. If delay <= 0 or no history or t_delayed < 0,
+    returns None (caller should use current state).
+    """
+    if delay <= 0.0:
+        return None
+
+    t_delayed = t_current - delay
+    if t_delayed < 0.0:
+        return None
+
+    global _state_history
+    if len(_state_history) == 0:
+        return None
+
+    # Binary search for the interval containing t_delayed
+    times = [entry[0] for entry in _state_history]
+    idx = bisect.bisect_left(times, t_delayed)
+
+    if idx == 0:
+        # Before first recorded time
+        return None
+    if idx == len(times):
+        # After last recorded time – use last state
+        return _state_history[-1][1]
+
+    t1, x1 = _state_history[idx - 1]
+    t2, x2 = _state_history[idx]
+
+    # Linear interpolation
+    if t2 - t1 < 1e-12:
+        return x1
+    alpha = (t_delayed - t1) / (t2 - t1)
+    x_delayed = (1 - alpha) * x1 + alpha * x2
+    return x_delayed
+
+
+# ============================================================
 # Cache
 # ============================================================
 
@@ -79,8 +130,25 @@ cache = {
     "hash": None,
     "time_discrete": None,
     "F_normal": None,
-    "b_vec": None,
+    "b_vec_series": None,
 }
+
+
+def reset_episode_state() -> None:
+    """
+    Clear per-episode transient state.
+
+    Call at the start of each RL episode after updating the tool trajectory.
+    """
+    global _state_history, cache, tau_floored
+
+    _state_history = []
+    tau_floored = None
+    cache["initialized"] = False
+    cache["hash"] = None
+    cache["time_discrete"] = None
+    cache["F_normal"] = None
+    cache["b_vec_series"] = None
 
 
 def _require_initialized() -> None:
@@ -186,31 +254,38 @@ def _make_time_grid(t_start: float, t_end: float, dt_grid: float) -> np.ndarray:
     return time_discrete
 
 
-def _compute_b_vec() -> np.ndarray:
-    """Compute modal force projection vector."""
-    c1 = -0.0985
-    c2 = -0.0941
+def _compute_b_vec_at(x_c: float, y_c: float) -> np.ndarray:
+    """
+    Modal force projection at the instantaneous cutter contact point (x_c, y_c).
 
+    F_k(t) = W_k(x_c(t), y_c(t)) / M_modal * F_normal(t)
+
+    This replaces the legacy fixed-point projection and couples the moving
+    tool trajectory to the plate modal dynamics.
+    """
     b_vec = np.zeros(K, dtype=np.float64)
 
-    cnt = 0
-    for m in range(m_max):
-        for n in range(n_max):
-            Wk = W_mn[m][n]
-            b_vec[cnt] = Wk(c1, c2) / M_modal
-            cnt += 1
+    for m, n, k in iter_mode_indices(m_max, n_max):
+        Wk = W_mn[m][n]
+        b_vec[k] = float(Wk(x_c, y_c)) / M_modal
 
     return b_vec
+
+
+def _tool_position_at(t: float) -> tuple[float, float]:
+    """Interpolate reference cutter position along the pass trajectory."""
+    x_c = float(np.interp(float(t), t_original, x_traj, left=x_traj[0], right=x_traj[-1]))
+    y_c = float(np.interp(float(t), t_original, y_traj, left=y_traj[0], right=y_traj[-1]))
+    return x_c, y_c
 
 
 def _update_cache(omega: float, ac: float, current_hash) -> None:
     """
     Recompute force time history and cache it.
 
-    Important efficiency change:
-        The old code stored F_modal with shape (K, P).
-        Since F_modal[k, :] = b_vec[k] * F_normal,
-        we only store F_normal with shape (P,) and b_vec with shape (K,).
+    Important efficiency note:
+        F_modal[k, t_j] = b_vec_series[k, j] * F_normal[j]
+        b_vec_series is (K, P) and varies with tool position along the pass.
     """
     global tau_floored, cache
 
@@ -263,10 +338,6 @@ def _update_cache(omega: float, ac: float, current_hash) -> None:
             break
 
         iteration += 1
-
-    #if iteration >= max_iterations:
-        # Keep the warning, but do not crash training.
-     #   print("Warning: max iterations reached; displacement condition may not be satisfied.")
 
     # =========================================================
     # Force coefficients
@@ -362,19 +433,29 @@ def _update_cache(omega: float, ac: float, current_hash) -> None:
     F_normal = np.sqrt(Fx * Fx + Fy * Fy)
     F_normal = np.nan_to_num(F_normal, nan=0.0, posinf=MAX_FORCE, neginf=0.0)
 
-    b_vec = _compute_b_vec()
-    b_vec = np.nan_to_num(b_vec, nan=0.0, posinf=0.0, neginf=0.0)
+    b_vec_series = np.zeros((K, P), dtype=np.float64)
+    if P > 0:
+        for j in range(P):
+            t_j = float(time_discrete[j])
+            x_c, y_c = _tool_position_at(t_j)
+            b_vec_series[:, j] = _compute_b_vec_at(x_c, y_c)
+
+    b_vec_series = np.nan_to_num(b_vec_series, nan=0.0, posinf=0.0, neginf=0.0)
 
     cache["time_discrete"] = time_discrete
     cache["F_normal"] = F_normal
-    cache["b_vec"] = b_vec
+    cache["b_vec_series"] = b_vec_series
     cache["hash"] = current_hash
     cache["initialized"] = True
 
 
 def f_nonlinear2(t, x, u):
     """
-    Nonlinear plate dynamics.
+    Nonlinear plate dynamics with optional state delay.
+
+    The delay is controlled by the module‑level variable STATE_DELAY.
+    If STATE_DELAY > 0, the damping, stiffness, and nonlinear terms
+    use the state at time t - STATE_DELAY (interpolated from history).
 
     Args:
         t: current time
@@ -397,6 +478,20 @@ def f_nonlinear2(t, x, u):
 
     x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
 
+    # ---------- History management ----------
+    global _state_history
+    _state_history.append((t, x.copy()))
+    # Prevent unbounded growth
+    if len(_state_history) > _MAX_HISTORY:
+        _state_history = _state_history[-_MAX_HISTORY:]
+
+    # ---------- Retrieve delayed state (if any) ----------
+    x_delayed = _get_delayed_state(t, STATE_DELAY)
+    if x_delayed is None:
+        # No valid delayed state yet → use current state (no delay)
+        x_delayed = x
+
+    # ---------- Force calculation (unchanged) ----------
     current_hash = _make_cache_hash(omega, ac)
 
     key_changed = (
@@ -404,7 +499,7 @@ def f_nonlinear2(t, x, u):
         or cache["hash"] != current_hash
         or cache["time_discrete"] is None
         or cache["F_normal"] is None
-        or cache["b_vec"] is None
+        or cache["b_vec_series"] is None
     )
 
     if key_changed:
@@ -412,41 +507,54 @@ def f_nonlinear2(t, x, u):
 
     time_discrete = cache["time_discrete"]
     F_normal = cache["F_normal"]
-    b_vec = cache["b_vec"]
+    b_vec_series = cache["b_vec_series"]
 
     if (
         time_discrete is None
         or F_normal is None
-        or b_vec is None
+        or b_vec_series is None
         or len(time_discrete) <= 1
     ):
         Fk = np.zeros(K, dtype=np.float64)
     else:
-        F_normal_t = np.interp(
-            float(t),
-            time_discrete,
-            F_normal,
-            left=0.0,
-            right=0.0,
+        t_now = float(t)
+        F_normal_t = float(
+            np.interp(t_now, time_discrete, F_normal, left=0.0, right=0.0)
         )
-        Fk = b_vec * F_normal_t
+        b_vec_t = np.array(
+            [
+                float(np.interp(t_now, time_discrete, b_vec_series[k], left=0.0, right=0.0))
+                for k in range(K)
+            ],
+            dtype=np.float64,
+        )
+        Fk = b_vec_t * F_normal_t
 
     Fk = np.nan_to_num(Fk, nan=0.0, posinf=MAX_FORCE, neginf=-MAX_FORCE)
 
+    # ---------- Dynamics using DELAYED state for the acceleration ----------
     dx = np.zeros(2 * K, dtype=np.float64)
 
-    eta = x[0::2]
-    etad = x[1::2]
+    # Current state (for the derivative of position)
+    eta_current = x[0::2]
+    etad_current = x[1::2]
+
+    # Delayed state (for damping, stiffness, nonlinearity)
+    eta_delayed = x_delayed[0::2]
+    etad_delayed = x_delayed[1::2]
 
     zeta_omega = 2.0 * zeta_vec * omega_vec
     omega2 = omega_vec ** 2
-    eta3 = eta ** 3
+    eta3_delayed = eta_delayed ** 3
 
-    ddeta = -zeta_omega * etad - omega2 * eta - lambda_vec * eta3 + Fk
+    ddeta = (-zeta_omega * etad_delayed
+             - omega2 * eta_delayed
+             - lambda_vec * eta3_delayed
+             + Fk)
     ddeta = np.nan_to_num(ddeta, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    dx[0::2] = etad
-    dx[1::2] = ddeta
+    dx[0::2] = etad_current      # d(eta)/dt = current velocity
+    dx[1::2] = ddeta             # d(etad)/dt = acceleration from delayed state
 
     dx = np.nan_to_num(dx, nan=0.0, posinf=1e6, neginf=-1e6)
 

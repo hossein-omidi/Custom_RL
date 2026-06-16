@@ -26,7 +26,9 @@ env/
 # Training outputs (regeneratable)
 logs/
 models/
+runs/
 eval_trajectories/
+eval_mc/
 plots/*.png
 plots/*.pdf
 

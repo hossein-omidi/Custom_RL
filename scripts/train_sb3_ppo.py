@@ -49,8 +49,8 @@ def main() -> None:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=1000,
-        help="Maximum steps per episode",
+        default=None,
+        help="Maximum steps per episode (default: auto from pass duration)",
     )
 
     parser.add_argument(
@@ -71,8 +71,9 @@ def main() -> None:
 
     env_kwargs = {
         "reward_id": args.reward,
-        "max_episode_steps": args.max_episode_steps,
     }
+    if args.max_episode_steps is not None:
+        env_kwargs["max_episode_steps"] = args.max_episode_steps
 
     for seed in args.seeds:
         seed_dir = Path(args.log_dir) / f"seed_{seed}"
