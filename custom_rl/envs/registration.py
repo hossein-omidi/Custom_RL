@@ -60,8 +60,8 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     reward_id = kwargs.pop("reward_id", "dense")
 
-    dt = kwargs.pop("dt", 0.001)
-    n_substeps = kwargs.pop("n_substeps", 1)
+    dt = kwargs.pop("dt", 0.0005)
+    n_substeps = kwargs.pop("n_substeps", 4)
     max_episode_steps = kwargs.pop("max_episode_steps", None)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
     obs_noise_std = kwargs.pop("obs_noise_std", 0.0)
@@ -109,6 +109,23 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "enable_sensor_uncertainty",
         "enable_process_noise",
         "sensor_coords_relative",
+        # Directional milling
+        "milling_type",
+        "phi_st",
+        "phi_ex",
+        "phi_0",
+        "cutter_diameter",
+        "helix_angle",
+        "axial_quadrature_points",
+        "ac_via_axial_integration",
+        "ac_units",
+        "displacement_model",
+        "feed_per_tooth_source",
+        "cf_units",
+        "trajectory_mode",
+        "path_x_mid",
+        "path_y_start",
+        "path_y_end",
     }
 
     # Reward keys (preferred sensor-based names).
@@ -153,6 +170,14 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         reward_kwargs["termination_penalty"] = kwargs["termination_penalty"]
 
     plant = PlatePlant(**plant_kwargs)
+    if integrator == "dde_rk4" and plant.milling_config.is_feed_normal_full():
+        from custom_rl.plants.time_scales import recommend_integration_dt
+
+        macro = dt * n_substeps
+        scales = recommend_integration_dt(plant, macro_dt=macro, training_mode=True)
+        dt = scales["dt_recommended_training_substep_s"]
+        n_substeps = scales["n_substeps"]
+
     reward_fn = get_plate_reward(reward_id, **reward_kwargs)
 
     step_dt = dt * n_substeps

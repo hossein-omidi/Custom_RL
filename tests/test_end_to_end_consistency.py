@@ -122,9 +122,21 @@ def test_ppo_observation_excludes_modal_coordinates() -> None:
     env.close()
 
 
+def test_physical_action_units_contract() -> None:
+    env = _make_env()
+    plant = env.unwrapped.plant
+    meta = plant.get_interface_metadata()
+    assert meta["physical_action_units"] == ["rad/s", "mm"]
+    assert meta["milling_force"]["ac_units"] == "mm"
+    u_phys_hi = plant.normalized_to_physical_action(np.array([1.0, 1.0]))
+    assert u_phys_hi[0] == plant.omega_max
+    assert u_phys_hi[1] == plant.ac_max
+    env.close()
+
+
 def test_cutting_force_projection_moves_with_tool() -> None:
     """b_vec at t=0 and t>0 must differ when the tool travels along y."""
-    env = _make_env(feed_speed=0.1)
+    env = _make_env(feed_speed=0.1, trajectory_mode="pass_grid")
     plant = env.unwrapped.plant
     env.reset(seed=0)
 
@@ -133,13 +145,17 @@ def test_cutting_force_projection_moves_with_tool() -> None:
     u_phys = plant.normalized_to_physical_action(np.array([0.5, 0.5], dtype=np.float64))
     x0 = np.zeros(plant.state_dim)
 
-    _ = fmods.f_nonlinear2(0.0, x0, u_phys)
-    b0 = fmods.cache["b_vec_series"][:, 0].copy()
+    fmods.bind_modal_history(plant._modal_state_history)
+    try:
+        _ = fmods.f_nonlinear2(0.0, x0, u_phys)
+        b0 = fmods.cache["b_vec_series"][:, 0].copy()
 
-    t_mid = 0.5 * float(plant.pass_duration)
-    _ = fmods.f_nonlinear2(t_mid, x0, u_phys)
-    idx = int(np.argmin(np.abs(fmods.cache["time_discrete"] - t_mid)))
-    b_mid = fmods.cache["b_vec_series"][:, idx]
+        t_mid = 0.5 * float(plant.pass_duration)
+        _ = fmods.f_nonlinear2(t_mid, x0, u_phys)
+        idx = int(np.argmin(np.abs(fmods.cache["time_discrete"] - t_mid)))
+        b_mid = fmods.cache["b_vec_series"][:, idx]
+    finally:
+        fmods.unbind_modal_history()
 
     x0_tool, y0_tool = plant.tool_position_at(0.0)
     x_mid_tool, y_mid_tool = plant.tool_position_at(t_mid)

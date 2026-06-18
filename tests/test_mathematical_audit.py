@@ -26,6 +26,8 @@ def _plant() -> PlatePlant:
         enable_process_noise=False,
         pass_sampling="sequential",
         n_pass_lines=5,
+        displacement_model="surface_normal_reduced",
+        trajectory_mode="pass_grid",
     )
     p.reset(np.random.default_rng(0))
     return p
@@ -77,7 +79,7 @@ def test_structural_current_only() -> None:
 # 4. Delayed eta only in force (ac>0 force differs when history differs)
 def test_delayed_eta_only_in_force() -> None:
     plant = _plant()
-    omega, ac = 700.0, 2.0
+    omega, ac = 700.0, 2.0  # ac [mm]; calibrated coeffs stay below safety clip
     u = _u_phys(plant, omega, ac)
     eta = np.array([1e-5, 0, 0, 0], dtype=np.float64)
     x = np.zeros(plant.state_dim)
@@ -89,10 +91,11 @@ def test_delayed_eta_only_in_force() -> None:
     fmod.record_omega(0.0, omega)
     fmod.record_modal_state(t - tau, x.copy())
     fmod.record_omega(t - tau, omega)
-    f1 = fmod._scalar_cutting_force_at(t, eta, omega, ac)
+    f1 = fmod._scalar_cutting_force_at(t, x, omega, ac)
     fmod.record_modal_state(t - tau, np.zeros(plant.state_dim))
-    f2 = fmod._scalar_cutting_force_at(t, eta, omega, ac)
-    assert f1 != f2 or f1 == 0.0
+    f2 = fmod._scalar_cutting_force_at(t, x, omega, ac)
+    assert abs(f1) > 1e-9
+    assert f1 != f2
 
 
 # 5. Delay equals tau for constant omega
@@ -142,20 +145,29 @@ def test_force_depends_on_delta_eta() -> None:
     assert fa != fb
 
 
-# 8. Dynamic regenerative force vanishes when Delta_w_c = 0
-def test_regenerative_vanishes_zero_delta_w() -> None:
+# 8. When Delta_q = 0, chip thickness is geometry-only (no regenerative term)
+def test_regenerative_vanishes_zero_delta_q() -> None:
     plant = _plant()
     omega, ac = 600.0, 2.0
     fmod._update_cache(omega, ac, fmod._make_cache_hash(omega, ac))
-    h_geom, _, _ = fmod._geometry_at(0.01)
-    if h_geom <= 0:
-        h_geom = 1e-6
-    f_geom = fmod._cutting_force_scalar_from_h(h_geom, ac)
-    f_total = fmod._cutting_force_scalar_from_h(h_geom + 0.0, ac)
-    assert np.isclose(f_geom, f_total)
-    if ac > 0 and h_geom > 0:
-        f_dyn = fmod._cutting_force_scalar_from_h(h_geom + 1e-6, ac)
-        assert f_dyn != f_geom or h_geom + 1e-6 <= 0
+    eta = np.zeros(plant.K)
+    t = 0.03
+    tau = fmod.tooth_period(omega)
+    fmod.reset_episode_state(plant._modal_state_history)
+    plant.record_modal_state(t - tau, np.zeros(plant.state_dim), omega=omega)
+    plant.record_modal_state(t, np.zeros(plant.state_dim), omega=omega)
+    fmod.bind_modal_history(plant._modal_state_history)
+    try:
+        res = fmod._directional_force_result(t, eta, None, omega, ac)
+        assert abs(res["Delta_q"]) < 1e-14
+        assert np.isfinite(res["F_projected"])
+        x_delayed = np.zeros(plant.state_dim)
+        x_delayed[0] = 5e-5
+        plant.record_modal_state(t - tau, x_delayed, omega=omega)
+        res2 = fmod._directional_force_result(t, eta, None, omega, ac)
+        assert abs(res2["Delta_q"]) > 1e-12
+    finally:
+        fmod.unbind_modal_history()
 
 
 # 9. Physical omega/ac vary with PPO action
@@ -243,7 +255,7 @@ def test_stability_lobe_script_runs_fast_config() -> None:
         cwd=str(root),
         capture_output=True,
         text=True,
-        timeout=300,
+        timeout=600,
         env=env,
     )
     assert result.returncode == 0, result.stderr + result.stdout

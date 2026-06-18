@@ -7,6 +7,7 @@ import numpy as np
 
 from custom_rl import register_envs
 from custom_rl.plants.mode_ordering import mode_index
+from custom_rl.plants.modal_state import split_modal_state
 from custom_rl.rewards.plate_rewards import SensorProductivePlateReward
 
 
@@ -66,10 +67,11 @@ def test_obs_sensor_part_matches_unclipped_normalization() -> None:
     assert np.allclose(unclipped[plant.n_sensors :], w_dot / plant.vel_norm_scale)
 
     # Matrix form must match direct reconstruction.
-    eta = x[0::2]
-    eta_dot = x[1::2]
-    assert np.allclose(w, plant.S_disp @ eta)
-    assert np.allclose(w_dot, plant.S_disp @ eta_dot)
+    eta_n, eta_dot_n, _, _ = split_modal_state(
+        x, plant.K, two_field=plant.milling_config.is_feed_normal_full()
+    )
+    assert np.allclose(w, plant.S_disp @ eta_n)
+    assert np.allclose(w_dot, plant.S_disp @ eta_dot_n)
 
     env.close()
 
@@ -118,14 +120,16 @@ def test_sensor_coordinates_are_valid_and_matrix_matches_mode_order() -> None:
     assert w_dot.shape == (plant.n_sensors,)
 
     # Manual reconstruction for one sensor to confirm ordering.
-    eta = x0[0::2]
+    eta_n, _, _, _ = split_modal_state(
+        x0, plant.K, two_field=plant.milling_config.is_feed_normal_full()
+    )
     manual = 0.0
     cnt = 0
     for m in range(plant.m_max):
         for n in range(plant.n_max):
             xs = float(plant.sensor_coords[0, 0])
             ys = float(plant.sensor_coords[0, 1])
-            manual += float(plant.W_mn[m][n](xs, ys)) * float(eta[cnt])
+            manual += float(plant.W_mn[m][n](xs, ys)) * float(eta_n[cnt])
             cnt += 1
     assert np.isclose(w[0], manual, rtol=1e-10, atol=1e-12)
 

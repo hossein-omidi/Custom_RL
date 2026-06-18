@@ -58,10 +58,14 @@ def make_config(
         "ac_grid": [0.5, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0],
         "n_rollouts": 5,
         "seeds": list(seeds),
-        "horizon_steps": 120,
+        "t_final_s": 2.0,
+        "macro_dt_s": 0.002,
+        "horizon_steps": None,
         "transient_fraction": 0.25,
         "unstable_threshold": 0.5,
+        "growth_factor": 3.0,
         "rms_unstable_factor": 3.0,
+        "initial_perturb_m": 1e-6,
         "controller_modes": ["uncontrolled"],
     }
     if stability_lobe:

@@ -1,16 +1,24 @@
 #!/usr/bin/env python3
 """
-Stability-lobe analysis: p_unstable(omega, ac) over a grid.
+Stability-lobe analysis for the regenerative surface-milling plant.
+
+Uncontrolled mode: conventional stability lobe  critical_ac(omega)  from fixed
+(omega, ac) with Test2-style response classification and Monte Carlo seeds.
+
+Trained mode: closed-loop *performance map* at grid initial conditions (agent may
+change omega/ac) plus action-visitation heatmap — not a conventional stability lobe.
 
 Usage:
     python scripts/stability_lobes.py --config conf_fast
-    python scripts/stability_lobes.py --config conf1 --controller uncontrolled trained
+    python scripts/stability_lobes.py --config conf_fast --controller uncontrolled trained
 """
 
 from __future__ import annotations
 
 import argparse
 import csv
+import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -28,6 +36,22 @@ if str(_ROOT) not in sys.path:
 
 from configs import list_configs, load_config
 from custom_rl import register_envs
+from custom_rl.analysis.milling_rollout import (
+    rollout_env_trained,
+    rollout_uncontrolled,
+)
+from custom_rl.analysis.response_classification import (
+    classify_milling_response,
+    metrics_from_rollout_dict,
+)
+from custom_rl.analysis.stability_lobe import (
+    critical_ac_curve_with_mc_std,
+    critical_ac_from_probability,
+    monotonicity_violations,
+    start_position_sensitivity,
+)
+from custom_rl.plants.plate import PlatePlant
+from custom_rl.plants.time_scales import recommend_integration_dt, tooth_period
 
 ENV_ID = "CustomODEPlate-v0"
 
@@ -38,267 +62,375 @@ def _build_env_kwargs(cfg: dict) -> dict:
     return kw
 
 
-def _classify_rollout(
-    sensor_w: np.ndarray,
-    transient_fraction: float,
-    displacement_limit: float,
-    rms_factor: float,
-    terminated: bool,
-    term_reason: str,
-) -> tuple[bool, float]:
-    """
-    Classify stable vs unstable from physical sensor displacement.
-
-    Unstable if: failure termination OR post-transient RMS exceeds rms_factor * baseline.
-    """
-    if terminated and term_reason.startswith("excessive"):
-        return True, float(np.nanmax(np.abs(sensor_w)))
-
-    n = sensor_w.shape[0]
-    start = int(np.floor(transient_fraction * n))
-    tail = sensor_w[start:]
-    if tail.size == 0:
-        return False, 0.0
-
-    rms = float(np.sqrt(np.mean(tail**2)))
-    head = sensor_w[: max(start, 1)]
-    baseline = float(np.sqrt(np.mean(head**2)) + 1e-12)
-    unstable = rms > rms_factor * baseline or rms > displacement_limit
-    return unstable, rms
+def _resolve_t_final(sl: dict, plant: PlatePlant, omega_grid: np.ndarray) -> float:
+    if sl.get("t_final_s") is not None:
+        return float(sl["t_final_s"])
+    horizon = sl.get("horizon_steps")
+    macro_dt = float(sl.get("macro_dt_s", 0.002))
+    if horizon is not None:
+        return float(horizon) * macro_dt
+    om_min = float(np.min(omega_grid))
+    om_max = float(np.max(omega_grid))
+    tau_max = tooth_period(om_max, plant.N)
+    t_rev_min = 2.0 * math.pi / om_min
+    return max(2.0, 40.0 * tau_max, 5.0 * t_rev_min)
 
 
-def _run_fixed_point_rollout(
-    env,
-    omega: float,
-    ac: float,
-    seed: int,
-    horizon: int,
-    policy: PPO | None,
-) -> dict:
-    plant = env.unwrapped.plant
-    u_fixed = plant.physical_to_normalized_action(np.array([omega, ac], dtype=np.float64))
+def _plant_kwargs_from_cfg(cfg: dict) -> dict:
+    import inspect
 
-    obs, _ = env.reset(seed=seed)
-    sensor_ws = []
-    actions_phys = []
-    terminated = False
-    term_reason = "pass_complete"
-
-    for _ in range(horizon):
-        if policy is not None:
-            action, _ = policy.predict(obs, deterministic=True)
-        else:
-            action = u_fixed
-        obs, _, term, trunc, info = env.step(action)
-        w = np.asarray(info.get("sensor_w", []), dtype=np.float64)
-        if w.size:
-            sensor_ws.append(float(np.max(np.abs(w))))
-        ap = info.get("action_phys")
-        if ap is not None:
-            actions_phys.append(np.asarray(ap, dtype=np.float64))
-        if term or trunc:
-            terminated = term
-            term_reason = str(info.get("termination_reason", "truncated"))
-            break
-
-    sw = np.asarray(sensor_ws, dtype=np.float64) if sensor_ws else np.zeros(1)
-    ap_arr = np.asarray(actions_phys, dtype=np.float64) if actions_phys else np.zeros((0, 2))
-    return {
-        "sensor_w_max": sw,
-        "terminated": terminated,
-        "term_reason": term_reason,
-        "actions_phys": ap_arr,
-    }
+    env_kw = _build_env_kwargs(cfg)
+    params = inspect.signature(PlatePlant.__init__).parameters
+    return {k: v for k, v in env_kw.items() if k in params and k != "self"}
 
 
-def run_stability_grid(
-    cfg: dict,
-    controller: str = "uncontrolled",
-    model_path: Path | None = None,
-) -> dict:
+def _make_plant(cfg: dict) -> PlatePlant:
+    return PlatePlant(**_plant_kwargs_from_cfg(cfg))
+
+
+def run_uncontrolled_lobe(cfg: dict) -> dict:
     sl = cfg["stability_lobe"]
     omega_grid = np.asarray(sl["omega_grid"], dtype=np.float64)
     ac_grid = np.asarray(sl["ac_grid"], dtype=np.float64)
     seeds = list(sl.get("seeds", cfg["seeds"]))
     n_rollouts = int(sl["n_rollouts"])
-    horizon = int(sl["horizon_steps"])
+    macro_dt = float(sl.get("macro_dt_s", cfg["env"].get("dt", 0.002)))
+    transient_fraction = float(sl["transient_fraction"])
+    threshold = float(sl["unstable_threshold"])
+    growth_factor = float(sl.get("growth_factor", sl.get("rms_unstable_factor", 3.0)))
+    perturb = float(sl.get("initial_perturb_m", 1e-6))
 
-    register_envs()
-    env_kwargs = _build_env_kwargs(cfg)
-    env = gym.make(ENV_ID, **env_kwargs)
-    plant = env.unwrapped.plant
+    plant = _make_plant(cfg)
+    if sl.get("pass_sampling"):
+        plant.pass_sampling = str(sl["pass_sampling"])
+    plant.reset(np.random.default_rng(0))
+    t_final = _resolve_t_final(sl, plant, omega_grid)
     disp_limit = float(plant.displacement_failure_limit)
 
-    policy = None
-    if controller == "trained":
-        if model_path is None or not model_path.exists():
-            raise FileNotFoundError(f"Trained policy required: {model_path}")
-        policy = PPO.load(str(model_path), device="cpu")
+    print(f"  t_final={t_final:.3f}s  macro_dt={macro_dt}s  rollouts/point={n_rollouts}")
+    scales = recommend_integration_dt(plant, macro_dt=macro_dt, training_mode=True)
+    print(f"  sub_dt={scales['dt_recommended_training_substep_s']:.2e}s  "
+          f"n_substeps={scales['n_substeps']}")
 
     n_omega, n_ac = len(omega_grid), len(ac_grid)
-    p_unstable = np.zeros((n_omega, n_ac), dtype=np.float64)
+    p_chatter = np.zeros((n_omega, n_ac), dtype=np.float64)
+    p_failed = np.zeros((n_omega, n_ac), dtype=np.float64)
+    p_bounded = np.zeros((n_omega, n_ac), dtype=np.float64)
     rms_mean = np.zeros((n_omega, n_ac), dtype=np.float64)
     rms_std = np.zeros((n_omega, n_ac), dtype=np.float64)
+    all_records: list[dict] = []
+
+    instability = np.zeros((n_omega, n_ac, n_rollouts), dtype=bool)
+    for i, omega in enumerate(omega_grid):
+        for j, ac in enumerate(ac_grid):
+            classes: list[str] = []
+            rms_vals: list[float] = []
+            for rollout in range(n_rollouts):
+                seed = int(seeds[rollout % len(seeds)] + 1000 * i + 10 * j + rollout)
+                rng = np.random.default_rng(seed)
+                raw = rollout_uncontrolled(
+                    plant, float(omega), float(ac),
+                    t_final=t_final, macro_dt=macro_dt, rng=rng, perturb=perturb,
+                )
+                raw["transient_fraction"] = transient_fraction
+                metrics = metrics_from_rollout_dict(raw)
+                klass = classify_milling_response(
+                    metrics,
+                    transient_fraction=transient_fraction,
+                    displacement_limit_m=disp_limit,
+                    growth_factor=growth_factor,
+                )
+                classes.append(klass)
+                rms_vals.append(metrics.rms_w_post_m)
+                instability[i, j, rollout] = klass == "chatter-like"
+                all_records.append({**raw, "class": klass, "seed": seed})
+
+            p_chatter[i, j] = float(np.mean([c == "chatter-like" for c in classes]))
+            p_failed[i, j] = float(np.mean([c == "failed" for c in classes]))
+            p_bounded[i, j] = float(np.mean([c == "bounded" for c in classes]))
+            rms_mean[i, j] = float(np.mean(rms_vals))
+            rms_std[i, j] = float(np.std(rms_vals))
+
+    critical_ac, critical_unc, critical_mc_std, p_mono = critical_ac_curve_with_mc_std(
+        omega_grid, ac_grid, instability, threshold=threshold,
+    )
+    start_sens = start_position_sensitivity(all_records, omega_grid, ac_grid)
+    mono_v = monotonicity_violations(p_mono)
+
+    return {
+        "map_type": "uncontrolled_stability_lobe",
+        "omega_grid": omega_grid,
+        "ac_grid": ac_grid,
+        "p_chatter": p_chatter,
+        "p_failed": p_failed,
+        "p_bounded": p_bounded,
+        "p_mono": p_mono,
+        "p_unstable": p_chatter,
+        "rms_mean": rms_mean,
+        "rms_std": rms_std,
+        "critical_ac": critical_ac,
+        "critical_ac_uncertainty": critical_unc,
+        "critical_ac_std": critical_mc_std,
+        "threshold": threshold,
+        "t_final_s": t_final,
+        "macro_dt_s": macro_dt,
+        "start_position": start_sens,
+        "monotonicity_violations": mono_v,
+        "records": all_records,
+    }
+
+
+def run_trained_performance_map(cfg: dict, model_path: Path) -> dict:
+    sl = cfg["stability_lobe"]
+    omega_grid = np.asarray(sl["omega_grid"], dtype=np.float64)
+    ac_grid = np.asarray(sl["ac_grid"], dtype=np.float64)
+    seeds = list(sl.get("seeds", cfg["seeds"]))
+    n_rollouts = int(sl["n_rollouts"])
+    transient_fraction = float(sl["transient_fraction"])
+    growth_factor = float(sl.get("growth_factor", sl.get("rms_unstable_factor", 3.0)))
+    perturb = float(sl.get("initial_perturb_m", 1e-6))
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Trained policy required: {model_path}")
+
+    register_envs()
+    env = gym.make(ENV_ID, **_build_env_kwargs(cfg))
+    plant = env.unwrapped.plant
+    step_dt = float(env.unwrapped._step_dt)
+    t_final = _resolve_t_final(sl, plant, omega_grid)
+    n_steps = max(int(math.ceil(t_final / step_dt)), 10)
+    disp_limit = float(plant.displacement_failure_limit)
+    policy = PPO.load(str(model_path), device="cpu")
+
+    n_omega, n_ac = len(omega_grid), len(ac_grid)
+    p_chatter = np.zeros((n_omega, n_ac), dtype=np.float64)
+    p_failed = np.zeros((n_omega, n_ac), dtype=np.float64)
+    rms_mean = np.zeros((n_omega, n_ac), dtype=np.float64)
+    reward_mean = np.zeros((n_omega, n_ac), dtype=np.float64)
     visit_density = np.zeros((n_omega, n_ac), dtype=np.float64)
 
     for i, omega in enumerate(omega_grid):
         for j, ac in enumerate(ac_grid):
-            flags = []
-            rms_vals = []
+            classes: list[str] = []
+            rms_vals: list[float] = []
+            rew_vals: list[float] = []
             for rollout in range(n_rollouts):
-                seed = int(seeds[rollout % len(seeds)] + 1000 * i + 10 * j + rollout)
-                out = _run_fixed_point_rollout(
-                    env, float(omega), float(ac), seed, horizon, policy
+                seed = int(seeds[rollout % len(seeds)] + 2000 * i + 10 * j + rollout)
+                raw = rollout_env_trained(
+                    env, float(omega), float(ac),
+                    seed=seed, n_steps=n_steps, policy=policy, perturb=perturb,
                 )
-                unstable, rms = _classify_rollout(
-                    out["sensor_w_max"],
-                    float(sl["transient_fraction"]),
-                    disp_limit,
-                    float(sl["rms_unstable_factor"]),
-                    out["terminated"],
-                    out["term_reason"],
+                raw["transient_fraction"] = transient_fraction
+                metrics = metrics_from_rollout_dict(raw)
+                klass = classify_milling_response(
+                    metrics,
+                    transient_fraction=transient_fraction,
+                    displacement_limit_m=disp_limit,
+                    growth_factor=growth_factor,
                 )
-                flags.append(unstable)
-                rms_vals.append(rms)
-                if policy is not None and out["actions_phys"].size:
-                    for ap in out["actions_phys"]:
-                        oi = int(np.argmin(np.abs(omega_grid - ap[0])))
-                        aj = int(np.argmin(np.abs(ac_grid - ap[1])))
-                        visit_density[oi, aj] += 1.0
+                classes.append(klass)
+                rms_vals.append(metrics.rms_w_post_m)
+                rew_vals.append(float(raw.get("mean_reward", 0.0)))
+                for ap in raw.get("actions_phys", np.zeros((0, 2))):
+                    oi = int(np.argmin(np.abs(omega_grid - ap[0])))
+                    aj = int(np.argmin(np.abs(ac_grid - ap[1])))
+                    visit_density[oi, aj] += 1.0
 
-            p_unstable[i, j] = float(np.mean(flags))
+            p_chatter[i, j] = float(np.mean([c == "chatter-like" for c in classes]))
+            p_failed[i, j] = float(np.mean([c == "failed" for c in classes]))
             rms_mean[i, j] = float(np.mean(rms_vals))
-            rms_std[i, j] = float(np.std(rms_vals))
+            reward_mean[i, j] = float(np.mean(rew_vals))
 
     env.close()
-
-    threshold = float(sl["unstable_threshold"])
-    critical_ac = np.full(n_omega, np.nan, dtype=np.float64)
-    for i in range(n_omega):
-        row = p_unstable[i, :]
-        cross = np.where(row >= threshold)[0]
-        if cross.size:
-            critical_ac[i] = float(ac_grid[cross[0]])
-        else:
-            above = np.where(row > 0.0)[0]
-            if above.size:
-                j0 = int(above[-1])
-                if j0 + 1 < n_ac:
-                    t = (threshold - row[j0]) / max(row[j0 + 1] - row[j0], 1e-12)
-                    critical_ac[i] = float(ac_grid[j0] + t * (ac_grid[j0 + 1] - ac_grid[j0]))
-
     return {
+        "map_type": "closed_loop_performance_map",
         "omega_grid": omega_grid,
         "ac_grid": ac_grid,
-        "p_unstable": p_unstable,
+        "p_chatter": p_chatter,
+        "p_failed": p_failed,
+        "p_unstable": p_chatter,
         "rms_mean": rms_mean,
-        "rms_std": rms_std,
-        "critical_ac": critical_ac,
+        "reward_mean": reward_mean,
         "visit_density": visit_density,
-        "controller": controller,
-        "threshold": threshold,
+        "t_final_s": t_final,
+        "step_dt_s": step_dt,
     }
 
 
-def _plot_heatmaps(data: dict, out_dir: Path) -> None:
+def _plot_uncontrolled(data: dict, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
-    og = data["omega_grid"]
-    ag = data["ac_grid"]
-    pu = data["p_unstable"]
+    og, ag = data["omega_grid"], data["ac_grid"]
+    pc = data["p_chatter"]
 
     fig, ax = plt.subplots(figsize=(8, 5))
     im = ax.imshow(
-        pu.T,
-        origin="lower",
-        aspect="auto",
-        extent=[og[0], og[-1], ag[0], ag[-1]],
-        vmin=0.0,
-        vmax=1.0,
-        cmap="RdYlGn_r",
+        pc.T, origin="lower", aspect="auto",
+        extent=[og[0], og[-1], ag[0], ag[-1]], vmin=0.0, vmax=1.0, cmap="RdYlGn_r",
     )
-    plt.colorbar(im, ax=ax, label="p_unstable")
-    ax.set_xlabel("Spindle speed omega [rad/s]")
-    ax.set_ylabel("Depth of cut ac")
-    ax.set_title(f"Stability lobe probability ({data['controller']})")
+    plt.colorbar(im, ax=ax, label="P(chatter-like)")
+    ax.set_xlabel("omega [rad/s]")
+    ax.set_ylabel("ac [mm]")
+    ax.set_title("Uncontrolled stability lobe (Monte Carlo)")
     fig.tight_layout()
     fig.savefig(out_dir / "stability_lobe_prob_heatmap.png", dpi=150)
     plt.close(fig)
 
+    pf = data["p_failed"]
     fig, ax = plt.subplots(figsize=(8, 5))
-    ax.plot(og, data["critical_ac"], "b-", lw=2, label="p_unstable threshold")
-    ax.fill_between(
-        og,
-        np.maximum(data["critical_ac"] - data["rms_std"].mean(axis=1), 0.0),
-        data["critical_ac"] + data["rms_std"].mean(axis=1),
-        alpha=0.25,
-        color="blue",
+    im = ax.imshow(
+        pf.T, origin="lower", aspect="auto",
+        extent=[og[0], og[-1], ag[0], ag[-1]], vmin=0.0, vmax=1.0, cmap="Oranges",
     )
+    plt.colorbar(im, ax=ax, label="P(failed)")
     ax.set_xlabel("omega [rad/s]")
-    ax.set_ylabel("critical ac")
-    ax.set_title("Stability boundary")
+    ax.set_ylabel("ac [mm]")
+    ax.set_title("Numerical / clip failure probability")
+    fig.tight_layout()
+    fig.savefig(out_dir / "failure_prob_heatmap.png", dpi=150)
+    plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(og, data["critical_ac"], "b-", lw=2, label=f"P(chatter)={data['threshold']}")
+    unc = data["critical_ac_uncertainty"]
+    ax.fill_between(og, data["critical_ac"] - unc, data["critical_ac"] + unc, alpha=0.25)
+    mc_std = data.get("critical_ac_std")
+    if mc_std is not None and np.any(np.isfinite(mc_std)):
+        ax.fill_between(
+            og,
+            data["critical_ac"] - mc_std,
+            data["critical_ac"] + mc_std,
+            alpha=0.15,
+            color="orange",
+            label="MC std",
+        )
+    ax.set_xlabel("omega [rad/s]")
+    ax.set_ylabel("critical ac [mm]")
+    ax.set_title("Conventional stability boundary (uncontrolled)")
     ax.legend()
     fig.tight_layout()
     fig.savefig(out_dir / "stability_lobe_boundary.png", dpi=150)
+    plt.close(fig)
+
+
+def _plot_trained(data: dict, out_dir: Path) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    og, ag = data["omega_grid"], data["ac_grid"]
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    im = ax.imshow(
+        data["p_chatter"].T, origin="lower", aspect="auto",
+        extent=[og[0], og[-1], ag[0], ag[-1]], vmin=0.0, vmax=1.0, cmap="RdYlGn_r",
+    )
+    plt.colorbar(im, ax=ax, label="P(chatter-like at initial op.)")
+    ax.set_xlabel("initial omega [rad/s]")
+    ax.set_ylabel("initial ac [mm]")
+    ax.set_title("Closed-loop performance map (NOT conventional stability lobe)")
+    fig.tight_layout()
+    fig.savefig(out_dir / "closed_loop_performance_map.png", dpi=150)
     plt.close(fig)
 
     vd = data["visit_density"]
     if np.any(vd > 0):
         fig, ax = plt.subplots(figsize=(8, 5))
         im2 = ax.imshow(
-            vd.T,
-            origin="lower",
-            aspect="auto",
-            extent=[og[0], og[-1], ag[0], ag[-1]],
-            cmap="Blues",
+            vd.T, origin="lower", aspect="auto",
+            extent=[og[0], og[-1], ag[0], ag[-1]], cmap="Blues",
         )
-        plt.colorbar(im2, ax=ax, label="visit count")
+        plt.colorbar(im2, ax=ax, label="action visit count")
         ax.set_xlabel("omega [rad/s]")
-        ax.set_ylabel("ac")
+        ax.set_ylabel("ac [mm]")
         ax.set_title("RL action visitation density")
         fig.tight_layout()
         fig.savefig(out_dir / "action_visit_heatmap.png", dpi=150)
         plt.close(fig)
 
 
-def _save_data(data: dict, out_dir: Path) -> None:
+def _save_outputs(data: dict, out_dir: Path) -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
+    og, ag = data["omega_grid"], data["ac_grid"]
+
     np.savez_compressed(
         out_dir / "stability_lobe_data.npz",
-        omega_grid=data["omega_grid"],
-        ac_grid=data["ac_grid"],
+        map_type=np.array(data["map_type"]),
+        omega_grid=og,
+        ac_grid=ag,
+        p_chatter=data["p_chatter"],
+        p_failed=data["p_failed"],
+        p_bounded=data.get("p_bounded", np.zeros_like(data["p_chatter"])),
         p_unstable=data["p_unstable"],
         rms_mean=data["rms_mean"],
-        rms_std=data["rms_std"],
-        critical_ac=data["critical_ac"],
-        visit_density=data["visit_density"],
-        threshold=data["threshold"],
-        controller=data["controller"],
+        rms_std=data.get("rms_std", np.zeros_like(data["rms_mean"])),
+        critical_ac=data.get("critical_ac", np.full(len(og), np.nan)),
+        critical_ac_uncertainty=data.get("critical_ac_uncertainty", np.zeros(len(og))),
+        critical_ac_std=data.get("critical_ac_std", np.zeros(len(og))),
+        threshold=np.array(data.get("threshold", 0.5)),
+        omega_units=np.array("rad/s"),
+        ac_units=np.array("mm"),
+        rms_units=np.array("m"),
+        t_final_s=np.array(data.get("t_final_s", 0.0)),
     )
+
     with open(out_dir / "stability_lobe_summary.csv", "w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["omega", "ac", "p_unstable", "rms_mean", "rms_std"])
-        for i, om in enumerate(data["omega_grid"]):
-            for j, ac in enumerate(data["ac_grid"]):
-                writer.writerow([
+        w = csv.writer(f)
+        w.writerow([
+            "omega_rad_s", "ac_mm", "p_chatter", "p_failed", "p_bounded",
+            "rms_mean_m", "rms_std_m",
+        ])
+        for i, om in enumerate(og):
+            for j, ac in enumerate(ag):
+                w.writerow([
                     om, ac,
-                    data["p_unstable"][i, j],
+                    data["p_chatter"][i, j],
+                    data["p_failed"][i, j],
+                    data.get("p_bounded", np.zeros_like(data["p_chatter"]))[i, j],
                     data["rms_mean"][i, j],
-                    data["rms_std"][i, j],
+                    data.get("rms_std", np.zeros_like(data["rms_mean"]))[i, j],
                 ])
+
+    if "critical_ac" in data:
+        with open(out_dir / "critical_ac_curve.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["omega_rad_s", "critical_ac_mm", "uncertainty_mm", "mc_std_mm"])
+            for om, ac_crit, unc, mcs in zip(
+                og, data["critical_ac"], data["critical_ac_uncertainty"],
+                data.get("critical_ac_std", np.zeros(len(og))),
+            ):
+                w.writerow([om, ac_crit, unc, mcs])
+
+    report = {
+        "map_type": data["map_type"],
+        "stability_criterion": (
+            "Monte Carlo classification per grid point: stable / bounded / "
+            "chatter-like / failed using sensor vibration, Delta_f, force-clip %, "
+            "finite-state check, and post-transient RMS growth (Test2 philosophy). "
+            "Lobe boundary: critical ac where P(chatter-like) crosses threshold."
+        ),
+        "stochastic_sources": (
+            "Episode geometry/sensor/pass-line resampling via plant.reset(seed); "
+            "enable_geometry_uncertainty, enable_sensor_uncertainty, "
+            "enable_process_noise, pass_sampling=random from env config."
+        ),
+        "t_final_s": data.get("t_final_s"),
+        "threshold": data.get("threshold"),
+    }
+    if "start_position" in data:
+        report["start_position_sensitivity"] = data["start_position"]
+    if "monotonicity_violations" in data:
+        report["monotonicity_violations_ac_scan"] = data["monotonicity_violations"]
+
+    with open(out_dir / "stability_lobe_report.json", "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
 
 
 def main() -> int:
     available = ", ".join(list_configs()) or "conf_fast"
-    parser = argparse.ArgumentParser(description="Stability-lobe Monte Carlo analysis")
+    parser = argparse.ArgumentParser(description="Regenerative milling stability-lobe analysis")
     parser.add_argument("--config", default="conf_fast", help=f"Config ({available})")
     parser.add_argument(
-        "--controller",
-        nargs="+",
-        default=None,
+        "--controller", nargs="+", default=None,
         choices=["uncontrolled", "trained"],
-        help="Controller modes to evaluate",
     )
-    parser.add_argument("--model", type=Path, default=None, help="Path to trained PPO zip")
+    parser.add_argument("--model", type=Path, default=None)
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -311,11 +443,21 @@ def main() -> int:
         model_path = Path(cfg["model_dir"]) / f"final_{seed}.zip"
 
     for mode in modes:
-        print(f"[stability] controller={mode} config={args.config}")
-        data = run_stability_grid(cfg, controller=mode, model_path=model_path)
-        sub = out_base / mode
-        _save_data(data, sub)
-        _plot_heatmaps(data, sub)
+        print(f"[stability] mode={mode} config={args.config}")
+        if mode == "uncontrolled":
+            data = run_uncontrolled_lobe(cfg)
+            sub = out_base / "uncontrolled"
+            _save_outputs(data, sub)
+            _plot_uncontrolled(data, sub)
+            sp = data.get("start_position", {})
+            print(f"  critical_ac range: {np.nanmin(data['critical_ac']):.2f}-"
+                  f"{np.nanmax(data['critical_ac']):.2f} mm")
+            print(f"  start-position 3D lobe recommended: {sp.get('recommend_3d_lobe', False)}")
+        else:
+            data = run_trained_performance_map(cfg, model_path)
+            sub = out_base / "trained"
+            _save_outputs(data, sub)
+            _plot_trained(data, sub)
         print(f"  saved -> {sub}")
 
     return 0

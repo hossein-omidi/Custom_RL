@@ -239,16 +239,23 @@ def build_process_noise_vector(
     eta_dot_std = config.eta_dot_std_per_sqrt_s * scale
 
     noise = np.zeros(state_dim, dtype=np.float64)
-    for k in range(K):
-        noise[2 * k] = float(rng.normal(0.0, eta_std))
-        noise[2 * k + 1] = float(rng.normal(0.0, eta_dot_std))
+    n_subsystems = state_dim // (2 * K)
+    for sub in range(n_subsystems):
+        base = sub * 2 * K
+        for k in range(K):
+            noise[base + 2 * k] = float(rng.normal(0.0, eta_std))
+            noise[base + 2 * k + 1] = float(rng.normal(0.0, eta_dot_std))
 
     if config.clip_sigma > 0.0:
         eta_lim = config.clip_sigma * eta_std
         eta_dot_lim = config.clip_sigma * eta_dot_std
-        for k in range(K):
-            noise[2 * k] = float(np.clip(noise[2 * k], -eta_lim, eta_lim))
-            noise[2 * k + 1] = float(np.clip(noise[2 * k + 1], -eta_dot_lim, eta_dot_lim))
+        for sub in range(n_subsystems):
+            base = sub * 2 * K
+            for k in range(K):
+                noise[base + 2 * k] = float(np.clip(noise[base + 2 * k], -eta_lim, eta_lim))
+                noise[base + 2 * k + 1] = float(
+                    np.clip(noise[base + 2 * k + 1], -eta_dot_lim, eta_dot_lim)
+                )
 
     return noise
 

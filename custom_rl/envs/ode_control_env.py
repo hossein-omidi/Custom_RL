@@ -140,14 +140,30 @@ class ODEControlEnv(gym.Env):
         if hasattr(self.plant, "_modal_state_history"):
             f_nonlinear2.bind_modal_history(self.plant._modal_state_history)
         try:
-            self._state = self._integrate(
-                self.plant.dynamics,
-                self._t,
-                self._state,
-                action,
-                self.dt,
-                n_steps=self.n_substeps,
+            t_cur = float(self._t)
+            x = self._state.copy()
+            omega_phys = (
+                float(self.plant._scale_action(action)[0])
+                if hasattr(self.plant, "_scale_action")
+                else None
             )
+            for _ in range(self.n_substeps):
+                x = self._integrate(
+                    self.plant.dynamics,
+                    t_cur,
+                    x,
+                    action,
+                    self.dt,
+                    n_steps=1,
+                )
+                t_cur += self.dt
+                if hasattr(self.plant, "record_modal_state"):
+                    self.plant.record_modal_state(
+                        t_cur, x, omega=omega_phys if omega_phys is not None else None
+                    )
+                else:
+                    f_nonlinear2.record_modal_state(t_cur, x)
+            self._state = x
         finally:
             f_nonlinear2.unbind_modal_history()
         # Add process noise (stochastic dynamics)
@@ -163,12 +179,6 @@ class ODEControlEnv(gym.Env):
             )
         self._t += self._step_dt
         self._step_count += 1
-
-        if hasattr(self.plant, "record_modal_state"):
-            omega_phys = float(self.plant._scale_action(action)[0])
-            self.plant.record_modal_state(self._t, self._state, omega=omega_phys)
-        else:
-            f_nonlinear2.record_modal_state(self._t, self._state)
 
         terminated, truncated_term, term_info = self.plant.termination(
             self._t, self._state

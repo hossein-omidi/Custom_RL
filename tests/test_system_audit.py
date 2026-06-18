@@ -50,7 +50,7 @@ def test_reward_uses_sensor_not_modal() -> None:
 
 
 def test_regenerative_history_one_entry_per_env_step() -> None:
-    """RK4 internals must not flood delay history."""
+    """Accepted history must grow per substep, not per RK4 internal stage."""
     register_envs()
     env = gym.make(
         "CustomODEPlate-v0",
@@ -63,6 +63,7 @@ def test_regenerative_history_one_entry_per_env_step() -> None:
     )
     env.reset(seed=0)
     plant = env.unwrapped.plant
+    n_sub = env.unwrapped.n_substeps
     n0 = len(plant._modal_state_history)
     assert n0 == 1  # recorded at reset t=0
 
@@ -70,7 +71,11 @@ def test_regenerative_history_one_entry_per_env_step() -> None:
         env.step(env.action_space.sample())
 
     n1 = len(plant._modal_state_history)
-    assert n1 == n0 + 5, f"expected 6 history entries, got {n1}"
+    expected = n0 + 5 * n_sub
+    assert n1 == expected, f"expected {expected} history entries, got {n1}"
+    times = [h[0] for h in plant._modal_state_history]
+    assert times == sorted(times)
+    assert len(set(times)) == len(times)
     env.close()
 
 

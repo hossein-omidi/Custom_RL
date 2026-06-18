@@ -32,6 +32,47 @@ def pass_line_x_positions(
     return np.linspace(margin, L1 - margin, n_lines, dtype=np.float64)
 
 
+def build_middle_line_trajectory(
+    x_mid: float,
+    y_start: float,
+    y_end: float,
+    feed_speed: float,
+    dt: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """
+    Straight-line surface milling path through plate middle.
+
+    x_c(t) = x_mid
+    y_c(t) = y_start + sign(y_end - y_start) * feed_speed * t
+
+    Clamped so 0 <= y_c <= plate span when y_start/y_end are inside bounds.
+    """
+    if feed_speed <= 0.0:
+        raise ValueError("feed_speed must be > 0.")
+    if dt <= 0.0:
+        raise ValueError("dt must be > 0.")
+
+    y_start_val = float(y_start)
+    y_end_val = float(y_end)
+    travel = abs(y_end_val - y_start_val)
+    if travel <= 0.0:
+        t_original = np.array([0.0], dtype=np.float64)
+        x_traj = np.array([float(x_mid)], dtype=np.float64)
+        y_traj = np.array([y_start_val], dtype=np.float64)
+        return t_original, x_traj, y_traj, 0.0
+
+    s_feed = 1.0 if y_end_val >= y_start_val else -1.0
+    pass_duration = travel / feed_speed
+    t_original = np.arange(0.0, pass_duration + dt, dt, dtype=np.float64)
+    t_original = t_original[t_original <= pass_duration + 1e-12]
+    if t_original.size == 0:
+        t_original = np.array([0.0], dtype=np.float64)
+
+    x_traj = np.full(t_original.shape, float(x_mid), dtype=np.float64)
+    y_traj = y_start_val + s_feed * feed_speed * t_original
+    return t_original, x_traj, y_traj, float(pass_duration)
+
+
 def build_straight_pass_trajectory(
     x_line: float,
     L2: float,

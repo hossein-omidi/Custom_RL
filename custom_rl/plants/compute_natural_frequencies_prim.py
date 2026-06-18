@@ -80,7 +80,10 @@ def compute_lambda_star(b_a, mode, mode_type):
 
     col = mode - 1
     y = lambda_star_table[:, col]
-    lambda_star_val = np.interp(b_a, b_a_values, y)
+    # Table is stored with decreasing b_a (MATLAB convention); np.interp needs ascending xp.
+    xp = b_a_values[::-1]
+    fp = y[::-1]
+    lambda_star_val = np.interp(b_a, xp, fp)
     return lambda_star_val
 
 

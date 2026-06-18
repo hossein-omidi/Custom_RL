@@ -9,15 +9,20 @@ from gymnasium import spaces
 
 from custom_rl.plants.base import ODEPlant
 from custom_rl.plants import f_nonlinear2
-from custom_rl.plants.compute_mode_shapes import compute_mode_shapes
+from custom_rl.plants.compute_mode_shapes import ModeShapeBasis, compute_mode_shapes
 from custom_rl.plants.compute_natural_frequencies import compute_natural_frequencies
 from custom_rl.plants.compute_nonlinear_stiffness import compute_nonlinear_stiffness
+from custom_rl.plants.compute_natural_frequencies_prim import compute_natural_frequencies_prim
+from custom_rl.plants.modal_state import split_modal_state, state_dim_for_model
 from custom_rl.plants.mode_ordering import (
     build_sensor_displacement_matrix,
     flatten_mode_matrix,
     mode_index_map,
 )
+from custom_rl.plants.milling_config import MillingForceConfig
+from custom_rl.plants.units import FORCE_COEFFICIENT_SCALE, calibrated_cutting_coefficients
 from custom_rl.plants.pass_schedule import (
+    build_middle_line_trajectory,
     build_straight_pass_trajectory,
     pass_line_x_positions,
 )
@@ -60,7 +65,7 @@ class PlatePlant(ODEPlant):
     **PPO interface**
 
         Observation: [w_s_norm..., ẇ_s_norm..., prev_u_ω, prev_u_ac]
-        Action:      [u_ω, u_ac] ∈ [-1, 1]²
+        Action:      [u_ω, u_ac] ∈ [-1, 1]²  →  physical [ω rad/s, a_c mm]
     """
 
     def __init__(
@@ -106,6 +111,23 @@ class PlatePlant(ODEPlant):
         sensor_uncertainty: SensorUncertaintyConfig | None = None,
         process_noise: ProcessNoiseConfig | None = None,
         sensor_coords_relative: list[tuple[float, float]] | None = None,
+        # Directional milling force (see milling_config.py)
+        milling_type: str = "surface",
+        phi_st: float | None = None,
+        phi_ex: float | None = None,
+        phi_0: float = 0.0,
+        cutter_diameter: float = 0.02,
+        helix_angle: float = 0.0,
+        axial_quadrature_points: int = 5,
+        ac_via_axial_integration: bool = True,
+        ac_units: str = "mm",
+        displacement_model: str = "feed_normal_full",
+        feed_per_tooth_source: str = "from_feed_speed",
+        cf_units: str = "m_per_tooth",
+        trajectory_mode: str = "middle_line",
+        path_x_mid: float | None = None,
+        path_y_start: float | None = None,
+        path_y_end: float = 0.0,
     ):
         """
         Args:
@@ -120,8 +142,8 @@ class PlatePlant(ODEPlant):
             n_max: maximum mode index in y direction
             omega_min: minimum physical spindle/angular input
             omega_max: maximum physical spindle/angular input
-            ac_min: minimum physical control coefficient/input
-            ac_max: maximum physical control coefficient/input
+            ac_min: minimum physical axial depth of cut (mm by default; see ac_units)
+            ac_max: maximum physical axial depth of cut (mm by default; see ac_units)
             eta_limit: optional internal modal safety limit (not used for main termination)
             eta_obs_limit: legacy unused observation bound
             eta_dot_obs_limit: legacy unused observation bound
@@ -206,7 +228,6 @@ class PlatePlant(ODEPlant):
         self.m_max = m_max
         self.n_max = n_max
         self.K = self.m_max * self.n_max
-        self.state_dim = 2 * self.K
 
         self.omega_min = omega_min
         self.omega_max = omega_max
@@ -272,6 +293,30 @@ class PlatePlant(ODEPlant):
         self.pass_sampling = pass_sampling
         self.pass_complete_tolerance = float(pass_complete_tolerance)
 
+        self.milling_config = MillingForceConfig(
+            milling_type=milling_type,
+            phi_st=phi_st,
+            phi_ex=phi_ex,
+            phi_0=phi_0,
+            cutter_diameter=cutter_diameter,
+            helix_angle=helix_angle,
+            axial_quadrature_points=axial_quadrature_points,
+            ac_via_axial_integration=ac_via_axial_integration,
+            ac_units=ac_units,
+            displacement_model=displacement_model,
+            feed_per_tooth_source=feed_per_tooth_source,
+            cf_units=cf_units,
+        )
+
+        if trajectory_mode not in {"middle_line", "pass_grid"}:
+            raise ValueError('trajectory_mode must be "middle_line" or "pass_grid".')
+        self.trajectory_mode = trajectory_mode
+        self.path_x_mid = path_x_mid
+        self.path_y_start = path_y_start
+        self.path_y_end = float(path_y_end)
+
+        self.state_dim = state_dim_for_model(self.K, self.milling_config)
+
         self._pass_counter = 0
         self.current_pass_line_index = 0
         self.current_pass_x = 0.0
@@ -311,6 +356,7 @@ class PlatePlant(ODEPlant):
             self.sensor_coords,
             self.m_max,
             self.n_max,
+            mode_basis=self.mode_basis,
         )
 
     def _rebuild_modal_physics(self) -> None:
@@ -323,6 +369,13 @@ class PlatePlant(ODEPlant):
         self.M_modal = M_modal
 
         W_mn, V_mn = compute_mode_shapes(
+            self.L1,
+            self.L2,
+            self.h,
+            self.m_max,
+            self.n_max,
+        )
+        self.mode_basis = ModeShapeBasis.build(
             self.L1,
             self.L2,
             self.h,
@@ -343,7 +396,7 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
-        lambda_mn, _lambda_prime_mn = compute_nonlinear_stiffness(
+        lambda_mn, lambda_prime_mn = compute_nonlinear_stiffness(
             self.E,
             self.nu,
             self.h,
@@ -355,24 +408,42 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
+        omega_prime_mn = compute_natural_frequencies_prim(
+            self.E,
+            self.nu,
+            self.rho,
+            self.h,
+            self.L1,
+            self.L2,
+            self.m_max,
+            self.n_max,
+        )
+
         omega_vec = flatten_mode_matrix(omega_mn, self.m_max, self.n_max)
         lambda_vec = flatten_mode_matrix(lambda_mn, self.m_max, self.n_max)
+        omega_f_vec = flatten_mode_matrix(omega_prime_mn, self.m_max, self.n_max)
+        lambda_f_vec = flatten_mode_matrix(lambda_prime_mn, self.m_max, self.n_max)
         self.omega_vec = omega_vec
         self.lambda_vec = lambda_vec
+        self.omega_f_vec = omega_f_vec
+        self.lambda_f_vec = lambda_f_vec
         self.mode_index_map = mode_index_map(self.m_max, self.n_max)
 
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
+        zeta_f_vec = 0.05 * np.ones(self.K, dtype=np.float64)
         cf = 0.3
 
-        xi_base = np.array(
-            [6765e9, -4910e6, 2840e3, 132],
-            dtype=np.float64,
-        ) / 2.5
+        z_contact = float(self.h if self.milling_config.z_contact is None else self.milling_config.z_contact)
+        self.z_contact = z_contact
+        self.milling_config.z_contact = z_contact
 
-        delta_base = np.array(
-            [12740e9, -7452e6, 1674e3, 246],
-            dtype=np.float64,
-        ) / 2.5
+        M_modal_f = M_modal
+        self.M_modal_f = M_modal_f
+
+        xi_base, delta_base = calibrated_cutting_coefficients()
+        self.force_coefficient_scale = FORCE_COEFFICIENT_SCALE
+        self.xi_base = xi_base
+        self.delta_base = delta_base
 
         f_nonlinear2.m_max = self.m_max
         f_nonlinear2.n_max = self.n_max
@@ -381,15 +452,26 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.zeta_vec = zeta_vec
         f_nonlinear2.lambda_vec = lambda_vec
         f_nonlinear2.omega_vec = omega_vec
+        f_nonlinear2.zeta_f_vec = zeta_f_vec
+        f_nonlinear2.lambda_f_vec = lambda_f_vec
+        f_nonlinear2.omega_f_vec = omega_f_vec
         f_nonlinear2.xi_base = xi_base
         f_nonlinear2.delta_base = delta_base
         f_nonlinear2.W_mn = W_mn
+        f_nonlinear2.V_mn = V_mn
+        f_nonlinear2.mode_basis = self.mode_basis
         f_nonlinear2.cf = cf
         f_nonlinear2.t_original = self.t_original
         f_nonlinear2.x_traj = self.x_traj
         f_nonlinear2.y_traj = self.y_traj
+        f_nonlinear2.feed_speed = self.feed_speed
         f_nonlinear2.M_modal = M_modal
+        f_nonlinear2.M_modal_f = M_modal_f
+        f_nonlinear2.z_contact = z_contact
+        f_nonlinear2.milling_cfg = self.milling_config
         f_nonlinear2.decimal_places = 1
+
+        self.state_dim = state_dim_for_model(self.K, self.milling_config)
 
         self._rebuild_sensor_matrix()
 
@@ -419,23 +501,59 @@ class PlatePlant(ODEPlant):
         return process_noise_info(self.process_noise, step_dt)
 
     def _configure_pass_line(self, line_index: int) -> dict[str, Any]:
-        """Select a pass line and install the straight reference tool trajectory."""
-        if line_index < 0 or line_index >= self.n_pass_lines:
-            raise ValueError(
-                f"line_index must be in [0, {self.n_pass_lines}), got {line_index}."
+        """Install reference tool trajectory for the episode."""
+        if self.trajectory_mode == "middle_line":
+            x_mid = float(self.path_x_mid if self.path_x_mid is not None else 0.5 * self.L1)
+            y_start = float(self.path_y_start if self.path_y_start is not None else self.L2)
+            y_end = float(self.path_y_end)
+            if not (0.0 <= x_mid <= self.L1):
+                raise ValueError(f"path x_mid={x_mid} outside [0, L1={self.L1}].")
+            if not (0.0 <= y_start <= self.L2) or not (0.0 <= y_end <= self.L2):
+                raise ValueError("path y_start/y_end must lie in [0, L2].")
+            t_original, x_traj, y_traj, pass_duration = build_middle_line_trajectory(
+                x_mid=x_mid,
+                y_start=y_start,
+                y_end=y_end,
+                feed_speed=self.feed_speed,
+                dt=self.traj_dt,
             )
-
-        self.current_pass_line_index = int(line_index)
-        self.current_pass_x = float(self.pass_x_positions[line_index])
-
-        t_original, x_traj, y_traj, pass_duration = build_straight_pass_trajectory(
-            x_line=self.current_pass_x,
-            L2=self.L2,
-            feed_speed=self.feed_speed,
-            dt=self.traj_dt,
-            y_start=self.L2,
-            y_end=0.0,
-        )
+            self.current_pass_line_index = 0
+            self.current_pass_x = x_mid
+            pass_info = {
+                "pass_line_index": 0,
+                "pass_x": x_mid,
+                "pass_duration": pass_duration,
+                "trajectory_mode": "middle_line",
+                "path_x_mid": x_mid,
+                "path_y_start": y_start,
+                "path_y_end": y_end,
+                "feed_speed": self.feed_speed,
+            }
+        else:
+            if line_index < 0 or line_index >= self.n_pass_lines:
+                raise ValueError(
+                    f"line_index must be in [0, {self.n_pass_lines}), got {line_index}."
+                )
+            self.current_pass_line_index = int(line_index)
+            self.current_pass_x = float(self.pass_x_positions[line_index])
+            t_original, x_traj, y_traj, pass_duration = build_straight_pass_trajectory(
+                x_line=self.current_pass_x,
+                L2=self.L2,
+                feed_speed=self.feed_speed,
+                dt=self.traj_dt,
+                y_start=self.L2,
+                y_end=0.0,
+            )
+            pass_info = {
+                "pass_line_index": self.current_pass_line_index,
+                "pass_x": self.current_pass_x,
+                "pass_duration": pass_duration,
+                "trajectory_mode": "pass_grid",
+                "n_pass_lines": self.n_pass_lines,
+                "feed_speed": self.feed_speed,
+                "y_start": float(self.L2),
+                "y_end": 0.0,
+            }
 
         self.t_original = t_original
         self.x_traj = x_traj
@@ -447,15 +565,7 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.y_traj = self.y_traj
         f_nonlinear2.reset_episode_state(self._modal_state_history)
 
-        return {
-            "pass_line_index": self.current_pass_line_index,
-            "pass_x": self.current_pass_x,
-            "pass_duration": self.pass_duration,
-            "n_pass_lines": self.n_pass_lines,
-            "feed_speed": self.feed_speed,
-            "y_start": float(self.L2),
-            "y_end": 0.0,
-        }
+        return pass_info
 
     def recommended_max_episode_steps(self, step_dt: float, safety_margin: int = 10) -> int:
         """Episode horizon covering one full pass plus a small safety margin."""
@@ -550,10 +660,15 @@ class PlatePlant(ODEPlant):
             "vel_norm_scale_m_s": float(self.vel_norm_scale),
             "physical_action_low": self.u_phys_low.tolist(),
             "physical_action_high": self.u_phys_high.tolist(),
+            "physical_action_units": ["rad/s", self.milling_config.ac_units],
             "displacement_failure_limit_m": float(self.displacement_failure_limit),
             "velocity_failure_limit_m_s": float(self.velocity_failure_limit),
             "n_modal_modes": int(self.K),
+            "n_modal_subsystems": 2 if self.milling_config.is_feed_normal_full() else 1,
+            "state_dim": int(self.state_dim),
+            "trajectory_mode": self.trajectory_mode,
             "n_sensors": int(self.n_sensors),
+            "milling_force": self.milling_config.to_dict(),
         }
 
     def tool_position_at(self, t: float) -> tuple[float, float]:
@@ -578,7 +693,7 @@ class PlatePlant(ODEPlant):
         State derivative: dx/dt = dynamics(t, x, u).
 
         The environment supplies normalized action in [-1, 1]^2.
-        This method scales it to physical [omega, ac] before calling f_nonlinear2.
+        This method scales it to physical [omega rad/s, ac mm] before calling f_nonlinear2.
         """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
 
@@ -701,10 +816,14 @@ class PlatePlant(ODEPlant):
             np.any(np.abs(w_dot_sensors) > self.velocity_failure_limit)
         )
 
-        eta = x[0::2]
-        eta_dot = x[1::2]
-        excessive_modal_displacement = bool(np.any(np.abs(eta) > self.eta_limit))
-        excessive_modal_velocity = bool(np.any(np.abs(eta_dot) > self.eta_dot_limit))
+        eta_n, eta_dot_n, _, _ = split_modal_state(
+            x,
+            self.K,
+            two_field=self.milling_config.is_feed_normal_full(),
+        )
+
+        excessive_modal_displacement = bool(np.any(np.abs(eta_n) > self.eta_limit))
+        excessive_modal_velocity = bool(np.any(np.abs(eta_dot_n) > self.eta_dot_limit))
         excessive_internal_modal = self.use_eta_internal_safety and (
             excessive_modal_displacement or excessive_modal_velocity
         )
@@ -809,9 +928,12 @@ class PlatePlant(ODEPlant):
                 f"PlatePlant expects internal state shape ({self.state_dim},), got {x.shape}."
             )
 
-        eta = x[0::2]
-        eta_dot = x[1::2]
+        eta_n, eta_dot_n, _, _ = split_modal_state(
+            x,
+            self.K,
+            two_field=self.milling_config.is_feed_normal_full(),
+        )
 
-        w_sensors = self.S_disp @ eta
-        w_dot_sensors = self.S_disp @ eta_dot
+        w_sensors = self.S_disp @ eta_n
+        w_dot_sensors = self.S_disp @ eta_dot_n
         return w_sensors, w_dot_sensors

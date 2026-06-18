@@ -515,7 +515,7 @@ def plot_action_trajectories(
     t_grid, x_label = _time_grid(T, A.shape[1])
 
     if action_dim == 2:
-        action_labels = ["omega", "ac"]
+        action_labels = ["omega [rad/s]", "ac [mm]"]
     else:
         action_labels = [f"action{idx}" for idx in range(action_dim)]
 

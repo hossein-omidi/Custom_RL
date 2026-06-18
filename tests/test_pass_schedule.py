@@ -35,6 +35,7 @@ def test_reset_is_stationary_and_selects_pass_line() -> None:
         n_pass_lines=10,
         feed_speed=0.5,
         pass_sampling="sequential",
+        trajectory_mode="pass_grid",
         enable_geometry_uncertainty=False,
         enable_sensor_uncertainty=False,
         enable_process_noise=False,

@@ -47,6 +47,8 @@ def build_sensor_displacement_matrix(
     sensor_coords: np.ndarray,
     m_max: int,
     n_max: int,
+    *,
+    mode_basis=None,
 ) -> np.ndarray:
     """
   Build S_disp with shape (n_sensors, K) such that:
@@ -61,12 +63,50 @@ def build_sensor_displacement_matrix(
     K = m_max * n_max
 
     S = np.zeros((n_sensors, K), dtype=np.float64)
+    if mode_basis is not None:
+        for i in range(n_sensors):
+            S[i, :] = mode_basis.w_values(
+                float(sensor_coords[i, 0]),
+                float(sensor_coords[i, 1]),
+            )
+        return S
     for m, n, k in iter_mode_indices(m_max, n_max):
         Wk = W_mn[m][n]
         for i in range(n_sensors):
             xs = float(sensor_coords[i, 0])
             ys = float(sensor_coords[i, 1])
             S[i, k] = float(np.asarray(Wk(xs, ys), dtype=np.float64).item())
+    return S
+
+
+def build_feed_displacement_matrix(
+    V_mn,
+    sensor_coords: np.ndarray,
+    z_contact: float,
+    m_max: int,
+    n_max: int,
+    *,
+    mode_basis=None,
+) -> np.ndarray:
+    """
+    Build S_feed with shape (n_sensors, K) such that:
+        w_f = S_feed @ eta_f
+    Entry: S[i, k] = V_k(z_contact, y_s_i)
+    """
+    sensor_coords = np.asarray(sensor_coords, dtype=np.float64)
+    n_sensors = int(sensor_coords.shape[0])
+    K = m_max * n_max
+    z_c = float(z_contact)
+    S = np.zeros((n_sensors, K), dtype=np.float64)
+    if mode_basis is not None:
+        for i in range(n_sensors):
+            S[i, :] = mode_basis.v_values(z_c, float(sensor_coords[i, 1]))
+        return S
+    for m, n, k in iter_mode_indices(m_max, n_max):
+        Vk = V_mn[m][n]
+        for i in range(n_sensors):
+            ys = float(sensor_coords[i, 1])
+            S[i, k] = float(np.asarray(Vk(z_c, ys), dtype=np.float64).item())
     return S
 
 

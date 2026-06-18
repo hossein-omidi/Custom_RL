@@ -39,7 +39,7 @@ class SensorProductivePlateReward:
         eta_dot_weight_vel: float = 0.1,
         action_smoothness_weight: float = 0.0,
         productivity_weight: float = 10.0,
-        ac_productive_target: float = 5.0,
+        ac_productive_target: float = 5.0,  # mm (matches physical action ac)
         alive_bonus: float = 1.0,
         termination_penalty: float = 100.0,
     ):

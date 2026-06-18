@@ -72,6 +72,7 @@ def test_sensor_and_pass_vary_per_reset() -> None:
         enable_process_noise=False,
         pass_sampling="random",
         n_pass_lines=20,
+        trajectory_mode="pass_grid",
     )
     plant = env.unwrapped.plant
 
@@ -116,11 +117,12 @@ def test_random_pass_line_default() -> None:
     register_envs()
     env = gym.make(
         "CustomODEPlate-v0",
+        pass_sampling="random",
+        n_pass_lines=50,
+        trajectory_mode="pass_grid",
         enable_geometry_uncertainty=False,
         enable_sensor_uncertainty=False,
         enable_process_noise=False,
-        pass_sampling="random",
-        n_pass_lines=50,
     )
 
     indices = set()
