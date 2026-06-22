@@ -9,6 +9,13 @@ from gymnasium.utils.env_checker import check_env
 
 from custom_rl import register_envs
 
+ENV_ID = "CustomODEPlate-v0"
+ENV_KWARGS = {
+    "dt": 0.001,
+    "n_substeps": 1,
+    "max_episode_steps": 500,
+}
+
 
 @pytest.fixture(scope="module")
 def registered():
@@ -16,20 +23,19 @@ def registered():
 
 
 def test_check_env_dense(registered) -> None:
-    env = gym.make("CustomODECartPole-v0", reward_id="dense")
+    env = gym.make(ENV_ID, reward_id="dense", **ENV_KWARGS)
     check_env(env.unwrapped, skip_render_check=True)
     env.close()
 
 
 def test_check_env_sparse(registered) -> None:
-    env = gym.make("CustomODECartPole-v0", reward_id="sparse")
+    env = gym.make(ENV_ID, reward_id="sparse", **ENV_KWARGS)
     check_env(env.unwrapped, skip_render_check=True)
     env.close()
 
 
 def test_rollout_finite(registered) -> None:
-    register_envs()
-    env = gym.make("CustomODECartPole-v0", reward_id="dense")
+    env = gym.make(ENV_ID, reward_id="dense", **ENV_KWARGS)
     obs, _ = env.reset(seed=42)
     for _ in range(20):
         action = env.action_space.sample()
@@ -44,7 +50,7 @@ def test_rollout_finite(registered) -> None:
 
 
 def test_deterministic_reset(registered) -> None:
-    env = gym.make("CustomODECartPole-v0", reward_id="dense")
+    env = gym.make(ENV_ID, reward_id="dense", **ENV_KWARGS)
     o1, _ = env.reset(seed=99)
     o2, _ = env.reset(seed=99)
     assert (o1 == o2).all()

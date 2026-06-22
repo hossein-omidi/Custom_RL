@@ -11,19 +11,29 @@ from gymnasium.utils.env_checker import check_env
 
 from custom_rl import register_envs
 
+ENV_ID = "CustomODEPlate-v0"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Check custom RL env with Gymnasium.")
-    parser.add_argument("--reward", default="dense", choices=["dense", "sparse"])
+    parser.add_argument("--reward", default="dense", choices=["dense", "sparse", "quadratic"])
     parser.add_argument("--steps", type=int, default=50, help="Rollout steps")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--max-episode-steps", type=int, default=1000)
     args = parser.parse_args()
 
     register_envs()
-    env = gym.make("CustomODECartPole-v0", reward_id=args.reward)
+    env = gym.make(
+        ENV_ID,
+        reward_id=args.reward,
+        dt=args.dt,
+        n_substeps=1,
+        max_episode_steps=args.max_episode_steps,
+    )
     raw_env = env.unwrapped
 
-    print("Running Gymnasium check_env (skip_render_check=True)...")
+    print(f"Running Gymnasium check_env on {ENV_ID} (skip_render_check=True)...")
     check_env(raw_env, skip_render_check=True)
     print("check_env passed.")
 
@@ -43,7 +53,13 @@ def main() -> int:
     env.close()
 
     print("\nDeterminism check (same seed -> same first obs)...")
-    env2 = gym.make("CustomODECartPole-v0", reward_id=args.reward)
+    env2 = gym.make(
+        ENV_ID,
+        reward_id=args.reward,
+        dt=args.dt,
+        n_substeps=1,
+        max_episode_steps=args.max_episode_steps,
+    )
     o1, _ = env.reset(seed=args.seed)
     o2, _ = env2.reset(seed=args.seed)
     env2.close()

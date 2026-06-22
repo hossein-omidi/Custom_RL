@@ -27,15 +27,14 @@ class DenseProductivePlateReward:
         ac    in [ac_min, ac_max]
 
     Reward:
-        reward = alive_bonus
-               + productivity_weight * productivity_score
+        reward = productivity_weight * productivity_score
                - vibration_cost
                - velocity_cost
                - negative_ac_cost
                - action_regularization
 
     Notes:
-        - productivity_score encourages nonzero productive cutting.
+        - productivity_score is zero when ac=0 (no cutting), so idle motion earns no reward.
         - vibration penalties suppress chatter/plate vibration.
         - negative_ac_cost discourages nonphysical negative cutting intensity.
         - action_regularization is optional and should stay small.
@@ -52,10 +51,10 @@ class DenseProductivePlateReward:
         eta_dot_scale: float = 1e-2,
         omega_min: float = 50.0,
         omega_max: float = 2000.0,
-        ac_min: float = -10.0,
-        ac_max: float = 10.0,
-        ac_productive_target: float = 5.0,
-        alive_bonus: float = 1.0,
+        ac_min: float = 0.0,
+        ac_max: float = 20.0,
+        ac_productive_target: float = 10.0,
+        alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
     ):
         self.eta_weight = eta_weight
@@ -142,7 +141,7 @@ class DenseProductivePlateReward:
         productivity_score = omega_score * ac_score
 
         negative_ac = max(-ac, 0.0)
-        negative_ac_cost = (negative_ac / max(abs(self.ac_min), 1e-12)) ** 2
+        negative_ac_cost = (negative_ac / max(self.ac_max, 1e-12)) ** 2
 
         action_cost = np.mean(np.clip(u, -1.0, 1.0) ** 2)
 
@@ -232,6 +231,9 @@ class SparseStablePlateReward:
     """
     Sparse reward for simple stability testing.
     """
+
+    def __init__(self, **kwargs: Any) -> None:
+        pass
 
     def __call__(
         self,

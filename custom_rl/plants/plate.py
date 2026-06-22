@@ -43,7 +43,7 @@ class PlatePlant(ODEPlant):
         omega_min: float = 50,
         omega_max: float = 2000.0,
         ac_min: float = 0,
-        ac_max: float = 10.0,
+        ac_max: float = 20.0,
         eta_limit: float = 0.01,
         eta_obs_limit: float = 1e6,
         eta_dot_obs_limit: float = 1e6,
@@ -232,8 +232,10 @@ class PlatePlant(ODEPlant):
         """
         Sample initial modal displacement and velocity.
         """
-        eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
-        eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
+        #eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
+        #eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
+        eta0 = rng.uniform(0, 0, size=self.K)
+        eta_dot0 = rng.uniform(0, 0, size=self.K)
 
         x0 = np.zeros(self.state_dim, dtype=np.float64)
         x0[0::2] = eta0

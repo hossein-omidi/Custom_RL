@@ -91,6 +91,12 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     reward_kwargs = {k: v for k, v in kwargs.items() if k in reward_keys}
 
     plant = PlatePlant(**plant_kwargs)
+
+    # Keep reward action scaling aligned with the plant.
+    for bound_key in ("omega_min", "omega_max", "ac_min", "ac_max"):
+        reward_kwargs.setdefault(bound_key, getattr(plant, bound_key))
+    reward_kwargs.setdefault("ac_productive_target", plant.ac_max / 2.0)
+
     reward_fn = get_plate_reward(reward_id, **reward_kwargs)
 
     return ODEControlEnv(
