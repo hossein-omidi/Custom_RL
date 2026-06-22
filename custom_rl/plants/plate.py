@@ -232,6 +232,8 @@ class PlatePlant(ODEPlant):
         """
         Sample initial modal displacement and velocity.
         """
+        f_nonlinear2.reset_state_history()
+
         #eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
         #eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
         eta0 = rng.uniform(0, 0, size=self.K)
