@@ -28,7 +28,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=100_000)
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -49,14 +49,14 @@ def main() -> None:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=1000,
+        default=4800,
         help="Maximum steps per episode",
     )
 
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=1,
+        default=5,
         help="Number of evaluation episodes",
     )
 

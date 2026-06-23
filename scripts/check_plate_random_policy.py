@@ -241,7 +241,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dt", type=float, default=0.001)
-    parser.add_argument("--max-episode-steps", type=int, default=5000)
+    parser.add_argument("--max-episode-steps", type=int, default=10000)
     parser.add_argument("--out-dir", default=str(Path(DEFAULT_PLOT_DIR) / "pretrain"))
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ac.")
     parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed.")
