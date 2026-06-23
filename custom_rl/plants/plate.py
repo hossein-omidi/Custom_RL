@@ -47,7 +47,16 @@ class PlatePlant(ODEPlant):
         eta_limit: float = 0.01,
         eta_obs_limit: float = 1e6,
         eta_dot_obs_limit: float = 1e6,
+            sensor_points: tuple[tuple[float, float], ...] = (
+        (0.83, 0.20),
+        (0.17, 0.20),
+        ),
+        w_limit: float = 1e-3,
+        w_obs_scale: float = 1e5,
+        wdot_obs_scale: float = 1e3,
+        physical_obs_limit: float = 1e3,
     ):
+
         """
         Args:
             N: number of teeth / force-related model parameter used by f_nonlinear2
@@ -89,7 +98,22 @@ class PlatePlant(ODEPlant):
         self.eta_limit = eta_limit
         self.eta_obs_limit = eta_obs_limit
         self.eta_dot_obs_limit = eta_dot_obs_limit
+        
+        self.sensor_points = np.asarray(sensor_points, dtype=np.float64)
 
+        if self.sensor_points.ndim != 2 or self.sensor_points.shape[1] != 2:
+            raise ValueError(
+                "sensor_points must have shape (n_sensors, 2), "
+                "with each row equal to [x_sensor, y_sensor]."
+            )
+
+        self.n_sensors = int(self.sensor_points.shape[0])
+        self.w_limit = float(w_limit)
+        self.w_obs_scale = float(w_obs_scale)
+        self.wdot_obs_scale = float(wdot_obs_scale)
+        self.physical_obs_limit = float(physical_obs_limit)
+        self.obs_dim = 2 * self.n_sensors
+        
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
             dtype=np.float64,
@@ -115,6 +139,12 @@ class PlatePlant(ODEPlant):
             self.m_max,
             self.n_max,
         )
+        
+        
+        self.W_mn = W_mn
+        self.V_mn = V_mn
+        self.Phi_sensor = self._build_sensor_matrix()
+
 
         # Natural frequencies
         omega_mn = compute_natural_frequencies(
@@ -247,46 +277,61 @@ class PlatePlant(ODEPlant):
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         """
-        Terminate if modal displacement becomes unsafe or state becomes invalid.
+        Terminate if the modal state becomes invalid, modal coordinates become
+        numerically unsafe, or the physical vibration at the measurement
+        locations exceeds the physical limit.
         """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
         eta = x[0::2]
 
         invalid_state = not np.all(np.isfinite(x))
-        excessive_displacement = np.any(np.abs(eta) > self.eta_limit)
+        excessive_modal_displacement = np.any(np.abs(eta) > self.eta_limit)
 
-        terminated = bool(invalid_state or excessive_displacement)
+        excessive_physical_displacement = False
+        max_abs_w_sensor = np.nan
 
-        info: dict[str, Any] = {}
+        if not invalid_state:
+            signals = self.modal_to_physical_signals(x)
+            w_sensor = signals["w_sensor"]
+            max_abs_w_sensor = float(np.max(np.abs(w_sensor)))
+            excessive_physical_displacement = bool(max_abs_w_sensor > self.w_limit)
+
+        terminated = bool(
+            invalid_state
+            or excessive_modal_displacement
+            or excessive_physical_displacement
+        )
+
+        info: dict[str, Any] = {
+            "max_abs_w_sensor": max_abs_w_sensor,
+        }
 
         if invalid_state:
             info["termination_reason"] = "invalid_state"
-
-        if excessive_displacement:
+        elif excessive_modal_displacement:
             info["termination_reason"] = "excessive_modal_displacement"
+        elif excessive_physical_displacement:
+            info["termination_reason"] = "excessive_physical_displacement"
 
         return terminated, False, info
-
+    
+    
     def get_observation_space(self) -> spaces.Space:
         """
         Return Gymnasium observation space.
 
         Observation:
-            [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+            [scaled_w1, scaled_w2, scaled_wdot1, scaled_wdot2]
+
+        More generally, for n_sensors:
+            [scaled_w_sensor, scaled_wdot_sensor]
         """
-        low = np.zeros(self.state_dim, dtype=np.float64)
-        high = np.zeros(self.state_dim, dtype=np.float64)
-
-        low[0::2] = -self.eta_obs_limit
-        high[0::2] = self.eta_obs_limit
-
-        low[1::2] = -self.eta_dot_obs_limit
-        high[1::2] = self.eta_dot_obs_limit
+        high = self.physical_obs_limit * np.ones(self.obs_dim, dtype=np.float64)
 
         return spaces.Box(
-            low=low,
+            low=-high,
             high=high,
-            shape=(self.state_dim,),
+            shape=(self.obs_dim,),
             dtype=np.float64,
         )
 
@@ -306,8 +351,76 @@ class PlatePlant(ODEPlant):
 
     def state_to_obs(self, x: np.ndarray) -> np.ndarray:
         """
-        Map internal state to observation.
+        Map internal modal state to physical observation.
 
-        Here, observation is equal to the full modal state.
+        The simulator keeps modal state internally, but the RL agent observes
+        physical displacement and velocity at the selected locations.
         """
-        return np.asarray(x, dtype=np.float64).reshape(-1)
+        signals = self.modal_to_physical_signals(x)
+
+        w_sensor = signals["w_sensor"]
+        wdot_sensor = signals["wdot_sensor"]
+
+        obs = np.concatenate(
+            [
+                self.w_obs_scale * w_sensor,
+                self.wdot_obs_scale * wdot_sensor,
+            ]
+        )
+
+        obs = np.asarray(obs, dtype=np.float64)
+        obs = np.nan_to_num(
+            obs,
+            nan=0.0,
+            posinf=self.physical_obs_limit,
+            neginf=-self.physical_obs_limit,
+        )
+
+        return obs
+
+
+    def _build_sensor_matrix(self) -> np.ndarray:
+        """
+        Build fixed physical measurement matrix.
+
+        Phi[i, k] = W_k(xs_i, ys_i)
+
+        where i is the abstract sensor/location index and k is the modal index.
+        """
+        Phi = np.zeros((self.n_sensors, self.K), dtype=np.float64)
+
+        cnt = 0
+        for m in range(self.m_max):
+            for n in range(self.n_max):
+                Wk = self.W_mn[m][n]
+                for i, (xs, ys) in enumerate(self.sensor_points):
+                    Phi[i, cnt] = Wk(float(xs), float(ys))
+                cnt += 1
+
+        return Phi
+
+
+    def modal_to_physical_signals(self, x: np.ndarray) -> dict[str, np.ndarray]:
+        """
+        Convert internal modal state to physical displacement and velocity
+        at the abstract measurement locations.
+
+        Internal state:
+            x = [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+
+        Physical reconstruction:
+            w_sensor    = Phi @ eta
+            wdot_sensor = Phi @ eta_dot
+        """
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+
+        eta = x[0::2]
+        eta_dot = x[1::2]
+
+        w_sensor = self.Phi_sensor @ eta
+        wdot_sensor = self.Phi_sensor @ eta_dot
+
+        return {
+            "w_sensor": np.asarray(w_sensor, dtype=np.float64),
+            "wdot_sensor": np.asarray(wdot_sensor, dtype=np.float64),
+        }

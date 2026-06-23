@@ -28,7 +28,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -59,6 +59,21 @@ def main() -> None:
         default=5,
         help="Number of evaluation episodes",
     )
+    
+    parser.add_argument(
+    "--dt",
+    type=float,
+    default=0.001,
+    help="Environment integration/control step size",
+)
+
+    parser.add_argument(
+        "--n-substeps",
+        type=int,
+        default=1,
+        help="Number of RK4 substeps per environment step",
+    )
+        
 
     args = parser.parse_args()
 
@@ -72,6 +87,8 @@ def main() -> None:
     env_kwargs = {
         "reward_id": args.reward,
         "max_episode_steps": args.max_episode_steps,
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
     }
 
     for seed in args.seeds:
@@ -110,13 +127,14 @@ def main() -> None:
             "MlpPolicy",
             env,
             seed=seed,
-            learning_rate=3e-4,
+            learning_rate=1e-4,
             n_steps=2048,
-            batch_size=64,
+            batch_size=128,
             n_epochs=10,
-            gamma=0.99,
+            gamma=0.995,
             gae_lambda=0.95,
             clip_range=0.2,
+            policy_kwargs=dict(log_std_init=-1.5),
             verbose=1,
             device="cpu",
         )

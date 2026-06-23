@@ -82,15 +82,29 @@ class ODEControlEnv(gym.Env):
         options: Optional[dict[str, Any]] = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         super().reset(seed=seed)
-        # Use env's np_random (set by super) for determinism with reset() vs reset(seed=X)
+
         rng = self.np_random
-        self._state, info = self.plant.reset(rng)
+        self._state, reset_info = self.plant.reset(rng)
         self._t = 0.0
         self._step_count = 0
+
+        signal_info = self._plant_signal_info(self._state)
+
         obs = self.plant.state_to_obs(self._state)
         obs = self._add_obs_noise(obs)
         obs = self._clip_obs(obs)
+
+        info: dict[str, Any] = {
+            "t": self._t,
+            "x_modal": self._state.copy(),
+            "state": self._state.copy(),  # kept for old eval/plot compatibility
+            **reset_info,
+            **signal_info,
+        }
+
         return obs, info
+    
+    
 
     def step(
         self, action: np.ndarray
@@ -119,6 +133,13 @@ class ODEControlEnv(gym.Env):
         truncated_time = self._step_count >= self.max_episode_steps
         truncated = truncated_term or truncated_time
 
+        signal_info = self._plant_signal_info(self._state)
+
+        reward_info: dict[str, Any] = {
+            **term_info,
+            **signal_info,
+        }
+
         reward = self.reward_fn(
             self._t - self._step_dt,
             x_prev,
@@ -126,18 +147,26 @@ class ODEControlEnv(gym.Env):
             self._state,
             terminated,
             truncated,
-            term_info,
+            reward_info,
         )
 
-        info: dict[str, Any] = {"t": self._t, "state": self._state.copy(), **term_info}
+        info: dict[str, Any] = {
+            "t": self._t,
+            "x_modal": self._state.copy(),
+            "state": self._state.copy(),  # kept for old eval/plot compatibility
+            **reward_info,
+        }
+
         if truncated_time:
             info["TimeLimit.truncated"] = True
 
         obs = self.plant.state_to_obs(self._state)
         obs = self._add_obs_noise(obs)
         obs = self._clip_obs(obs)
-        return obs, float(reward), terminated, truncated, info
 
+        return obs, float(reward), terminated, truncated, info
+    
+    
     def _clamp_action(self, action: np.ndarray) -> np.ndarray:
         if isinstance(self.action_space, spaces.Box):
             low = np.asarray(self.action_space.low, dtype=np.float64)
@@ -152,6 +181,17 @@ class ODEControlEnv(gym.Env):
             high = np.asarray(self.observation_space.high, dtype=np.float64)
             return np.clip(np.asarray(obs, dtype=np.float64), low, high)
         return np.asarray(obs, dtype=np.float64)
+    
+    
+    def _plant_signal_info(self, x: np.ndarray) -> dict[str, Any]:
+        """
+        Optional plant-specific physical signals for reward, logging, eval, and plots.
+        """
+        if hasattr(self.plant, "modal_to_physical_signals"):
+            return self.plant.modal_to_physical_signals(x)
+        return {}
+
+
 
     def _add_obs_noise(self, obs: np.ndarray) -> np.ndarray:
         """Add observation noise (stochastic observations)."""

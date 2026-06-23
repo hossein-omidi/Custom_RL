@@ -75,6 +75,11 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "eta_limit",
         "eta_obs_limit",
         "eta_dot_obs_limit",
+        "sensor_points",
+        "w_limit",
+        "w_obs_scale",
+        "wdot_obs_scale",
+        "physical_obs_limit",
     }
 
     reward_keys = {
@@ -85,6 +90,12 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "eta_dot_scale",
         "alive_bonus",
         "termination_penalty",
+        "productivity_weight",
+        "negative_ac_weight",
+        "ac_productive_target",
+        "max_component_cost",
+        "reward_clip_min",
+        "reward_clip_max",
     }
 
     plant_kwargs = {k: v for k, v in kwargs.items() if k in plant_keys}

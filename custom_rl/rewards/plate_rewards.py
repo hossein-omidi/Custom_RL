@@ -8,6 +8,42 @@ import numpy as np
 
 from custom_rl.rewards.base import RewardFn
 
+def _sensor_costs_from_info(
+    info: dict[str, Any],
+    w_scale: float,
+    wdot_scale: float,
+    max_component_cost: float,
+) -> tuple[float, float, np.ndarray, np.ndarray]:
+    """
+    Compute bounded physical displacement and velocity costs from info.
+
+    Required info keys:
+        info["w_sensor"]
+        info["wdot_sensor"]
+    """
+    if "w_sensor" not in info or "wdot_sensor" not in info:
+        raise KeyError(
+            "Reward requires info['w_sensor'] and info['wdot_sensor']. "
+            "Make sure ODEControlEnv passes plant.modal_to_physical_signals()."
+        )
+
+    w_sensor = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
+    wdot_sensor = np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1)
+
+    if not np.all(np.isfinite(w_sensor)):
+        raise ValueError("w_sensor contains non-finite values.")
+
+    if not np.all(np.isfinite(wdot_sensor)):
+        raise ValueError("wdot_sensor contains non-finite values.")
+
+    w_cost = np.mean((w_sensor / w_scale) ** 2)
+    wdot_cost = np.mean((wdot_sensor / wdot_scale) ** 2)
+
+    w_cost = float(np.clip(w_cost, 0.0, max_component_cost))
+    wdot_cost = float(np.clip(wdot_cost, 0.0, max_component_cost))
+
+    return w_cost, wdot_cost, w_sensor, wdot_sensor
+
 
 class DenseProductivePlateReward:
     """
@@ -40,15 +76,16 @@ class DenseProductivePlateReward:
         - action_regularization is optional and should stay small.
     """
 
+
     def __init__(
         self,
         eta_weight: float = 1.0,
-        eta_dot_weight: float = 0.1,
-        action_weight: float = 0.0,
-        productivity_weight: float = 10.0,
-        negative_ac_weight: float = 2.0,
+        eta_dot_weight: float = 0.05,
+        action_weight: float = 0.001,
+        productivity_weight: float = 20.0,
+        negative_ac_weight: float = 0.0,
         eta_scale: float = 1e-3,
-        eta_dot_scale: float = 1e-2,
+        eta_dot_scale: float = 5e-2,
         omega_min: float = 50.0,
         omega_max: float = 2000.0,
         ac_min: float = 0.0,
@@ -56,6 +93,9 @@ class DenseProductivePlateReward:
         ac_productive_target: float = 10.0,
         alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        max_component_cost: float = 100.0,
+        reward_clip_min: float = -300.0,
+        reward_clip_max: float = 20.0,
     ):
         self.eta_weight = eta_weight
         self.eta_dot_weight = eta_dot_weight
@@ -74,6 +114,9 @@ class DenseProductivePlateReward:
 
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
+        self.max_component_cost = max_component_cost
+        self.reward_clip_min = reward_clip_min
+        self.reward_clip_max = reward_clip_max
 
         if self.omega_max <= self.omega_min:
             raise ValueError("omega_max must be greater than omega_min.")
@@ -83,6 +126,14 @@ class DenseProductivePlateReward:
 
         if self.ac_productive_target <= 0.0:
             raise ValueError("ac_productive_target must be positive.")
+
+        if self.eta_scale <= 0.0:
+            raise ValueError("eta_scale/w_scale must be positive.")
+
+        if self.eta_dot_scale <= 0.0:
+            raise ValueError("eta_dot_scale/wdot_scale must be positive.")
+        
+        
 
     def _scale_action(self, u: np.ndarray) -> tuple[float, float]:
         """
@@ -123,11 +174,15 @@ class DenseProductivePlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        eta = x_next[0::2]
-        eta_dot = x_next[1::2]
-
-        eta_cost = np.mean((eta / self.eta_scale) ** 2)
-        eta_dot_cost = np.mean((eta_dot / self.eta_dot_scale) ** 2)
+        try:
+            w_cost, wdot_cost, w_sensor, wdot_sensor = _sensor_costs_from_info(
+                info=info,
+                w_scale=self.eta_scale,
+                wdot_scale=self.eta_dot_scale,
+                max_component_cost=self.max_component_cost,
+            )
+        except (KeyError, ValueError):
+            return -float(self.termination_penalty)
 
         omega, ac = self._scale_action(u)
 
@@ -143,11 +198,11 @@ class DenseProductivePlateReward:
         negative_ac = max(-ac, 0.0)
         negative_ac_cost = (negative_ac / max(self.ac_max, 1e-12)) ** 2
 
-        action_cost = np.mean(np.clip(u, -1.0, 1.0) ** 2)
+        action_cost = float(np.mean(np.clip(u, -1.0, 1.0) ** 2))
 
         vibration_cost = (
-            self.eta_weight * eta_cost
-            + self.eta_dot_weight * eta_dot_cost
+            self.eta_weight * w_cost
+            + self.eta_dot_weight * wdot_cost
         )
 
         reward = (
@@ -161,7 +216,19 @@ class DenseProductivePlateReward:
         if terminated:
             reward -= self.termination_penalty
 
-        return float(reward)
+        info["reward_w_cost"] = w_cost
+        info["reward_wdot_cost"] = wdot_cost
+        info["reward_action_cost"] = action_cost
+        info["reward_productivity_score"] = productivity_score
+        info["reward_vibration_cost"] = vibration_cost
+        info["max_abs_w_sensor"] = float(np.max(np.abs(w_sensor)))
+        info["max_abs_wdot_sensor"] = float(np.max(np.abs(wdot_sensor)))
+
+        return float(np.clip(reward, self.reward_clip_min, self.reward_clip_max))
+        
+        
+    
+    
 
 
 class DenseQuadraticPlateReward:
@@ -175,12 +242,15 @@ class DenseQuadraticPlateReward:
     def __init__(
         self,
         eta_weight: float = 1.0,
-        eta_dot_weight: float = 0.1,
-        action_weight: float = 0.01,
+        eta_dot_weight: float = 0.05,
+        action_weight: float = 0.001,
         eta_scale: float = 1e-3,
-        eta_dot_scale: float = 1e-2,
-        alive_bonus: float = 1.0,
+        eta_dot_scale: float = 5e-2,
+        alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        max_component_cost: float = 100.0,
+        reward_clip_min: float = -300.0,
+        reward_clip_max: float = 20.0,
     ):
         self.eta_weight = eta_weight
         self.eta_dot_weight = eta_dot_weight
@@ -189,6 +259,15 @@ class DenseQuadraticPlateReward:
         self.eta_dot_scale = eta_dot_scale
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
+        self.max_component_cost = max_component_cost
+        self.reward_clip_min = reward_clip_min
+        self.reward_clip_max = reward_clip_max
+
+        if self.eta_scale <= 0.0:
+            raise ValueError("eta_scale/w_scale must be positive.")
+
+        if self.eta_dot_scale <= 0.0:
+            raise ValueError("eta_dot_scale/wdot_scale must be positive.")
 
     def __call__(
         self,
@@ -206,16 +285,21 @@ class DenseQuadraticPlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        eta = x_next[0::2]
-        eta_dot = x_next[1::2]
+        try:
+            w_cost, wdot_cost, w_sensor, wdot_sensor = _sensor_costs_from_info(
+                info=info,
+                w_scale=self.eta_scale,
+                wdot_scale=self.eta_dot_scale,
+                max_component_cost=self.max_component_cost,
+            )
+        except (KeyError, ValueError):
+            return -float(self.termination_penalty)
 
-        eta_cost = np.mean((eta / self.eta_scale) ** 2)
-        eta_dot_cost = np.mean((eta_dot / self.eta_dot_scale) ** 2)
-        action_cost = np.mean(np.clip(u, -1.0, 1.0) ** 2)
+        action_cost = float(np.mean(np.clip(u, -1.0, 1.0) ** 2))
 
         cost = (
-            self.eta_weight * eta_cost
-            + self.eta_dot_weight * eta_dot_cost
+            self.eta_weight * w_cost
+            + self.eta_dot_weight * wdot_cost
             + self.action_weight * action_cost
         )
 
@@ -224,7 +308,14 @@ class DenseQuadraticPlateReward:
         if terminated:
             reward -= self.termination_penalty
 
-        return float(reward)
+        info["reward_w_cost"] = w_cost
+        info["reward_wdot_cost"] = wdot_cost
+        info["reward_action_cost"] = action_cost
+        info["max_abs_w_sensor"] = float(np.max(np.abs(w_sensor)))
+        info["max_abs_wdot_sensor"] = float(np.max(np.abs(wdot_sensor)))
+
+        return float(np.clip(reward, self.reward_clip_min, self.reward_clip_max))
+
 
 
 class SparseStablePlateReward:
