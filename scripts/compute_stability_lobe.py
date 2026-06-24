@@ -19,6 +19,10 @@ Run from the project root:
 Example single-condition check (same physics, different script):
 
     python scripts/check_plate_random_policy.py --fixed-action --omega 500 --ac 5
+
+3D stability surface (optional):
+
+    python scripts/compute_stability_lobe.py --surface-3d --y0-min 0.05 --y0-max 0.45 --y0-points 5
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from pathlib import Path
 import gymnasium as gym
 import matplotlib.pyplot as plt
 import numpy as np
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3D projection)
 
 from custom_rl import register_envs
 from custom_rl.plants.plate import estimate_pass_episode_steps
@@ -117,7 +122,7 @@ def classify_stability(
       - or the vibration RMS envelope clearly grows over time.
     """
     if w_series.size == 0:
-        return True, 0.0, 0.0, 0.0, 1.0
+        return True, 0.0, 0.0, 0.0, 0.0, 1.0
 
     max_abs_w = float(np.max(w_series))
     rms_w = float(np.sqrt(np.mean(w_series ** 2)))
@@ -335,7 +340,7 @@ def compute_lobe(args: argparse.Namespace) -> tuple[list[dict], dict]:
         "No-control stability lobe sweep\n"
         f"  rpm range     : {args.rpm_min:.0f} - {args.rpm_max:.0f} rpm "
         f"({args.rpm_points} points)\n"
-        f"  ac search     : {plant.ac_min:.3f} – {plant.ac_max:.3f} mm\n"
+        f"  ac search     : {plant.ac_min:.3f} - {plant.ac_max:.3f} mm\n"
         f"  dt            : {args.dt} s, substeps={args.n_substeps}\n"
         f"  w_limit       : {plant.w_limit} m\n"
     )
@@ -427,6 +432,176 @@ def compute_lobe(args: argparse.Namespace) -> tuple[list[dict], dict]:
     return rows, metadata
 
 
+def sweep_rpm_boundary_at_y0(
+    env: gym.Env,
+    plant,
+    rpm_values: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    y0_m: float,
+    seed_offset: int,
+) -> list[dict]:
+    """
+    Estimate the 2D stability boundary over rpm at a fixed milling start y0.
+
+    Sets plant.set_milling_start_y(y0_m) so f_nonlinear2.y_cutter and the modal
+    force projection W_k(x_c, y0) both follow the selected start point.
+    """
+    plant.set_milling_start_y(y0_m)
+    rows: list[dict] = []
+
+    for index, rpm in enumerate(rpm_values):
+        omega = rpm_to_omega(float(rpm))
+        omega = float(np.clip(omega, plant.omega_min, plant.omega_max))
+        rpm_clipped = omega_to_rpm(omega)
+
+        max_steps = simulation_steps_for_rpm(
+            rpm_clipped,
+            dt=args.dt,
+            n_substeps=args.n_substeps,
+            plant=plant,
+            sim_seconds=args.sim_seconds,
+            max_sim_steps=args.max_sim_steps,
+        )
+
+        print(
+            f"    rpm={rpm_clipped:.0f} (omega={omega:.1f} rad/s), "
+            f"max_steps={max_steps}"
+        )
+
+        ac_stable, stable_trial, unstable_trial = find_max_stable_ac(
+            env,
+            omega_rad_s=omega,
+            ac_min=plant.ac_min,
+            ac_max=plant.ac_max,
+            max_steps=max_steps,
+            seed=args.seed + seed_offset + index,
+            ac_tol_mm=args.ac_tol,
+            max_binary_iters=args.binary_iters,
+            rms_growth_threshold=args.rms_growth_threshold,
+            w_limit_fraction=args.w_limit_fraction,
+        )
+
+        row = {
+            "rpm": rpm_clipped,
+            "omega_rad_s": omega,
+            "y0_m": y0_m,
+            "ac_stable_mm": ac_stable,
+            "max_abs_w_m": stable_trial.max_abs_w_m,
+            "rms_w_m": stable_trial.rms_w_m,
+            "rms_growth_ratio": stable_trial.rms_growth_ratio,
+            "sim_steps": stable_trial.steps,
+            "sim_time_s": stable_trial.sim_time_s,
+            "termination_reason": stable_trial.termination_reason,
+            "stable_at_boundary": stable_trial.stable,
+            "unstable_ac_mm": None if unstable_trial is None else unstable_trial.ac_mm,
+            "unstable_max_abs_w_m": None if unstable_trial is None else unstable_trial.max_abs_w_m,
+        }
+        rows.append(row)
+
+        print(
+            f"      -> stable boundary ac ~ {ac_stable:.3f} mm "
+            f"(max|w|={stable_trial.max_abs_w_m:.4e} m, "
+            f"rms growth={stable_trial.rms_growth_ratio:.2f})"
+        )
+
+    return rows
+
+
+def compute_lobe_surface_3d(args: argparse.Namespace) -> tuple[list[dict], dict]:
+    """
+    Sweep y0 and rpm to estimate ac_stable = f(rpm, y0).
+
+    Practical time-domain estimate of the no-control stability boundary surface.
+    Physical accuracy depends on the regenerative force model (STATE_DELAY) and
+    on y0 correctly updating both cutter path and force projection via
+    PlatePlant.set_milling_start_y -> f_nonlinear2.y_cutter / _compute_b_vec_at.
+    RL/control is not used.
+    """
+    register_envs()
+
+    env_kwargs: dict = {
+        "reward_id": "sparse",
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
+    }
+    if args.max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = args.max_episode_steps
+
+    env = gym.make(ENV_ID, **env_kwargs)
+    plant = env.unwrapped.plant
+
+    rpm_values = np.linspace(args.rpm_min, args.rpm_max, args.rpm_points)
+    y0_values = np.linspace(args.y0_min, args.y0_max, args.y0_points)
+    rows: list[dict] = []
+
+    print(
+        "No-control 3D stability surface sweep\n"
+        f"  rpm range     : {args.rpm_min:.0f} - {args.rpm_max:.0f} rpm "
+        f"({args.rpm_points} points)\n"
+        f"  y0 range      : {args.y0_min:.3f} - {args.y0_max:.3f} m "
+        f"({args.y0_points} points)\n"
+        f"  ac search     : {plant.ac_min:.3f} - {plant.ac_max:.3f} mm\n"
+        f"  dt            : {args.dt} s, substeps={args.n_substeps}\n"
+        f"  w_limit       : {plant.w_limit} m\n"
+    )
+
+    for y_index, y0_m in enumerate(y0_values):
+        y0_m = float(y0_m)
+        print(
+            f"[y0 {y_index + 1}/{len(y0_values)}] milling start y0={y0_m:.3f} m "
+            f"(L2={plant.L2:.3f} m)"
+        )
+
+        y_rows = sweep_rpm_boundary_at_y0(
+            env,
+            plant,
+            rpm_values,
+            args,
+            y0_m=y0_m,
+            seed_offset=y_index * 1000,
+        )
+        rows.extend(y_rows)
+
+    env.close()
+
+    metadata = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "method": "time_domain_no_control_binary_search_3d_surface",
+        "note": (
+            "Practical time-domain estimate of the no-control stability boundary "
+            "surface ac_stable = f(rpm, y0). Accuracy depends on regenerative "
+            "delay dynamics (STATE_DELAY) and on y0 updating both the cutter "
+            "path and modal force projection (f_nonlinear2.y_cutter, "
+            "_compute_b_vec_at). RL/control is not used."
+        ),
+        "env_id": ENV_ID,
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
+        "sim_seconds": args.sim_seconds,
+        "max_sim_steps": args.max_sim_steps,
+        "rpm_min": args.rpm_min,
+        "rpm_max": args.rpm_max,
+        "rpm_points": args.rpm_points,
+        "y0_min_m": args.y0_min,
+        "y0_max_m": args.y0_max,
+        "y0_points": args.y0_points,
+        "L2_m": plant.L2,
+        "ac_min_mm": plant.ac_min,
+        "ac_max_mm": plant.ac_max,
+        "ac_tol_mm": args.ac_tol,
+        "binary_iters": args.binary_iters,
+        "w_limit_m": plant.w_limit,
+        "w_limit_fraction": args.w_limit_fraction,
+        "rms_growth_threshold": args.rms_growth_threshold,
+        "seed": args.seed,
+        "omega_min_rad_s": plant.omega_min,
+        "omega_max_rad_s": plant.omega_max,
+    }
+
+    return rows, metadata
+
+
 def save_csv(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys()) if rows else []
@@ -498,6 +673,81 @@ def plot_lobe(rows: list[dict], metadata: dict, path: Path) -> None:
     plt.close(fig)
 
 
+def plot_lobe_surface_3d(rows: list[dict], metadata: dict, path: Path) -> None:
+    """Plot stable boundary ac as a surface over rpm and milling start y0."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    rpm_axis = np.array(sorted({row["rpm"] for row in rows}), dtype=np.float64)
+    y0_axis = np.array(sorted({row["y0_m"] for row in rows}), dtype=np.float64)
+
+    ac_grid = np.full((y0_axis.size, rpm_axis.size), np.nan, dtype=np.float64)
+    rpm_index = {rpm: idx for idx, rpm in enumerate(rpm_axis)}
+    y0_index = {y0: idx for idx, y0 in enumerate(y0_axis)}
+
+    for row in rows:
+        ac_grid[y0_index[row["y0_m"]], rpm_index[row["rpm"]]] = row["ac_stable_mm"]
+
+    rpm_mesh, y0_mesh = np.meshgrid(rpm_axis, y0_axis)
+
+    fig = plt.figure(figsize=(10, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    surface = ax.plot_surface(
+        rpm_mesh,
+        y0_mesh,
+        ac_grid,
+        cmap="viridis",
+        alpha=0.85,
+        edgecolor="k",
+        linewidth=0.2,
+        antialiased=True,
+    )
+    ax.plot_wireframe(
+        rpm_mesh,
+        y0_mesh,
+        ac_grid,
+        color="black",
+        linewidth=0.4,
+        alpha=0.35,
+    )
+
+    for y0 in y0_axis:
+        ac_line = ac_grid[y0_index[y0], :]
+        ax.plot(
+            rpm_axis,
+            np.full_like(rpm_axis, y0),
+            ac_line,
+            color="#d62728",
+            linewidth=1.5,
+            marker="o",
+            markersize=3,
+        )
+
+    ax.set_xlabel("Spindle speed (rpm)")
+    ax.set_ylabel("Milling start point y0 (m)")
+    ax.set_zlabel("Stable axial depth ac (mm)")
+    ax.set_title("No-control 3D stability lobe surface (time-domain estimate)")
+    fig.colorbar(surface, ax=ax, shrink=0.6, pad=0.1, label="ac stable (mm)")
+
+    note = (
+        "Surface: max stable ac = f(rpm, y0). Uncontrolled simulator only.\n"
+        "Depends on regenerative model and y0 force-path coupling."
+    )
+    fig.text(
+        0.02,
+        0.02,
+        note,
+        fontsize=8,
+        va="bottom",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85},
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute a no-control stability lobe for CustomODEPlate-v0."
@@ -535,14 +785,54 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         default=Path("plots/stability_lobe"),
     )
+    parser.add_argument(
+        "--surface-3d",
+        action="store_true",
+        help="Compute 3D stability surface ac=f(rpm, y0) instead of 2D lobe only",
+    )
+    parser.add_argument(
+        "--y0-min",
+        type=float,
+        default=0.05,
+        help="Minimum milling start y0 [m] for 3D surface mode",
+    )
+    parser.add_argument(
+        "--y0-max",
+        type=float,
+        default=0.45,
+        help="Maximum milling start y0 [m] for 3D surface mode",
+    )
+    parser.add_argument(
+        "--y0-points",
+        type=int,
+        default=5,
+        help="Number of y0 grid points for 3D surface mode",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    out_dir = args.out_dir
+
+    if args.surface_3d:
+        rows, metadata = compute_lobe_surface_3d(args)
+        csv_path = out_dir / "stability_lobe_surface.csv"
+        meta_path = out_dir / "stability_lobe_surface_metadata.json"
+        plot_path = out_dir / "stability_lobe_surface.png"
+
+        save_csv(rows, csv_path)
+        save_metadata(metadata, meta_path)
+        plot_lobe_surface_3d(rows, metadata, plot_path)
+
+        print("\nSaved 3D surface outputs:")
+        print(f"  plot     : {plot_path.resolve()}")
+        print(f"  csv      : {csv_path.resolve()}")
+        print(f"  metadata : {meta_path.resolve()}")
+        return
+
     rows, metadata = compute_lobe(args)
 
-    out_dir = args.out_dir
     csv_path = out_dir / "stability_lobe.csv"
     meta_path = out_dir / "stability_lobe_metadata.json"
     plot_path = out_dir / "stability_lobe.png"

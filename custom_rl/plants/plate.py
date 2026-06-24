@@ -259,6 +259,27 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.M_modal = M_modal
         f_nonlinear2.decimal_places = 1
 
+    def _sync_f_nonlinear2_geometry(self) -> None:
+        """Push milling path geometry into f_nonlinear2 module globals."""
+        f_nonlinear2.y_traj = self.y_traj
+        f_nonlinear2.y_cutter = self.y_cutter
+        # Invalidate force cache so omega/ac trials pick up new y0 projection.
+        f_nonlinear2.cache["initialized"] = False
+
+    def set_milling_start_y(self, y0_m: float) -> None:
+        """
+        Set the straight-pass milling start y (meters).
+
+        Updates the cutter path (f_nonlinear2.y_cutter, y_traj) and the modal
+        force projection W_k(x_c, y0) used in _compute_b_vec_at. The 3D stability
+        surface is only physically meaningful when y0 changes both path and force
+        location; it is a process parameter, not an RL control action.
+        """
+        y0_m = float(np.clip(y0_m, 0.0, self.L2))
+        self.y_cutter = y0_m
+        self.y_traj = np.full_like(self.t_original, y0_m, dtype=np.float64)
+        self._sync_f_nonlinear2_geometry()
+
     def modal_to_physical(
         self,
         x_modal: np.ndarray,
@@ -324,7 +345,15 @@ class PlatePlant(ODEPlant):
 
         return x_dot
 
-    def reset(self, rng) -> tuple[np.ndarray, dict[str, Any]]:
+    def reset(
+        self,
+        rng,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        options = options or {}
+        if "y0" in options:
+            self.set_milling_start_y(float(options["y0"]))
+
         f_nonlinear2.reset_state_history()
         self._last_omega = float(self.omega_min)
 

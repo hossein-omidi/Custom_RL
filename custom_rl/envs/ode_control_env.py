@@ -107,7 +107,11 @@ class ODEControlEnv(gym.Env):
         super().reset(seed=seed)
         # Use env's np_random (set by super) for determinism with reset() vs reset(seed=X)
         rng = self.np_random
-        self._state, info = self.plant.reset(rng)
+        reset_options = options or {}
+        try:
+            self._state, info = self.plant.reset(rng, options=reset_options)
+        except TypeError:
+            self._state, info = self.plant.reset(rng)
         self._t = 0.0
         self._step_count = 0
         obs = self.plant.state_to_obs(self._state)
