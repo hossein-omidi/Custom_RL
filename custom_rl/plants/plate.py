@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from gymnasium import spaces
@@ -13,27 +13,56 @@ from custom_rl.plants.compute_mode_shapes import compute_mode_shapes
 from custom_rl.plants.compute_natural_frequencies import compute_natural_frequencies
 from custom_rl.plants.compute_nonlinear_stiffness import compute_nonlinear_stiffness
 
+# AL7075 cantilever plate (clamped at y = L2), abstract sensor locations [m].
+DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
+    (0.83, 0.20),
+    (0.17, 0.20),
+)
+
+
+def build_sensor_mode_matrix(
+    W_mn: list,
+    m_max: int,
+    n_max: int,
+    sensor_points: Sequence[tuple[float, float]],
+) -> np.ndarray:
+    """
+    Build sensor mode-shape matrix Phi[i, k] = W_k(x_s_i, y_s_i).
+    """
+    n_sensors = len(sensor_points)
+    k_modes = m_max * n_max
+    phi = np.zeros((n_sensors, k_modes), dtype=np.float64)
+
+    mode_index = 0
+    for m in range(m_max):
+        for n in range(n_max):
+            w_func = W_mn[m][n]
+            for i, (xs, ys) in enumerate(sensor_points):
+                phi[i, mode_index] = float(w_func(xs, ys))
+            mode_index += 1
+
+    return phi
+
 
 class PlatePlant(ODEPlant):
     """
     Nonlinear plate vibration plant.
 
-    State:
-        [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+    Internal modal state:
+        x_modal = [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+
+    Agent observation (physical sensors):
+        [w_sensor / w_obs_scale, wdot_sensor / wdot_obs_scale]
 
     Normalized action:
         u = [u_omega, u_ac], each in [-1, 1]
-
-    Physical action passed to f_nonlinear2:
-        omega in [omega_min, omega_max]
-        ac    in [ac_min, ac_max]
     """
 
     def __init__(
         self,
-        N: int = 4,
+        N: int = 5,
         L1: float = 1.0,
-        L2: float = 1,
+        L2: float = 1.0,
         h: float = 0.02,
         E: float = 71.7e9,
         nu: float = 0.33,
@@ -44,29 +73,13 @@ class PlatePlant(ODEPlant):
         omega_max: float = 2000.0,
         ac_min: float = 0,
         ac_max: float = 20.0,
+        sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
+        w_limit: float = 0.01,
+        w_obs_scale: float = 0.01,
+        wdot_obs_scale: float = 1.0,
+        wdot_limit: float = 10.0,
         eta_limit: float = 0.01,
-        eta_obs_limit: float = 1e6,
-        eta_dot_obs_limit: float = 1e6,
     ):
-        """
-        Args:
-            N: number of teeth / force-related model parameter used by f_nonlinear2
-            L1: plate length in x direction
-            L2: plate length in y direction
-            h: plate thickness
-            E: Young's modulus
-            nu: Poisson's ratio
-            rho: density
-            m_max: maximum mode index in x direction
-            n_max: maximum mode index in y direction
-            omega_min: minimum physical spindle/angular input
-            omega_max: maximum physical spindle/angular input
-            ac_min: minimum physical control coefficient/input
-            ac_max: maximum physical control coefficient/input
-            eta_limit: modal displacement safety limit for termination
-            eta_obs_limit: observation bound for modal displacement
-            eta_dot_obs_limit: observation bound for modal velocity
-        """
         self.N = N
         self.L1 = L1
         self.L2 = L2
@@ -86,9 +99,17 @@ class PlatePlant(ODEPlant):
         self.ac_min = ac_min
         self.ac_max = ac_max
 
+        self.sensor_points = tuple(
+            (float(xs), float(ys)) for xs, ys in sensor_points
+        )
+        self.n_sensors = len(self.sensor_points)
+        self.obs_dim = 2 * self.n_sensors
+
+        self.w_limit = w_limit
+        self.w_obs_scale = w_obs_scale
+        self.wdot_obs_scale = wdot_obs_scale
+        self.wdot_limit = wdot_limit
         self.eta_limit = eta_limit
-        self.eta_obs_limit = eta_obs_limit
-        self.eta_dot_obs_limit = eta_dot_obs_limit
 
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
@@ -104,10 +125,9 @@ class PlatePlant(ODEPlant):
         self.x_traj = 0.1 * np.sin(2.0 * np.pi * 0.2 * self.t_original)
         self.y_traj = 0.1 * np.cos(2.0 * np.pi * 0.2 * self.t_original)
 
-        # Modal mass
+        # Modal mass: rho * h integrated over plate area (no double-counting of h).
         M_modal = self.L1 * self.L2 * self.rho * self.h
 
-        # Mode shapes
         W_mn, V_mn = compute_mode_shapes(
             self.L1,
             self.L2,
@@ -116,7 +136,13 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
-        # Natural frequencies
+        self.Phi = build_sensor_mode_matrix(
+            W_mn,
+            self.m_max,
+            self.n_max,
+            self.sensor_points,
+        )
+
         omega_mn = compute_natural_frequencies(
             self.E,
             self.nu,
@@ -128,7 +154,6 @@ class PlatePlant(ODEPlant):
             self.n_max,
         )
 
-        # Nonlinear stiffness
         lambda_mn, _lambda_prime_mn = compute_nonlinear_stiffness(
             self.E,
             self.nu,
@@ -145,7 +170,6 @@ class PlatePlant(ODEPlant):
         lambda_vec = np.asarray(lambda_mn.T.reshape(self.K), dtype=np.float64)
 
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
-
         cf = 0.3
 
         xi_base = np.array(
@@ -158,8 +182,6 @@ class PlatePlant(ODEPlant):
             dtype=np.float64,
         ) / 2.5
 
-        # Set required variables inside the existing f_nonlinear2 module.
-        # This preserves your original nonlinear dynamics implementation.
         f_nonlinear2.m_max = self.m_max
         f_nonlinear2.n_max = self.n_max
         f_nonlinear2.N = self.N
@@ -181,10 +203,34 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.M_modal = M_modal
         f_nonlinear2.decimal_places = 1
 
+    def modal_to_physical(
+        self,
+        x_modal: np.ndarray,
+        *,
+        clip: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map modal state to physical sensor displacement and velocity."""
+        x_modal = np.asarray(x_modal, dtype=np.float64).reshape(-1)
+        eta = x_modal[0::2]
+        eta_dot = x_modal[1::2]
+
+        w_sensor = self.Phi @ eta
+        wdot_sensor = self.Phi @ eta_dot
+
+        w_sensor = np.asarray(w_sensor, dtype=np.float64)
+        wdot_sensor = np.asarray(wdot_sensor, dtype=np.float64)
+
+        if clip:
+            w_sensor = np.clip(w_sensor, -self.w_limit, self.w_limit)
+            wdot_sensor = np.clip(wdot_sensor, -self.wdot_limit, self.wdot_limit)
+
+        return w_sensor, wdot_sensor
+
+    def get_observe_state(self, x_modal: np.ndarray) -> np.ndarray:
+        """Return scaled physical observation for the RL agent."""
+        return self.state_to_obs(x_modal)
+
     def _scale_action(self, u: np.ndarray) -> np.ndarray:
-        """
-        Map normalized action from [-1, 1]^2 to physical action [omega, ac].
-        """
         u = np.asarray(u, dtype=np.float64).reshape(-1)
 
         if u.size != 2:
@@ -201,12 +247,6 @@ class PlatePlant(ODEPlant):
         return np.asarray(u_phys, dtype=np.float64)
 
     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        """
-        State derivative: dx/dt = dynamics(t, x, u).
-
-        The environment supplies normalized action in [-1, 1]^2.
-        This method scales it to physical [omega, ac] before calling f_nonlinear2.
-        """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
 
         if x.size != self.state_dim:
@@ -216,7 +256,6 @@ class PlatePlant(ODEPlant):
             )
 
         u_phys = self._scale_action(u)
-
         x_dot = f_nonlinear2.f_nonlinear2(t, x, u_phys)
         x_dot = np.asarray(x_dot, dtype=np.float64).reshape(-1)
 
@@ -229,13 +268,8 @@ class PlatePlant(ODEPlant):
         return x_dot
 
     def reset(self, rng) -> tuple[np.ndarray, dict[str, Any]]:
-        """
-        Sample initial modal displacement and velocity.
-        """
         f_nonlinear2.reset_state_history()
 
-        #eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
-        #eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
         eta0 = rng.uniform(0, 0, size=self.K)
         eta_dot0 = rng.uniform(0, 0, size=self.K)
 
@@ -246,16 +280,16 @@ class PlatePlant(ODEPlant):
         return x0, {}
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
-        """
-        Terminate if modal displacement becomes unsafe or state becomes invalid.
-        """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-        eta = x[0::2]
 
         invalid_state = not np.all(np.isfinite(x))
-        excessive_displacement = np.any(np.abs(eta) > self.eta_limit)
+        w_sensor, wdot_sensor = self.modal_to_physical(x)
+        excessive_displacement = np.any(np.abs(w_sensor) > self.w_limit)
+        excessive_velocity = np.any(np.abs(wdot_sensor) > self.wdot_limit)
 
-        terminated = bool(invalid_state or excessive_displacement)
+        terminated = bool(
+            invalid_state or excessive_displacement or excessive_velocity
+        )
 
         info: dict[str, Any] = {}
 
@@ -263,40 +297,31 @@ class PlatePlant(ODEPlant):
             info["termination_reason"] = "invalid_state"
 
         if excessive_displacement:
-            info["termination_reason"] = "excessive_modal_displacement"
+            info["termination_reason"] = "excessive_sensor_displacement"
+
+        if excessive_velocity:
+            info["termination_reason"] = "excessive_sensor_velocity"
 
         return terminated, False, info
 
     def get_observation_space(self) -> spaces.Space:
-        """
-        Return Gymnasium observation space.
+        low = np.full(self.obs_dim, -np.inf, dtype=np.float64)
+        high = np.full(self.obs_dim, np.inf, dtype=np.float64)
 
-        Observation:
-            [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
-        """
-        low = np.zeros(self.state_dim, dtype=np.float64)
-        high = np.zeros(self.state_dim, dtype=np.float64)
+        low[: self.n_sensors] = -self.w_limit / self.w_obs_scale
+        high[: self.n_sensors] = self.w_limit / self.w_obs_scale
 
-        low[0::2] = -self.eta_obs_limit
-        high[0::2] = self.eta_obs_limit
-
-        low[1::2] = -self.eta_dot_obs_limit
-        high[1::2] = self.eta_dot_obs_limit
+        low[self.n_sensors :] = -self.wdot_limit / self.wdot_obs_scale
+        high[self.n_sensors :] = self.wdot_limit / self.wdot_obs_scale
 
         return spaces.Box(
             low=low,
             high=high,
-            shape=(self.state_dim,),
+            shape=(self.obs_dim,),
             dtype=np.float64,
         )
 
     def get_action_space(self) -> spaces.Space:
-        """
-        Return normalized Gymnasium action space.
-
-        action[0]: normalized omega command
-        action[1]: normalized ac command
-        """
         return spaces.Box(
             low=-1.0,
             high=1.0,
@@ -305,9 +330,12 @@ class PlatePlant(ODEPlant):
         )
 
     def state_to_obs(self, x: np.ndarray) -> np.ndarray:
-        """
-        Map internal state to observation.
+        w_sensor, wdot_sensor = self.modal_to_physical(x)
 
-        Here, observation is equal to the full modal state.
-        """
-        return np.asarray(x, dtype=np.float64).reshape(-1)
+        return np.concatenate(
+            [
+                w_sensor / self.w_obs_scale,
+                wdot_sensor / self.wdot_obs_scale,
+            ],
+            dtype=np.float64,
+        )

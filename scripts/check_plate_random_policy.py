@@ -57,7 +57,16 @@ def normalized_to_physical(
     return low + 0.5 * (action + 1.0) * (high - low)
 
 
-def state_labels(state_dim: int) -> list[str]:
+def obs_labels(n_sensors: int) -> list[str]:
+    labels: list[str] = []
+    for i in range(n_sensors):
+        labels.append(f"w_sensor_{i + 1} (m)")
+    for i in range(n_sensors):
+        labels.append(f"wdot_sensor_{i + 1} (m/s)")
+    return labels
+
+
+def modal_labels(state_dim: int) -> list[str]:
     labels: list[str] = []
     for dim in range(state_dim):
         mode_index = dim // 2 + 1
@@ -70,44 +79,77 @@ def state_labels(state_dim: int) -> list[str]:
 
 def plot_rollout(
     times: np.ndarray,
-    states: np.ndarray,
+    observations: np.ndarray,
+    x_modal: np.ndarray | None,
     actions_norm: np.ndarray,
     actions_phys: np.ndarray,
     rewards: np.ndarray,
     terminated_flags: np.ndarray,
     truncated_flags: np.ndarray,
-    eta_limit: float | None,
+    w_limit: float | None,
+    n_sensors: int,
+    w_obs_scale: float,
+    wdot_obs_scale: float,
     out_dir: Path,
     title_suffix: str,
 ) -> None:
     """Save pre-training diagnostic plots."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    state_dim = states.shape[1]
-    labels = state_labels(state_dim)
+    obs_dim = observations.shape[1]
+    labels = obs_labels(n_sensors)
 
-    # --- Modal states ---
+    # --- Physical sensor observations (unscaled) ---
+    obs_physical = observations.copy()
+    if n_sensors > 0 and obs_dim >= 2 * n_sensors:
+        obs_physical[:, :n_sensors] *= w_obs_scale
+        obs_physical[:, n_sensors : 2 * n_sensors] *= wdot_obs_scale
+
     n_cols = 2
-    n_rows = int(np.ceil(state_dim / n_cols))
+    n_rows = int(np.ceil(obs_dim / n_cols))
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(10, 3.0 * n_rows), sharex=True)
     axes = np.asarray(axes).reshape(-1)
 
-    for dim in range(state_dim):
+    for dim in range(obs_dim):
         ax = axes[dim]
-        ax.plot(times, states[:, dim], lw=1.2)
-        if eta_limit is not None and np.isfinite(eta_limit) and dim % 2 == 0:
-            ax.axhline(+eta_limit, linestyle="--", linewidth=1, color="tab:red", alpha=0.7)
-            ax.axhline(-eta_limit, linestyle="--", linewidth=1, color="tab:red", alpha=0.7)
-        ax.set_ylabel(labels[dim])
+        ax.plot(times, obs_physical[:, dim], lw=1.2)
+        if w_limit is not None and np.isfinite(w_limit) and dim < n_sensors:
+            ax.axhline(+w_limit, linestyle="--", linewidth=1, color="tab:red", alpha=0.7)
+            ax.axhline(-w_limit, linestyle="--", linewidth=1, color="tab:red", alpha=0.7)
+        ax.set_ylabel(labels[dim] if dim < len(labels) else f"obs{dim}")
         ax.grid(True, alpha=0.3)
 
-    for ax in axes[state_dim:]:
+    for ax in axes[obs_dim:]:
         ax.axis("off")
 
-    axes[min(state_dim - 1, len(axes) - 1)].set_xlabel("Time (s)")
-    fig.suptitle(f"Modal state trajectories ({title_suffix})")
+    axes[min(obs_dim - 1, len(axes) - 1)].set_xlabel("Time (s)")
+    fig.suptitle(f"Physical sensor response ({title_suffix})")
     fig.tight_layout()
-    fig.savefig(out_dir / "pretrain_modal_states.png", dpi=150)
+    fig.savefig(out_dir / "pretrain_physical_sensor_response.png", dpi=150)
     plt.close(fig)
+
+    if x_modal is not None and x_modal.size > 0:
+        n_align = min(len(times), x_modal.shape[0])
+        times_m = times[:n_align]
+        x_modal = x_modal[:n_align]
+        modal_dim = x_modal.shape[1]
+        modal_lbls = modal_labels(modal_dim)
+        n_rows_m = int(np.ceil(modal_dim / n_cols))
+        fig, axes = plt.subplots(
+            n_rows_m, n_cols, figsize=(10, 3.0 * n_rows_m), sharex=True
+        )
+        axes = np.asarray(axes).reshape(-1)
+        for dim in range(modal_dim):
+            ax = axes[dim]
+            ax.plot(times_m, x_modal[:, dim], lw=1.0, alpha=0.8)
+            ax.set_ylabel(modal_lbls[dim])
+            ax.grid(True, alpha=0.3)
+        for ax in axes[modal_dim:]:
+            ax.axis("off")
+        axes[min(modal_dim - 1, len(axes) - 1)].set_xlabel("Time (s)")
+        fig.suptitle(f"Modal state (debug) ({title_suffix})")
+        fig.tight_layout()
+        fig.savefig(out_dir / "pretrain_modal_states_debug.png", dpi=150)
+        plt.close(fig)
 
     # --- Physical actions ---
     fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
@@ -184,7 +226,8 @@ def run_rollout(
     plant = env.unwrapped.plant
 
     times: list[float] = [0.0]
-    states: list[np.ndarray] = [obs.copy()]
+    observations: list[np.ndarray] = [obs.copy()]
+    x_modal_hist: list[np.ndarray] = []
     actions_norm: list[np.ndarray] = []
     actions_phys: list[np.ndarray] = []
     rewards: list[float] = []
@@ -214,7 +257,9 @@ def run_rollout(
         truncated_flags.append(bool(truncated))
 
         times.append(float(info.get("t", step + 1)))
-        states.append(obs.copy())
+        observations.append(obs.copy())
+        if "x_modal" in info:
+            x_modal_hist.append(np.asarray(info["x_modal"], dtype=np.float64))
 
         if terminated or truncated:
             print(f"Episode ended at step {step + 1}.")
@@ -224,9 +269,14 @@ def run_rollout(
                 print("  reason:", info["termination_reason"])
             break
 
+    x_modal_arr = None
+    if x_modal_hist:
+        x_modal_arr = np.asarray(x_modal_hist, dtype=np.float64)
+
     return {
         "times": np.asarray(times[1:], dtype=np.float64),
-        "states": np.asarray(states[1:], dtype=np.float64),
+        "observations": np.asarray(observations[1:], dtype=np.float64),
+        "x_modal": x_modal_arr,
         "actions_norm": np.asarray(actions_norm, dtype=np.float64),
         "actions_phys": np.asarray(actions_phys, dtype=np.float64),
         "rewards": np.asarray(rewards, dtype=np.float64),
@@ -241,7 +291,7 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=2000)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dt", type=float, default=0.001)
-    parser.add_argument("--max-episode-steps", type=int, default=10000)
+    parser.add_argument("--max-episode-steps", type=int, default=5000)
     parser.add_argument("--out-dir", default=str(Path(DEFAULT_PLOT_DIR) / "pretrain"))
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ac.")
     parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed.")
@@ -281,8 +331,8 @@ def main() -> None:
 
     rollout = run_rollout(env, args.steps, args.seed, fixed_action)
 
-    assert rollout["states"].shape[1] == env.observation_space.shape[0]
-    assert np.all(np.isfinite(rollout["states"]))
+    assert rollout["observations"].shape[1] == env.observation_space.shape[0]
+    assert np.all(np.isfinite(rollout["observations"]))
     assert np.all(np.isfinite(rollout["rewards"]))
 
     env.close()
@@ -295,21 +345,32 @@ def main() -> None:
 
     plot_rollout(
         times=rollout["times"],
-        states=rollout["states"],
+        observations=rollout["observations"],
+        x_modal=rollout["x_modal"],
         actions_norm=rollout["actions_norm"],
         actions_phys=rollout["actions_phys"],
         rewards=rollout["rewards"],
         terminated_flags=rollout["terminated_flags"],
         truncated_flags=rollout["truncated_flags"],
-        eta_limit=getattr(plant, "eta_limit", None),
+        w_limit=getattr(plant, "w_limit", None),
+        n_sensors=getattr(plant, "n_sensors", 2),
+        w_obs_scale=getattr(plant, "w_obs_scale", 0.01),
+        wdot_obs_scale=getattr(plant, "wdot_obs_scale", 1.0),
         out_dir=Path(args.out_dir),
         title_suffix=policy_label,
     )
 
     print("Rollout test finished successfully.")
     print("Total reward:", float(np.sum(rollout["rewards"])))
-    print("Final modal displacements:", rollout["states"][-1, 0::2])
-    print("Final modal velocities:", rollout["states"][-1, 1::2])
+    if rollout["x_modal"] is not None and rollout["x_modal"].size > 0:
+        print("Final modal displacements:", rollout["x_modal"][-1, 0::2])
+        print("Final modal velocities:", rollout["x_modal"][-1, 1::2])
+    w_scale = getattr(plant, "w_obs_scale", 0.01)
+    wdot_scale = getattr(plant, "wdot_obs_scale", 1.0)
+    obs_last = rollout["observations"][-1]
+    n_sensors = getattr(plant, "n_sensors", 2)
+    print("Final sensor displacement (m):", obs_last[:n_sensors] * w_scale)
+    print("Final sensor velocity (m/s):", obs_last[n_sensors : 2 * n_sensors] * wdot_scale)
 
 
 if __name__ == "__main__":

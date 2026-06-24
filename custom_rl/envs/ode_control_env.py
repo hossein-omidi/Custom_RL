@@ -75,6 +75,29 @@ class ODEControlEnv(gym.Env):
         self._t: float = 0.0
         self._step_count: int = 0
 
+    def _build_step_info(
+        self,
+        term_info: dict[str, Any],
+        truncated_time: bool,
+    ) -> dict[str, Any]:
+        info: dict[str, Any] = {
+            "t": self._t,
+            "x_modal": self._state.copy(),
+            **term_info,
+        }
+
+        if hasattr(self.plant, "modal_to_physical"):
+            w_sensor, wdot_sensor = self.plant.modal_to_physical(
+                self._state, clip=True
+            )
+            info["w_sensor"] = w_sensor
+            info["wdot_sensor"] = wdot_sensor
+
+        if truncated_time:
+            info["TimeLimit.truncated"] = True
+
+        return info
+
     def reset(
         self,
         *,
@@ -90,6 +113,16 @@ class ODEControlEnv(gym.Env):
         obs = self.plant.state_to_obs(self._state)
         obs = self._add_obs_noise(obs)
         obs = self._clip_obs(obs)
+
+        info = dict(info)
+        info["x_modal"] = self._state.copy()
+        if hasattr(self.plant, "modal_to_physical"):
+            w_sensor, wdot_sensor = self.plant.modal_to_physical(
+                self._state, clip=True
+            )
+            info["w_sensor"] = w_sensor
+            info["wdot_sensor"] = wdot_sensor
+
         return obs, info
 
     def step(
@@ -119,6 +152,8 @@ class ODEControlEnv(gym.Env):
         truncated_time = self._step_count >= self.max_episode_steps
         truncated = truncated_term or truncated_time
 
+        info = self._build_step_info(term_info, truncated_time)
+
         reward = self.reward_fn(
             self._t - self._step_dt,
             x_prev,
@@ -126,12 +161,8 @@ class ODEControlEnv(gym.Env):
             self._state,
             terminated,
             truncated,
-            term_info,
+            info,
         )
-
-        info: dict[str, Any] = {"t": self._t, "state": self._state.copy(), **term_info}
-        if truncated_time:
-            info["TimeLimit.truncated"] = True
 
         obs = self.plant.state_to_obs(self._state)
         obs = self._add_obs_noise(obs)

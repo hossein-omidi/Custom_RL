@@ -76,7 +76,7 @@ MAX_FORCE = 1e5
 # ============================================================
 
 #STATE_DELAY = 0.0000075            # seconds; set this to desired delay (>0)
-STATE_DELAY = 0.000001            # seconds; set this to desired delay (>0)
+STATE_DELAY = 0.000            # seconds; set this to desired delay (>0)
 _state_history = []          # list of (t, x_copy) in increasing time order
 _MAX_HISTORY = 100000        # prevent unbounded memory growth
 

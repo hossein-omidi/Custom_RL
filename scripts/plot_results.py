@@ -1,4 +1,4 @@
-"""Plot training results: mean±std learning curves and plate trajectory summaries."""
+"""Plot training results: mean±std learning curves and physical sensor trajectory summaries."""
 
 from __future__ import annotations
 
@@ -161,17 +161,15 @@ def load_trajectories(traj_dir: Path, seeds: list[int]) -> dict[int, list]:
     return out
 
 
-def _state_labels(state_dim: int) -> list[str]:
-    """Create labels for plate modal state."""
+def _physical_signal_labels(n_sensors: int) -> list[str]:
+    """Create labels for physical sensor displacement and velocity."""
     labels = []
 
-    for dim in range(state_dim):
-        mode_index = dim // 2 + 1
+    for i in range(n_sensors):
+        labels.append(f"w_sensor_{i + 1} (m)")
 
-        if dim % 2 == 0:
-            labels.append(f"eta{mode_index}")
-        else:
-            labels.append(f"eta{mode_index}_dot")
+    for i in range(n_sensors):
+        labels.append(f"wdot_sensor_{i + 1} (m/s)")
 
     return labels
 
@@ -190,11 +188,64 @@ def _nan_mean_std(values: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarra
     return mean, std, valid
 
 
+def _physical_signals_from_episode(ep: dict) -> np.ndarray:
+    """
+    Return unscaled physical signals from one saved episode.
+
+    Preferred new format:
+        ep["physical_signals"] = [w_sensor, wdot_sensor]
+
+    Fallback:
+        ep["observations"] contains scaled [w_sensor, wdot_sensor], so unscale
+        using metadata["w_obs_scale"] and metadata["wdot_obs_scale"].
+
+    Old trajectory files with only ep["states"] are intentionally skipped because
+    they may contain modal coordinates and should not be relabeled as physical
+    sensor response.
+    """
+    metadata = ep.get("metadata", {})
+
+    if "physical_signals" in ep and len(ep["physical_signals"]) > 0:
+        signals = np.asarray(ep["physical_signals"], dtype=np.float64)
+
+    elif "observations" in ep and len(ep["observations"]) > 0:
+        obs = np.asarray(ep["observations"], dtype=np.float64)
+
+        if obs.ndim == 1:
+            obs = obs.reshape(-1, 1)
+
+        n_sensors = int(metadata.get("n_sensors", obs.shape[1] // 2))
+        w_scale = float(metadata.get("w_obs_scale", 1.0))
+        wdot_scale = float(metadata.get("wdot_obs_scale", 1.0))
+
+        if not np.isfinite(w_scale) or abs(w_scale) < 1e-12:
+            w_scale = 1.0
+
+        if not np.isfinite(wdot_scale) or abs(wdot_scale) < 1e-12:
+            wdot_scale = 1.0
+
+        signals = obs.copy()
+
+        if n_sensors > 0 and signals.shape[1] >= 2 * n_sensors:
+            signals[:, :n_sensors] /= w_scale
+            signals[:, n_sensors : 2 * n_sensors] /= wdot_scale
+        else:
+            return np.asarray([], dtype=np.float64)
+
+    else:
+        return np.asarray([], dtype=np.float64)
+
+    if signals.ndim == 1:
+        signals = signals.reshape(-1, 1)
+
+    return signals
+
+
 def _collect_trajectory_arrays(
     traj_dir: Path,
     seeds: list[int],
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict]:
-    """Collect trajectory states, physical actions, and times into padded arrays."""
+    """Collect physical sensor signals, physical actions, and times into padded arrays."""
     data = load_trajectories(traj_dir, seeds)
 
     if not data:
@@ -206,7 +257,10 @@ def _collect_trajectory_arrays(
 
     for seed in sorted(data.keys()):
         for ep in data[seed]:
-            states = np.asarray(ep["states"], dtype=np.float64)
+            if not metadata and "metadata" in ep:
+                metadata = ep["metadata"]
+
+            states = _physical_signals_from_episode(ep)
 
             # Prefer physical actions. Fall back to normalized actions for old files.
             actions = np.asarray(
@@ -231,9 +285,6 @@ def _collect_trajectory_arrays(
             if times.size != states.shape[0]:
                 times = np.arange(states.shape[0], dtype=np.float64)
 
-            if not metadata and "metadata" in ep:
-                metadata = ep["metadata"]
-
             all_trajs.append((states, actions, times))
 
     if not all_trajs:
@@ -242,7 +293,10 @@ def _collect_trajectory_arrays(
 
     state_dim = all_trajs[0][0].shape[1]
     action_dim = all_trajs[0][1].shape[1]
-    max_t = max(states.shape[0] for states, _, _ in all_trajs)
+    max_t = max(
+        max(states.shape[0], actions.shape[0], times.shape[0])
+        for states, actions, times in all_trajs
+    )
 
     S = np.full((len(all_trajs), max_t, state_dim), np.nan, dtype=np.float64)
     A = np.full((len(all_trajs), max_t, action_dim), np.nan, dtype=np.float64)
@@ -294,13 +348,21 @@ def plot_state_trajectories(
     metadata: dict,
     out_dir: Path,
 ) -> None:
-    """Plot all plate modal states with mean±std and displacement safety bounds."""
+    """Plot physical sensor signals with mean±std and displacement safety bounds."""
     state_dim = S.shape[2]
-    labels = _state_labels(state_dim)
+    n_sensors = int(metadata.get("n_sensors", state_dim // 2))
+
+    if n_sensors <= 0:
+        n_sensors = state_dim // 2 if state_dim >= 2 else state_dim
+
+    labels = _physical_signal_labels(n_sensors)
+
+    if len(labels) < state_dim:
+        labels.extend(f"signal{idx + 1}" for idx in range(len(labels), state_dim))
 
     t_grid, x_label = _time_grid(T, S.shape[1])
 
-    eta_limit = metadata.get("eta_limit", None)
+    w_limit = metadata.get("w_limit", None)
 
     n_cols = 2
     n_rows = int(np.ceil(state_dim / n_cols))
@@ -327,10 +389,10 @@ def plot_state_trajectories(
         )
         ax.plot(t_grid[valid], mean_s[valid], lw=1.5)
 
-        # Show displacement termination bounds only for eta states.
-        if eta_limit is not None and np.isfinite(eta_limit) and dim % 2 == 0:
-            ax.axhline(+eta_limit, linestyle="--", linewidth=1)
-            ax.axhline(-eta_limit, linestyle="--", linewidth=1)
+        # Show physical displacement limit only for displacement channels.
+        if w_limit is not None and np.isfinite(w_limit) and dim < n_sensors:
+            ax.axhline(+float(w_limit), linestyle="--", linewidth=1)
+            ax.axhline(-float(w_limit), linestyle="--", linewidth=1)
 
         ax.set_ylabel(labels[dim])
         ax.grid(True, alpha=0.3)
@@ -340,10 +402,10 @@ def plot_state_trajectories(
 
     axes[min(state_dim - 1, len(axes) - 1)].set_xlabel(x_label)
 
-    fig.suptitle("Evaluation trajectories: plate modal states")
+    fig.suptitle("Evaluation trajectories: physical sensor response")
     fig.tight_layout()
 
-    out_path = out_dir / "trajectory_states.png"
+    out_path = out_dir / "trajectory_physical_sensor_response.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -368,6 +430,12 @@ def plot_action_trajectories(
     physical_low = metadata.get("physical_action_low", None)
     physical_high = metadata.get("physical_action_high", None)
 
+    if physical_low is not None:
+        physical_low = np.asarray(physical_low, dtype=np.float64)
+
+    if physical_high is not None:
+        physical_high = np.asarray(physical_high, dtype=np.float64)
+
     fig, axes = plt.subplots(
         action_dim,
         1,
@@ -390,7 +458,12 @@ def plot_action_trajectories(
         )
         ax.plot(t_grid[valid], mean_a[valid], lw=1.5)
 
-        if physical_low is not None and physical_high is not None:
+        if (
+            physical_low is not None
+            and physical_high is not None
+            and dim < len(physical_low)
+            and dim < len(physical_high)
+        ):
             ax.axhline(float(physical_low[dim]), linestyle="--", linewidth=1)
             ax.axhline(float(physical_high[dim]), linestyle="--", linewidth=1)
 
@@ -414,7 +487,7 @@ def plot_trajectory_summary(
     out_dir: Path,
     seeds: list[int],
 ) -> None:
-    """Mean±std over time for plate states and physical actions."""
+    """Mean±std over time for physical sensor signals and physical actions."""
     S, A, T, metadata = _collect_trajectory_arrays(traj_dir, seeds)
 
     if S is None or A is None:

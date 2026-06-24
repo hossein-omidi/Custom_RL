@@ -9,46 +9,73 @@ import numpy as np
 from custom_rl.rewards.base import RewardFn
 
 
+def _physical_vibration_cost(
+    info: dict[str, Any],
+    x_next: np.ndarray,
+    w_weight: float,
+    wdot_weight: float,
+    w_scale: float,
+    wdot_scale: float,
+    w_clip: float | None = None,
+    wdot_clip: float | None = None,
+) -> tuple[float, float]:
+    """
+    Return (displacement_cost, velocity_cost) using physical sensor signals.
+
+    Signals are clipped to physical limits before squaring to keep rewards finite.
+    """
+    if "w_sensor" in info and "wdot_sensor" in info:
+        w_sensor = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
+        wdot_sensor = np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1)
+    else:
+        eta = x_next[0::2]
+        eta_dot = x_next[1::2]
+        w_sensor = eta
+        wdot_sensor = eta_dot
+
+    if not (np.all(np.isfinite(w_sensor)) and np.all(np.isfinite(wdot_sensor))):
+        return float("inf"), float("inf")
+
+    w_scale = max(float(w_scale), 1e-12)
+    wdot_scale = max(float(wdot_scale), 1e-12)
+
+    if w_clip is not None:
+        w_sensor = np.clip(w_sensor, -w_clip, w_clip)
+    if wdot_clip is not None:
+        wdot_sensor = np.clip(wdot_sensor, -wdot_clip, wdot_clip)
+
+    w_norm = w_sensor / w_scale
+    wdot_norm = wdot_sensor / wdot_scale
+
+    w_cost = float(np.mean(w_norm ** 2))
+    wdot_cost = float(np.mean(wdot_norm ** 2))
+
+    return w_weight * w_cost, wdot_weight * wdot_cost
+
+
 class DenseProductivePlateReward:
     """
-    Dense reward for productive vibration suppression.
+    Dense reward for productive cutting with physical chatter suppression.
 
-    Goal:
-        Suppress vibration while maintaining productive cutting.
-
-    State:
-        x = [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
-
-    Normalized action:
-        u = [u_omega, u_ac] in [-1, 1]^2
-
-    Physical action reconstructed inside reward:
-        omega in [omega_min, omega_max]
-        ac    in [ac_min, ac_max]
+    Chatter cost uses physical sensor displacement/velocity from info:
+        w_sensor, wdot_sensor
 
     Reward:
-        reward = productivity_weight * productivity_score
-               - vibration_cost
-               - velocity_cost
-               - negative_ac_cost
-               - action_regularization
-
-    Notes:
-        - productivity_score is zero when ac=0 (no cutting), so idle motion earns no reward.
-        - vibration penalties suppress chatter/plate vibration.
-        - negative_ac_cost discourages nonphysical negative cutting intensity.
-        - action_regularization is optional and should stay small.
+        productivity_weight * productivity_score
+        - w_weight * sum(w_sensor^2)
+        - wdot_weight * sum(wdot_sensor^2)
+        - action_weight * sum(action^2)
     """
 
     def __init__(
         self,
-        eta_weight: float = 1.0,
-        eta_dot_weight: float = 0.1,
+        w_weight: float = 1.0,
+        wdot_weight: float = 0.1,
         action_weight: float = 0.0,
         productivity_weight: float = 10.0,
         negative_ac_weight: float = 2.0,
-        eta_scale: float = 1e-3,
-        eta_dot_scale: float = 1e-2,
+        w_scale: float = 1e-3,
+        wdot_scale: float = 1e-2,
         omega_min: float = 50.0,
         omega_max: float = 2000.0,
         ac_min: float = 0.0,
@@ -56,15 +83,33 @@ class DenseProductivePlateReward:
         ac_productive_target: float = 10.0,
         alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        w_clip: float | None = None,
+        wdot_clip: float | None = None,
+        # Backward-compatible aliases for registration kwargs.
+        eta_weight: float | None = None,
+        eta_dot_weight: float | None = None,
+        eta_scale: float | None = None,
+        eta_dot_scale: float | None = None,
     ):
-        self.eta_weight = eta_weight
-        self.eta_dot_weight = eta_dot_weight
+        if eta_weight is not None:
+            w_weight = eta_weight
+        if eta_dot_weight is not None:
+            wdot_weight = eta_dot_weight
+        if eta_scale is not None:
+            w_scale = eta_scale
+        if eta_dot_scale is not None:
+            wdot_scale = eta_dot_scale
+
+        self.w_weight = w_weight
+        self.wdot_weight = wdot_weight
         self.action_weight = action_weight
         self.productivity_weight = productivity_weight
         self.negative_ac_weight = negative_ac_weight
 
-        self.eta_scale = eta_scale
-        self.eta_dot_scale = eta_dot_scale
+        self.w_scale = w_scale
+        self.wdot_scale = wdot_scale
+        self.w_clip = w_scale if w_clip is None else w_clip
+        self.wdot_clip = wdot_scale if wdot_clip is None else wdot_clip
 
         self.omega_min = omega_min
         self.omega_max = omega_max
@@ -85,9 +130,6 @@ class DenseProductivePlateReward:
             raise ValueError("ac_productive_target must be positive.")
 
     def _scale_action(self, u: np.ndarray) -> tuple[float, float]:
-        """
-        Convert normalized action in [-1, 1]^2 to physical [omega, ac].
-        """
         u = np.asarray(u, dtype=np.float64).reshape(-1)
 
         if u.size < 2:
@@ -102,10 +144,7 @@ class DenseProductivePlateReward:
 
         u_phys = low + 0.5 * (u + 1.0) * (high - low)
 
-        omega = float(u_phys[0])
-        ac = float(u_phys[1])
-
-        return omega, ac
+        return float(u_phys[0]), float(u_phys[1])
 
     def __call__(
         self,
@@ -123,11 +162,19 @@ class DenseProductivePlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        eta = x_next[0::2]
-        eta_dot = x_next[1::2]
+        w_cost, wdot_cost = _physical_vibration_cost(
+            info,
+            x_next,
+            self.w_weight,
+            self.wdot_weight,
+            self.w_scale,
+            self.wdot_scale,
+            w_clip=self.w_clip,
+            wdot_clip=self.wdot_clip,
+        )
 
-        eta_cost = np.mean((eta / self.eta_scale) ** 2)
-        eta_dot_cost = np.mean((eta_dot / self.eta_dot_scale) ** 2)
+        if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
+            return -float(self.termination_penalty)
 
         omega, ac = self._scale_action(u)
 
@@ -143,17 +190,13 @@ class DenseProductivePlateReward:
         negative_ac = max(-ac, 0.0)
         negative_ac_cost = (negative_ac / max(self.ac_max, 1e-12)) ** 2
 
-        action_cost = np.mean(np.clip(u, -1.0, 1.0) ** 2)
-
-        vibration_cost = (
-            self.eta_weight * eta_cost
-            + self.eta_dot_weight * eta_dot_cost
-        )
+        action_cost = float(np.sum(np.clip(u, -1.0, 1.0) ** 2))
 
         reward = (
             self.alive_bonus
             + self.productivity_weight * productivity_score
-            - vibration_cost
+            - w_cost
+            - wdot_cost
             - self.negative_ac_weight * negative_ac_cost
             - self.action_weight * action_cost
         )
@@ -161,32 +204,47 @@ class DenseProductivePlateReward:
         if terminated:
             reward -= self.termination_penalty
 
-        return float(reward)
+        if not np.isfinite(reward):
+            reward = -float(self.termination_penalty)
+
+        return float(np.clip(reward, -1e4, 1e4))
 
 
 class DenseQuadraticPlateReward:
-    """
-    Original pure quadratic vibration-suppression reward.
-
-    This is kept for comparison/debugging.
-    It does not explicitly reward productive cutting.
-    """
+    """Quadratic physical-sensor vibration suppression reward."""
 
     def __init__(
         self,
-        eta_weight: float = 1.0,
-        eta_dot_weight: float = 0.1,
+        w_weight: float = 1.0,
+        wdot_weight: float = 0.1,
         action_weight: float = 0.01,
-        eta_scale: float = 1e-3,
-        eta_dot_scale: float = 1e-2,
-        alive_bonus: float = 1.0,
+        w_scale: float = 1e-3,
+        wdot_scale: float = 1e-2,
+        alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        w_clip: float | None = None,
+        wdot_clip: float | None = None,
+        eta_weight: float | None = None,
+        eta_dot_weight: float | None = None,
+        eta_scale: float | None = None,
+        eta_dot_scale: float | None = None,
     ):
-        self.eta_weight = eta_weight
-        self.eta_dot_weight = eta_dot_weight
+        if eta_weight is not None:
+            w_weight = eta_weight
+        if eta_dot_weight is not None:
+            wdot_weight = eta_dot_weight
+        if eta_scale is not None:
+            w_scale = eta_scale
+        if eta_dot_scale is not None:
+            wdot_scale = eta_dot_scale
+
+        self.w_weight = w_weight
+        self.wdot_weight = wdot_weight
         self.action_weight = action_weight
-        self.eta_scale = eta_scale
-        self.eta_dot_scale = eta_dot_scale
+        self.w_scale = w_scale
+        self.wdot_scale = wdot_scale
+        self.w_clip = w_scale if w_clip is None else w_clip
+        self.wdot_clip = wdot_scale if wdot_clip is None else wdot_clip
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
 
@@ -206,31 +264,35 @@ class DenseQuadraticPlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        eta = x_next[0::2]
-        eta_dot = x_next[1::2]
-
-        eta_cost = np.mean((eta / self.eta_scale) ** 2)
-        eta_dot_cost = np.mean((eta_dot / self.eta_dot_scale) ** 2)
-        action_cost = np.mean(np.clip(u, -1.0, 1.0) ** 2)
-
-        cost = (
-            self.eta_weight * eta_cost
-            + self.eta_dot_weight * eta_dot_cost
-            + self.action_weight * action_cost
+        w_cost, wdot_cost = _physical_vibration_cost(
+            info,
+            x_next,
+            self.w_weight,
+            self.wdot_weight,
+            self.w_scale,
+            self.wdot_scale,
+            w_clip=self.w_clip,
+            wdot_clip=self.wdot_clip,
         )
 
-        reward = self.alive_bonus - cost
+        if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
+            return -float(self.termination_penalty)
+
+        action_cost = float(np.sum(np.clip(u, -1.0, 1.0) ** 2))
+
+        reward = self.alive_bonus - w_cost - wdot_cost - self.action_weight * action_cost
 
         if terminated:
             reward -= self.termination_penalty
 
-        return float(reward)
+        if not np.isfinite(reward):
+            reward = -float(self.termination_penalty)
+
+        return float(np.clip(reward, -1e4, 1e4))
 
 
 class SparseStablePlateReward:
-    """
-    Sparse reward for simple stability testing.
-    """
+    """Sparse reward for simple stability testing."""
 
     def __init__(self, **kwargs: Any) -> None:
         pass
@@ -262,13 +324,7 @@ def register_plate_reward(reward_id: str, reward_cls: type) -> None:
 
 
 def get_plate_reward(reward_id: str, **kwargs: Any) -> RewardFn:
-    """
-    Return Plate reward by id.
-
-    Args:
-        reward_id: reward name
-        **kwargs: parameters passed to the reward constructor
-    """
+    """Return Plate reward by id."""
     if reward_id not in _PLATE_REWARD_REGISTRY:
         raise ValueError(
             f"Unknown reward_id: {reward_id}. "

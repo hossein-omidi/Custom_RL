@@ -37,14 +37,13 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
             m_max, n_max,
             omega_min, omega_max,
             ac_min, ac_max,
-            eta_limit, eta_obs_limit, eta_dot_obs_limit
+            sensor_points, w_limit, w_obs_scale, wdot_obs_scale,
+            eta_limit
 
         Reward kwargs:
-            eta_weight
-            eta_dot_weight
+            w_weight, wdot_weight (aliases: eta_weight, eta_dot_weight)
             action_weight
-            eta_scale
-            eta_dot_scale
+            w_scale, wdot_scale (aliases: eta_scale, eta_dot_scale)
             alive_bonus
             termination_penalty
     """
@@ -72,15 +71,24 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "omega_max",
         "ac_min",
         "ac_max",
+        "sensor_points",
+        "w_limit",
+        "w_obs_scale",
+        "wdot_obs_scale",
+        "wdot_limit",
         "eta_limit",
-        "eta_obs_limit",
-        "eta_dot_obs_limit",
     }
 
     reward_keys = {
+        "w_weight",
+        "wdot_weight",
         "eta_weight",
         "eta_dot_weight",
         "action_weight",
+        "w_scale",
+        "wdot_scale",
+        "w_clip",
+        "wdot_clip",
         "eta_scale",
         "eta_dot_scale",
         "alive_bonus",
@@ -96,6 +104,10 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     for bound_key in ("omega_min", "omega_max", "ac_min", "ac_max"):
         reward_kwargs.setdefault(bound_key, getattr(plant, bound_key))
     reward_kwargs.setdefault("ac_productive_target", plant.ac_max / 2.0)
+    reward_kwargs.setdefault("w_scale", plant.w_limit)
+    reward_kwargs.setdefault("wdot_scale", plant.wdot_limit)
+    reward_kwargs.setdefault("w_clip", plant.w_limit)
+    reward_kwargs.setdefault("wdot_clip", plant.wdot_limit)
 
     reward_fn = get_plate_reward(reward_id, **reward_kwargs)
 
