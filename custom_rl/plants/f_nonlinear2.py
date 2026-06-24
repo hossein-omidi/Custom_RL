@@ -1,6 +1,16 @@
 """Efficient nonlinear modal-force dynamics for the plate plant.
 
-This file keeps the original public interface:
+Units (consistent with the original MATLAB model):
+    t, STATE_DELAY          : seconds [s]
+    L1, L2, h, coordinates  : meters [m]
+    omega (spindle speed)   : rad/s
+    ac (depth of cut)       : millimeters [mm]
+    cf (chip load)          : mm/tooth (converted to m via /1000 in feed_rate)
+    feed_rate               : m/s
+    modal coords eta        : nondimensional (mode-shape projection)
+    F_normal, Fk            : N (generalized modal force uses b_vec projection)
+
+Public interface:
 
     f_nonlinear2(t, x, u)
 
@@ -47,6 +57,13 @@ y_traj = None
 
 M_modal = None
 
+# Straight-line milling geometry (set by PlatePlant).
+L1 = None
+x0_cutter = 0.0
+y_cutter = 0.2
+x_pass_end_tol = 0.01
+USE_MOVING_FORCE_PROJECTION = True
+
 # Kept for compatibility, but no longer allowed to grow globally.
 decimal_places = 1
 tau_floored = None
@@ -76,7 +93,7 @@ MAX_FORCE = 1e5
 # ============================================================
 
 #STATE_DELAY = 0.0000075            # seconds; set this to desired delay (>0)
-STATE_DELAY = 0.000            # seconds; set this to desired delay (>0)
+STATE_DELAY = 0.00001          # seconds; set this to desired delay (>0)
 _state_history = []          # list of (t, x_copy) in increasing time order
 _MAX_HISTORY = 100000        # prevent unbounded memory growth
 
@@ -157,6 +174,7 @@ def _require_initialized() -> None:
         "x_traj": x_traj,
         "y_traj": y_traj,
         "M_modal": M_modal,
+        "L1": L1,
     }
 
     missing = [name for name, value in required.items() if value is None]
@@ -242,21 +260,88 @@ def _make_time_grid(t_start: float, t_end: float, dt_grid: float) -> np.ndarray:
     return time_discrete
 
 
-def _compute_b_vec() -> np.ndarray:
-    """Compute modal force projection vector."""
-    c1 = -0.0985
-    c2 = -0.0941
+def feed_rate(omega: float) -> float:
+    """Feed speed along x [m/s] for spindle speed omega [rad/s]."""
+    cf_m = float(cf) / 1000.0
+    return cf_m * float(N) * max(float(omega), OMEGA_EPS) / (2.0 * np.pi)
 
+
+def pass_duration(omega: float) -> float:
+    """Time to traverse plate length L1 at constant omega [s]."""
+    return float(L1) / max(feed_rate(omega), 1e-12)
+
+
+def cutter_point(t: float, omega: float) -> tuple[float, float]:
+    """
+    Straight-line cutter position in the x-y plane.
+
+    Starts at x = L1 (free end) and feeds toward x = 0.
+    """
+    feed_distance = feed_rate(omega) * float(t)
+    xc = float(L1) - (feed_distance + float(x0_cutter))
+    xc = float(np.clip(xc, 0.0, float(L1)))
+    yc = float(y_cutter)
+    return xc, yc
+
+
+def _straight_tool_path(
+    time_array: np.ndarray,
+    omega: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Straight pass coordinates at each time sample."""
+    time_array = np.asarray(time_array, dtype=np.float64)
+    feed = feed_rate(omega) * time_array
+    x_path = np.clip(float(L1) - (feed + float(x0_cutter)), 0.0, float(L1))
+    y_path = np.full_like(time_array, float(y_cutter), dtype=np.float64)
+    return x_path, y_path
+
+
+def _compute_b_vec_at(xc: float, yc: float) -> np.ndarray:
+    """Modal force projection at cutter contact point (xc, yc)."""
     b_vec = np.zeros(K, dtype=np.float64)
 
     cnt = 0
     for m in range(m_max):
         for n in range(n_max):
             Wk = W_mn[m][n]
-            b_vec[cnt] = Wk(c1, c2) / M_modal
+            b_vec[cnt] = Wk(float(xc), float(yc)) / M_modal
             cnt += 1
 
     return b_vec
+
+
+def _tool_path_increments(
+    time_discrete: np.ndarray,
+    omega: float,
+    dt_tooth: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Per-tooth path increments [m] aligned with each force sample.
+
+    The legacy ``np.diff(..., prepend=0)`` assumed the path started at the
+    origin. For straight milling the cutter starts near x = L1, which produced
+    a spurious first increment ~ L1 and a huge artificial force pulse.
+    """
+    time_discrete = np.asarray(time_discrete, dtype=np.float64)
+    if time_discrete.size == 0:
+        return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+
+    if time_discrete.size == 1:
+        step = feed_rate(omega) * max(float(dt_tooth), 0.0)
+        return np.array([step], dtype=np.float64), np.array([0.0], dtype=np.float64)
+
+    t_prev = np.concatenate(
+        [[max(time_discrete[0] - float(dt_tooth), 0.0)], time_discrete[:-1]]
+    )
+    x_prev, y_prev = _straight_tool_path(t_prev, omega)
+    x_curr, y_curr = _straight_tool_path(time_discrete, omega)
+    return x_curr - x_prev, y_curr - y_prev
+
+
+def _compute_b_vec() -> np.ndarray:
+    """Fixed-point projection (legacy / fallback)."""
+    xc, yc = cutter_point(0.0, 50.0)
+    return _compute_b_vec_at(xc, yc)
 
 
 def _update_cache(omega: float, ac: float, current_hash) -> None:
@@ -282,7 +367,8 @@ def _update_cache(omega: float, ac: float, current_hash) -> None:
     # Local only. Do not mutate the global decimal_places during RL.
     local_decimal_places = 1.0
 
-    t_end = float(t_original[-1])
+    pass_time = pass_duration(omega)
+    t_end = min(float(t_original[-1]), pass_time * 1.05 + tau)
     time_discrete = np.array([0.0], dtype=np.float64)
 
     threshold = cf_m_per_rad * N * omega * tau
@@ -302,8 +388,7 @@ def _update_cache(omega: float, ac: float, current_hash) -> None:
             dt_grid=tau_floored,
         )
 
-        x_discrete = np.interp(time_discrete, t_original, x_traj)
-        y_discrete = np.interp(time_discrete, t_original, y_traj)
+        x_discrete, y_discrete = _straight_tool_path(time_discrete, omega)
 
         if x_discrete.size > 1:
             dx_tmp = np.diff(x_discrete)
@@ -366,11 +451,7 @@ def _update_cache(omega: float, ac: float, current_hash) -> None:
     Fy = np.zeros(P, dtype=np.float64)
 
     if P > 1:
-        x_interp = np.interp(time_discrete, t_original, x_traj)
-        y_interp = np.interp(time_discrete, t_original, y_traj)
-
-        dx = np.diff(x_interp, prepend=0.0)
-        dy = np.diff(y_interp, prepend=0.0)
+        dx, dy = _tool_path_increments(time_discrete, omega, tau_floored)
 
         dx2 = dx * dx
         dx3 = dx2 * dx
@@ -499,7 +580,12 @@ def f_nonlinear2(t, x, u):
             left=0.0,
             right=0.0,
         )
-        Fk = b_vec * F_normal_t
+        if USE_MOVING_FORCE_PROJECTION:
+            xc, yc = cutter_point(float(t), omega)
+            b_vec_t = _compute_b_vec_at(xc, yc)
+            Fk = b_vec_t * F_normal_t
+        else:
+            Fk = b_vec * F_normal_t
 
     Fk = np.nan_to_num(Fk, nan=0.0, posinf=MAX_FORCE, neginf=-MAX_FORCE)
 

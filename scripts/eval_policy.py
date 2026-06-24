@@ -114,7 +114,7 @@ def main() -> None:
     parser.add_argument("--n-episodes", type=int, default=10)
     parser.add_argument("--out-dir", default=DEFAULT_TRAJ_DIR)
 
-    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--dt", type=float, default=0.002)
     parser.add_argument("--n-substeps", type=int, default=1)
 
     parser.add_argument(
@@ -122,7 +122,12 @@ def main() -> None:
         default="productive",
         choices=["dense", "productive", "quadratic", "sparse"],
     )
-    parser.add_argument("--max-episode-steps", type=int, default=4800)
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=None,
+        help="Max steps per episode (default: auto from pass duration)",
+    )
 
     args = parser.parse_args()
 
@@ -141,15 +146,18 @@ def main() -> None:
 
         model = PPO.load(str(model_path), device="cpu")
 
-        env = gym.make(
-            ENV_ID,
-            reward_id=args.reward,
-            max_episode_steps=args.max_episode_steps,
-            dt=args.dt,
-            n_substeps=args.n_substeps,
-        )
+        env_kwargs: dict = {
+            "reward_id": args.reward,
+            "dt": args.dt,
+            "n_substeps": args.n_substeps,
+        }
+        if args.max_episode_steps is not None:
+            env_kwargs["max_episode_steps"] = args.max_episode_steps
 
-        metadata = _get_metadata(env, args.max_episode_steps)
+        env = gym.make(ENV_ID, **env_kwargs)
+
+        max_steps = args.max_episode_steps or env.unwrapped.max_episode_steps
+        metadata = _get_metadata(env, max_steps)
         trajectories = []
 
         for ep in range(args.n_episodes):

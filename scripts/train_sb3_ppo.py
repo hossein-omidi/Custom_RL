@@ -47,10 +47,24 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--dt",
+        type=float,
+        default=0.002,
+        help="ODE integration step size [s]",
+    )
+
+    parser.add_argument(
+        "--n-substeps",
+        type=int,
+        default=1,
+        help="RK4 substeps per env step",
+    )
+
+    parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=4800,
-        help="Maximum steps per episode",
+        default=None,
+        help="Max steps per episode (default: auto from pass duration)",
     )
 
     parser.add_argument(
@@ -69,10 +83,13 @@ def main() -> None:
 
     vec_env_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
 
-    env_kwargs = {
+    env_kwargs: dict = {
         "reward_id": args.reward,
-        "max_episode_steps": args.max_episode_steps,
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
     }
+    if args.max_episode_steps is not None:
+        env_kwargs["max_episode_steps"] = args.max_episode_steps
 
     for seed in args.seeds:
         seed_dir = Path(args.log_dir) / f"seed_{seed}"

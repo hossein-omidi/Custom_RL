@@ -19,6 +19,32 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
     (0.17, 0.20),
 )
 
+DEFAULT_Y_CUTTER = 0.20
+
+
+def estimate_pass_duration(
+    L1: float,
+    cf: float,
+    N: int,
+    omega: float,
+) -> float:
+    """Seconds to complete a straight pass at constant spindle speed."""
+    feed = (cf / 1000.0) * N * float(omega) / (2.0 * np.pi)
+    return float(L1) / max(feed, 1e-12)
+
+
+def estimate_pass_episode_steps(
+    L1: float,
+    cf: float,
+    N: int,
+    omega_min: float,
+    step_dt: float,
+    margin: float = 1.1,
+) -> int:
+    """Episode step budget for the slowest pass (omega_min)."""
+    duration = estimate_pass_duration(L1, cf, N, omega_min) * margin
+    return int(np.ceil(duration / max(step_dt, 1e-12))) + 200
+
 
 def build_sensor_mode_matrix(
     W_mn: list,
@@ -56,6 +82,9 @@ class PlatePlant(ODEPlant):
 
     Normalized action:
         u = [u_omega, u_ac], each in [-1, 1]
+
+    Physical action after scaling:
+        omega [rad/s], ac [mm] depth of cut
     """
 
     def __init__(
@@ -79,6 +108,9 @@ class PlatePlant(ODEPlant):
         wdot_obs_scale: float = 1.0,
         wdot_limit: float = 10.0,
         eta_limit: float = 0.01,
+        y_cutter: float = DEFAULT_Y_CUTTER,
+        x0_cutter: float = 0.0,
+        x_pass_end_tol: float = 0.01,
     ):
         self.N = N
         self.L1 = L1
@@ -110,6 +142,11 @@ class PlatePlant(ODEPlant):
         self.wdot_obs_scale = wdot_obs_scale
         self.wdot_limit = wdot_limit
         self.eta_limit = eta_limit
+        self.y_cutter = float(y_cutter)
+        self.x0_cutter = float(x0_cutter)
+        self.x_pass_end_tol = float(x_pass_end_tol)
+        self.cf = 0.3
+        self._last_omega = float(omega_min)
 
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
@@ -120,10 +157,23 @@ class PlatePlant(ODEPlant):
             dtype=np.float64,
         )
 
-        # Trajectory input
-        self.t_original = np.arange(0.0, 20.0, 0.02, dtype=np.float64)
-        self.x_traj = 0.1 * np.sin(2.0 * np.pi * 0.2 * self.t_original)
-        self.y_traj = 0.1 * np.cos(2.0 * np.pi * 0.2 * self.t_original)
+        # Straight-line pass reference timeline (slowest feed at omega_min).
+        pass_duration = estimate_pass_duration(
+            self.L1, self.cf, self.N, self.omega_min
+        )
+        self.t_original = np.arange(
+            0.0,
+            pass_duration * 1.1,
+            0.02,
+            dtype=np.float64,
+        )
+        feed_slow = (self.cf / 1000.0) * self.N * self.omega_min / (2.0 * np.pi)
+        self.x_traj = np.clip(
+            self.L1 - feed_slow * self.t_original - self.x0_cutter,
+            0.0,
+            self.L1,
+        )
+        self.y_traj = np.full_like(self.t_original, self.y_cutter)
 
         # Modal mass: rho * h integrated over plate area (no double-counting of h).
         M_modal = self.L1 * self.L2 * self.rho * self.h
@@ -170,7 +220,7 @@ class PlatePlant(ODEPlant):
         lambda_vec = np.asarray(lambda_mn.T.reshape(self.K), dtype=np.float64)
 
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
-        cf = 0.3
+        cf = self.cf
 
         xi_base = np.array(
             [6765e9, -4910e6, 2840e3, 132],
@@ -199,6 +249,12 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.t_original = self.t_original
         f_nonlinear2.x_traj = self.x_traj
         f_nonlinear2.y_traj = self.y_traj
+
+        f_nonlinear2.L1 = self.L1
+        f_nonlinear2.x0_cutter = self.x0_cutter
+        f_nonlinear2.y_cutter = self.y_cutter
+        f_nonlinear2.x_pass_end_tol = self.x_pass_end_tol
+        f_nonlinear2.USE_MOVING_FORCE_PROJECTION = True
 
         f_nonlinear2.M_modal = M_modal
         f_nonlinear2.decimal_places = 1
@@ -256,6 +312,7 @@ class PlatePlant(ODEPlant):
             )
 
         u_phys = self._scale_action(u)
+        self._last_omega = float(u_phys[0])
         x_dot = f_nonlinear2.f_nonlinear2(t, x, u_phys)
         x_dot = np.asarray(x_dot, dtype=np.float64).reshape(-1)
 
@@ -269,6 +326,7 @@ class PlatePlant(ODEPlant):
 
     def reset(self, rng) -> tuple[np.ndarray, dict[str, Any]]:
         f_nonlinear2.reset_state_history()
+        self._last_omega = float(self.omega_min)
 
         eta0 = rng.uniform(0, 0, size=self.K)
         eta_dot0 = rng.uniform(0, 0, size=self.K)
@@ -287,22 +345,31 @@ class PlatePlant(ODEPlant):
         excessive_displacement = np.any(np.abs(w_sensor) > self.w_limit)
         excessive_velocity = np.any(np.abs(wdot_sensor) > self.wdot_limit)
 
-        terminated = bool(
-            invalid_state or excessive_displacement or excessive_velocity
-        )
-
         info: dict[str, Any] = {}
 
         if invalid_state:
             info["termination_reason"] = "invalid_state"
+            return True, False, info
 
         if excessive_displacement:
             info["termination_reason"] = "excessive_sensor_displacement"
+            return True, False, info
 
         if excessive_velocity:
             info["termination_reason"] = "excessive_sensor_velocity"
+            return True, False, info
 
-        return terminated, False, info
+        cutter_x, cutter_y = f_nonlinear2.cutter_point(t, self._last_omega)
+        info["cutter_x"] = float(cutter_x)
+        info["cutter_y"] = float(cutter_y)
+        info["feed_progress"] = float(1.0 - cutter_x / max(self.L1, 1e-12))
+
+        if cutter_x <= self.x_pass_end_tol:
+            info["pass_completed"] = True
+            info["termination_reason"] = "pass_completed"
+            return True, False, info
+
+        return False, False, info
 
     def get_observation_space(self) -> spaces.Space:
         low = np.full(self.obs_dim, -np.inf, dtype=np.float64)

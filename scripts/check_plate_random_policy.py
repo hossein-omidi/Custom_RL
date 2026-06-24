@@ -267,6 +267,10 @@ def run_rollout(
             print("  truncated:", truncated)
             if "termination_reason" in info:
                 print("  reason:", info["termination_reason"])
+            if "feed_progress" in info:
+                print("  feed_progress:", f"{info['feed_progress']:.3f}")
+            if info.get("pass_completed"):
+                print("  pass_completed: True")
             break
 
     x_modal_arr = None
@@ -288,10 +292,15 @@ def run_rollout(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plate env smoke test with optional plots.")
     parser.add_argument("--reward", default="dense", choices=["dense", "sparse", "quadratic"])
-    parser.add_argument("--steps", type=int, default=2000)
+    parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dt", type=float, default=0.001)
-    parser.add_argument("--max-episode-steps", type=int, default=5000)
+    parser.add_argument("--dt", type=float, default=0.002)
+    parser.add_argument(
+        "--max-episode-steps",
+        type=int,
+        default=0,
+        help="Env step limit (0 = auto from pass duration)",
+    )
     parser.add_argument("--out-dir", default=str(Path(DEFAULT_PLOT_DIR) / "pretrain"))
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ac.")
     parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed.")
@@ -300,13 +309,15 @@ def main() -> None:
 
     register_envs()
 
-    env = gym.make(
-        ENV_ID,
-        reward_id=args.reward,
-        dt=args.dt,
-        n_substeps=1,
-        max_episode_steps=args.max_episode_steps,
-    )
+    env_kwargs: dict = {
+        "reward_id": args.reward,
+        "dt": args.dt,
+        "n_substeps": 1,
+    }
+    if args.max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = args.max_episode_steps
+
+    env = gym.make(ENV_ID, **env_kwargs)
     plant = env.unwrapped.plant
 
     fixed_action = None

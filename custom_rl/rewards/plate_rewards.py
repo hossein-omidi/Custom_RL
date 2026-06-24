@@ -83,6 +83,7 @@ class DenseProductivePlateReward:
         ac_productive_target: float = 10.0,
         alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        pass_completion_bonus: float = 500.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
         # Backward-compatible aliases for registration kwargs.
@@ -119,6 +120,7 @@ class DenseProductivePlateReward:
 
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
+        self.pass_completion_bonus = pass_completion_bonus
 
         if self.omega_max <= self.omega_min:
             raise ValueError("omega_max must be greater than omega_min.")
@@ -202,7 +204,11 @@ class DenseProductivePlateReward:
         )
 
         if terminated:
-            reward -= self.termination_penalty
+            reason = str(info.get("termination_reason", ""))
+            if reason == "pass_completed" or info.get("pass_completed"):
+                reward += self.pass_completion_bonus
+            else:
+                reward -= self.termination_penalty
 
         if not np.isfinite(reward):
             reward = -float(self.termination_penalty)
@@ -222,6 +228,7 @@ class DenseQuadraticPlateReward:
         wdot_scale: float = 1e-2,
         alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
+        pass_completion_bonus: float = 500.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
         eta_weight: float | None = None,
@@ -247,6 +254,7 @@ class DenseQuadraticPlateReward:
         self.wdot_clip = wdot_scale if wdot_clip is None else wdot_clip
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
+        self.pass_completion_bonus = pass_completion_bonus
 
     def __call__(
         self,
@@ -283,7 +291,11 @@ class DenseQuadraticPlateReward:
         reward = self.alive_bonus - w_cost - wdot_cost - self.action_weight * action_cost
 
         if terminated:
-            reward -= self.termination_penalty
+            reason = str(info.get("termination_reason", ""))
+            if reason == "pass_completed" or info.get("pass_completed"):
+                reward += self.pass_completion_bonus
+            else:
+                reward -= self.termination_penalty
 
         if not np.isfinite(reward):
             reward = -float(self.termination_penalty)
