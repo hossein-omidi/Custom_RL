@@ -77,7 +77,7 @@ class DenseProductivePlateReward:
         w_scale: float = 1e-3,
         wdot_scale: float = 1e-2,
         omega_min: float = 50.0,
-        omega_max: float = 2000.0,
+        omega_max: float = 4000.0,
         ac_min: float = 0.0,
         ac_max: float = 20.0,
         ac_productive_target: float = 10.0,

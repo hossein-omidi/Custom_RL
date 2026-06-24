@@ -1,0 +1,23 @@
+{
+  "created_utc": "2026-06-24T15:47:49.079769+00:00",
+  "method": "time_domain_no_control_binary_search",
+  "note": "Practical time-domain estimate of the no-control stability boundary. Accuracy depends on regenerative delay dynamics (STATE_DELAY) in f_nonlinear2. RL/control is not used.",
+  "env_id": "CustomODEPlate-v0",
+  "dt": 0.002,
+  "n_substeps": 1,
+  "sim_seconds": 8.0,
+  "max_sim_steps": 8000,
+  "rpm_min": 500.0,
+  "rpm_max": 38197.18634205488,
+  "rpm_points": 12,
+  "ac_min_mm": 0,
+  "ac_max_mm": 20.0,
+  "ac_tol_mm": 0.1,
+  "binary_iters": 12,
+  "w_limit_m": 0.01,
+  "w_limit_fraction": 0.95,
+  "rms_growth_threshold": 1.8,
+  "seed": 0,
+  "omega_min_rad_s": 50,
+  "omega_max_rad_s": 4000.0
+}

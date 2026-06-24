@@ -99,7 +99,7 @@ class PlatePlant(ODEPlant):
         m_max: int = 3,
         n_max: int = 2,
         omega_min: float = 50,
-        omega_max: float = 2000.0,
+        omega_max: float = 4000.0,
         ac_min: float = 0,
         ac_max: float = 20.0,
         sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,

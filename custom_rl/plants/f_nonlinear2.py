@@ -81,7 +81,7 @@ P_MAX = 5000
 
 # Cache-key rounding.
 # This improves cache reuse for continuous PPO actions.
-# omega is physical, usually in [50, 2000].
+# omega is physical, usually in [50, 4000] rad/s.
 CACHE_OMEGA_DECIMALS = 1
 CACHE_AC_DECIMALS = 3
 
