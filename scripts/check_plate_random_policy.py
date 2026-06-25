@@ -3,7 +3,7 @@
 Run from the project root:
 
     python scripts/check_plate_random_policy.py
-    python scripts/check_plate_random_policy.py --fixed-action --omega 500 --ac 5
+    python scripts/check_plate_random_policy.py --fixed-action --rpm 1000 --ac 5
 
 This script does not train any agent. It verifies that:
 - environment registration works
@@ -28,6 +28,7 @@ from custom_rl.eval.monte_carlo import (
     physical_wdot_from_info_or_obs,
     plot_monte_carlo_rollouts,
 )
+from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm, rpm_to_omega
 
 ENV_ID = "CustomODEPlate-v0"
 
@@ -156,10 +157,13 @@ def plot_rollout(
         fig.savefig(out_dir / "pretrain_modal_states_debug.png", dpi=150)
         plt.close(fig)
 
-    # --- Physical actions ---
+    # --- Physical actions (rpm and mm for display) ---
     fig, axes = plt.subplots(2, 1, figsize=(8, 5), sharex=True)
-    for dim, name in enumerate(["omega (rad/s)", "ac (depth of cut)"]):
-        axes[dim].plot(times, actions_phys[:, dim], lw=1.5)
+    rpm_series = omega_to_rpm(actions_phys[:, 0])
+    action_series = [rpm_series, actions_phys[:, 1]]
+    action_names = ["Spindle speed (rpm)", "Depth of cut ac (mm)"]
+    for dim, name in enumerate(action_names):
+        axes[dim].plot(times, action_series[dim], lw=1.5)
         axes[dim].set_ylabel(name)
         axes[dim].grid(True, alpha=0.3)
     axes[-1].set_xlabel("Time (s)")
@@ -366,7 +370,18 @@ def main() -> None:
     )
     parser.add_argument("--out-dir", default=str(Path(DEFAULT_PLOT_DIR) / "pretrain"))
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ac.")
-    parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed [rad/s].")
+    parser.add_argument(
+        "--rpm",
+        type=float,
+        default=1000.0,
+        help="Physical spindle speed [rpm] when --fixed-action",
+    )
+    parser.add_argument(
+        "--omega",
+        type=float,
+        default=None,
+        help="Optional override: spindle speed [rad/s] instead of --rpm",
+    )
     parser.add_argument("--ac", type=float, default=5.0, help="Physical depth of cut [mm].")
     parser.add_argument(
         "--n-mc",
@@ -405,9 +420,10 @@ def main() -> None:
     plant = env.unwrapped.plant
 
     fixed_action = None
+    omega_phys = args.omega if args.omega is not None else rpm_to_omega(args.rpm)
     if args.fixed_action:
         fixed_action = physical_to_normalized(
-            args.omega,
+            omega_phys,
             args.ac,
             plant.omega_min,
             plant.omega_max,
@@ -419,14 +435,13 @@ def main() -> None:
     print("Observation space:", env.observation_space)
     print("Action space:", env.action_space)
     print(
-        f"Omega bounds [rad/s]: {plant.omega_min} - {plant.omega_max} "
-        f"({plant.omega_min * 60 / (2 * np.pi):.0f} - "
-        f"{plant.omega_max * 60 / (2 * np.pi):.0f} rpm)"
+        f"Spindle speed range: {RPM_MIN:.0f} - {RPM_MAX:.0f} rpm "
+        f"({plant.omega_min:.2f} - {plant.omega_max:.2f} rad/s)"
     )
     print(f"Dynamics uncertainty std: {plant.dynamics_uncertainty_std}")
     if fixed_action is not None:
         print(
-            f"Fixed physical action: omega={args.omega}, ac={args.ac} "
+            f"Fixed physical action: rpm={omega_to_rpm(omega_phys):.1f}, ac={args.ac} mm "
             f"(normalized={fixed_action})"
         )
 
@@ -451,7 +466,7 @@ def main() -> None:
     env.close()
 
     policy_label = (
-        f"fixed omega={args.omega}, ac={args.ac}"
+        f"fixed rpm={omega_to_rpm(omega_phys):.0f}, ac={args.ac} mm"
         if fixed_action is not None
         else "random policy"
     )

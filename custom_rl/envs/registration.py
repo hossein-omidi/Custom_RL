@@ -7,7 +7,12 @@ from typing import Any
 import gymnasium as gym
 
 from custom_rl.envs.ode_control_env import ODEControlEnv
-from custom_rl.plants.plate import PlatePlant, estimate_pass_episode_steps, OMEGA_MAX_RAD_S
+from custom_rl.plants.plate import (
+    PlatePlant,
+    estimate_pass_episode_steps,
+    OMEGA_MAX_RAD_S,
+    OMEGA_MIN_RAD_S,
+)
 from custom_rl.rewards.plate_rewards import get_plate_reward
 
 
@@ -154,7 +159,7 @@ def register_envs() -> None:
         L1=1.0,
         cf=0.3,
         N=5,
-        omega_min=50.0,
+        omega_min=OMEGA_MIN_RAD_S,
         step_dt=0.002,
     )
 
@@ -165,7 +170,7 @@ def register_envs() -> None:
             max_episode_steps=default_max_steps,
             kwargs={
                 "reward_id": "dense",
-                "omega_min": 50.0,
+                "omega_min": OMEGA_MIN_RAD_S,
                 "omega_max": OMEGA_MAX_RAD_S,
             },
         )

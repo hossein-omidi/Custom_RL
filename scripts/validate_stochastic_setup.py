@@ -8,7 +8,12 @@ import gymnasium as gym
 import numpy as np
 
 from custom_rl import register_envs
-from custom_rl.plants.plate import OMEGA_MAX_RAD_S, OMEGA_MIN_RAD_S
+from custom_rl.plants.plate import (
+    OMEGA_MAX_RAD_S,
+    OMEGA_MIN_RAD_S,
+    RPM_MAX,
+    RPM_MIN,
+)
 from custom_rl.rewards.plate_rewards import DenseProductivePlateReward
 
 ENV_ID = "CustomODEPlate-v0"
@@ -29,7 +34,8 @@ def check_omega_bounds() -> None:
     assert plant.u_phys_low[0] == OMEGA_MIN_RAD_S
     assert plant.u_phys_high[0] == OMEGA_MAX_RAD_S
     env.close()
-    print("[ok] omega bounds 50 - 4000 rad/s")
+    print(f"[ok] spindle speed range {RPM_MIN:.0f} - {RPM_MAX:.0f} rpm "
+          f"({OMEGA_MIN_RAD_S:.3f} - {OMEGA_MAX_RAD_S:.3f} rad/s)")
 
 
 def check_deterministic_without_uncertainty() -> None:

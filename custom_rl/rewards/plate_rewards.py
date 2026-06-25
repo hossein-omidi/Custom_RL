@@ -6,6 +6,7 @@ from typing import Any
 
 import numpy as np
 
+from custom_rl.plants.plate import OMEGA_MAX_RAD_S, OMEGA_MIN_RAD_S
 from custom_rl.rewards.base import RewardFn
 
 
@@ -78,8 +79,8 @@ class DenseProductivePlateReward:
         ac_action_weight: float = 0.0,
         w_scale: float = 1e-3,
         wdot_scale: float = 1e-2,
-        omega_min: float = 50.0,
-        omega_max: float = 4000.0,
+        omega_min: float = OMEGA_MIN_RAD_S,
+        omega_max: float = OMEGA_MAX_RAD_S,
         ac_min: float = 0.0,
         ac_max: float = 20.0,
         ac_productive_target: float = 10.0,

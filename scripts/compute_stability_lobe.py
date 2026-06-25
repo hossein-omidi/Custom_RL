@@ -14,11 +14,11 @@ NOT involved in this calculation.
 Run from the project root:
 
     python scripts/compute_stability_lobe.py
-    python scripts/compute_stability_lobe.py --rpm-min 1000 --rpm-max 15000 --rpm-points 12
+    python scripts/compute_stability_lobe.py --rpm-min 50 --rpm-max 4000 --rpm-points 12
 
 Example single-condition check (same physics, different script):
 
-    python scripts/check_plate_random_policy.py --fixed-action --omega 500 --ac 5
+    python scripts/check_plate_random_policy.py --fixed-action --rpm 1000 --ac 5
 
 3D stability surface (optional):
 
@@ -28,6 +28,8 @@ Stochastic multi-y0 lobe (optional, 2D curves with MC mean +/- std bands):
 
     python scripts/compute_stability_lobe.py --stochastic-lobe --y0 0.1 0.2 0.3 \\
         --n-mc 5 --dynamics-uncertainty-std 0.01
+        
+  python scripts/compute_stability_lobe.py --stochastic-lobe --y0-min 0.05 --y0-max 0.95 --y0-points 6 --n-mc 3 --dynamics-uncertainty-std 0.1      
 """
 
 from __future__ import annotations
@@ -45,21 +47,19 @@ import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3D projection)
 
 from custom_rl import register_envs
-from custom_rl.plants.plate import estimate_pass_episode_steps
+from custom_rl.eval.monte_carlo import MC_BAND_STD_MULT
+from custom_rl.plants.plate import (
+    RPM_MAX,
+    RPM_MIN,
+    estimate_pass_episode_steps,
+    omega_to_rpm,
+    rpm_to_omega,
+)
 
 ENV_ID = "CustomODEPlate-v0"
 
 
-def rpm_to_omega(rpm: float) -> float:
-    """Convert spindle speed from rpm to rad/s."""
-    return float(rpm) * 2.0 * np.pi / 60.0
-
-
-def omega_to_rpm(omega: float) -> float:
-    """Convert spindle speed from rad/s to rpm."""
-    return float(omega) * 60.0 / (2.0 * np.pi)
-
-
+# Re-export for scripts that import from here; canonical definitions live in plate.py.
 def physical_to_normalized(
     omega: float,
     ac: float,
@@ -1014,6 +1014,7 @@ def plot_stochastic_lobe_multi_y0(rows: list[dict], metadata: dict, path: Path) 
         ac_std = np.array(
             [row["ac_stable_std_mm"] for row in y_rows], dtype=np.float64
         )
+        ac_band = MC_BAND_STD_MULT * ac_std
 
         color = cmap(idx % 10)
         label = f"y0 = {y0_m:.3f} m"
@@ -1029,11 +1030,10 @@ def plot_stochastic_lobe_multi_y0(rows: list[dict], metadata: dict, path: Path) 
         )
         ax.fill_between(
             rpm,
-            np.maximum(ac_mean - ac_std, 0.0),
-            ac_mean + ac_std,
+            np.maximum(ac_mean - ac_band, 0.0),
+            ac_mean + ac_band,
             color=color,
             alpha=0.22,
-            label=f"{label} +/- std",
         )
 
     ax.set_xlabel("Spindle speed (rpm)")
@@ -1042,7 +1042,7 @@ def plot_stochastic_lobe_multi_y0(rows: list[dict], metadata: dict, path: Path) 
     unc = metadata.get("dynamics_uncertainty_std", 0.0)
     ax.set_title(
         "Stochastic no-control stability lobe "
-        f"(MC mean +/- std, n_mc={n_mc}, uncertainty={unc})"
+        f"(MC mean +/- {MC_BAND_STD_MULT:.0f}σ, n_mc={n_mc}, uncertainty={unc})"
     )
     ax.grid(True, which="both", linestyle="--", alpha=0.4)
     if rows:
@@ -1057,7 +1057,8 @@ def plot_stochastic_lobe_multi_y0(rows: list[dict], metadata: dict, path: Path) 
     ax.legend(mean_handles, mean_labels, loc="best", fontsize=9)
 
     note = (
-        "Solid line: mean stable ac across MC runs. Shaded band: +/- 1 std.\n"
+        f"Solid line: mean stable ac across MC runs. "
+        f"Shaded band: +/- {MC_BAND_STD_MULT:.0f}σ (~95%).\n"
         "Below each curve: typically stable. Above: chatter/unstable (time-domain estimate)."
     )
     ax.text(
@@ -1080,8 +1081,8 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute a no-control stability lobe for CustomODEPlate-v0."
     )
-    parser.add_argument("--rpm-min", type=float, default=500.0)
-    parser.add_argument("--rpm-max", type=float, default=omega_to_rpm(4000.0))
+    parser.add_argument("--rpm-min", type=float, default=RPM_MIN)
+    parser.add_argument("--rpm-max", type=float, default=RPM_MAX)
     parser.add_argument("--rpm-points", type=int, default=12)
     parser.add_argument("--dt", type=float, default=0.002)
     parser.add_argument("--n-substeps", type=int, default=1)

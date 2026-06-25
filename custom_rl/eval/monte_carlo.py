@@ -8,6 +8,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
+# Shaded MC bands use mean +/- k*std (~95% for k=3, Gaussian).
+MC_BAND_STD_MULT = 3.0
+
+
 def physical_w_from_info_or_obs(
     info: dict,
     obs: np.ndarray,
@@ -132,7 +136,7 @@ def plot_mc_sensor_bands(
     out_path: Path,
     w_limit: float | None = None,
 ) -> None:
-    """Plot mean solid line with +/- std shaded band for each sensor channel."""
+    """Plot mean solid line with +/- k*std shaded band for each sensor channel."""
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     times = np.asarray(times, dtype=np.float64).reshape(-1)
@@ -174,14 +178,15 @@ def plot_mc_sensor_bands(
                 va="center",
             )
         else:
+            band = MC_BAND_STD_MULT * std
             ax.plot(times, mean, lw=1.5, color="#1f77b4", label=f"{label} mean")
             ax.fill_between(
                 times,
-                mean - std,
-                mean + std,
+                mean - band,
+                mean + band,
                 color="#1f77b4",
                 alpha=0.25,
-                label=f"{label} +/- std",
+                label=f"{label} +/- {MC_BAND_STD_MULT:.0f}σ (~95%)",
             )
 
         if w_limit is not None and np.isfinite(w_limit) and ylabel.startswith("Displacement"):

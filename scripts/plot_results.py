@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from custom_rl import DEFAULT_LOG_DIR, DEFAULT_PLOT_DIR, DEFAULT_TRAJ_DIR
+from custom_rl.eval.monte_carlo import MC_BAND_STD_MULT
+from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm
 
 
 def load_monitor_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
@@ -127,15 +129,16 @@ def plot_learning_curve(
 
     ax.fill_between(
         step_grid,
-        mean_return - std_return,
-        mean_return + std_return,
+        mean_return - MC_BAND_STD_MULT * std_return,
+        mean_return + MC_BAND_STD_MULT * std_return,
         alpha=0.3,
+        label=f"±{MC_BAND_STD_MULT:.0f}σ (~95%)",
     )
     ax.plot(step_grid, mean_return, lw=2)
 
     ax.set_xlabel("Environment steps")
     ax.set_ylabel("Episode return")
-    ax.set_title("Training: Episode return (mean ± std)")
+    ax.set_title(f"Training: Episode return (mean ± {MC_BAND_STD_MULT:.0f}σ)")
     ax.grid(True, alpha=0.3)
 
     fig.tight_layout()
@@ -383,8 +386,8 @@ def plot_state_trajectories(
 
         ax.fill_between(
             t_grid[valid],
-            mean_s[valid] - std_s[valid],
-            mean_s[valid] + std_s[valid],
+            mean_s[valid] - MC_BAND_STD_MULT * std_s[valid],
+            mean_s[valid] + MC_BAND_STD_MULT * std_s[valid],
             alpha=0.3,
         )
         ax.plot(t_grid[valid], mean_s[valid], lw=1.5)
@@ -423,7 +426,7 @@ def plot_action_trajectories(
     t_grid, x_label = _time_grid(T, A.shape[1])
 
     if action_dim == 2:
-        action_labels = ["omega", "ac"]
+        action_labels = ["Spindle speed (rpm)", "Depth of cut ac (mm)"]
     else:
         action_labels = [f"action{idx}" for idx in range(action_dim)]
 
@@ -448,12 +451,17 @@ def plot_action_trajectories(
     for dim in range(action_dim):
         ax = axes[dim]
 
-        mean_a, std_a, valid = _nan_mean_std(A[:, :, dim])
+        series = A[:, :, dim].copy()
+        if dim == 0 and action_dim >= 1:
+            series = omega_to_rpm(series)
+
+        mean_a, std_a, valid = _nan_mean_std(series)
+        band = MC_BAND_STD_MULT * std_a
 
         ax.fill_between(
             t_grid[valid],
-            mean_a[valid] - std_a[valid],
-            mean_a[valid] + std_a[valid],
+            mean_a[valid] - band[valid],
+            mean_a[valid] + band[valid],
             alpha=0.3,
         )
         ax.plot(t_grid[valid], mean_a[valid], lw=1.5)
@@ -464,15 +472,23 @@ def plot_action_trajectories(
             and dim < len(physical_low)
             and dim < len(physical_high)
         ):
-            ax.axhline(float(physical_low[dim]), linestyle="--", linewidth=1)
-            ax.axhline(float(physical_high[dim]), linestyle="--", linewidth=1)
+            low = float(physical_low[dim])
+            high = float(physical_high[dim])
+            if dim == 0:
+                low = omega_to_rpm(low)
+                high = omega_to_rpm(high)
+            ax.axhline(low, linestyle="--", linewidth=1)
+            ax.axhline(high, linestyle="--", linewidth=1)
 
         ax.set_ylabel(action_labels[dim])
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel(x_label)
 
-    fig.suptitle("Evaluation trajectories: physical control actions")
+    fig.suptitle(
+        f"Evaluation trajectories: physical control actions "
+        f"(spindle {RPM_MIN:.0f}-{RPM_MAX:.0f} rpm)"
+    )
     fig.tight_layout()
 
     out_path = out_dir / "trajectory_actions_physical.png"

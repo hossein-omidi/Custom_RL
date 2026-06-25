@@ -15,6 +15,7 @@ from custom_rl.eval.monte_carlo import (
     aggregate_mc_sensor_runs,
     plot_mc_sensor_bands,
 )
+from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm
 
 
 ENV_ID = "CustomODEPlate-v0"
@@ -60,6 +61,9 @@ def _get_metadata(env: gym.Env, max_episode_steps: int) -> dict:
         metadata["physical_action_high"] = np.asarray(
             plant.u_phys_high, dtype=np.float64
         ).tolist()
+        metadata["physical_action_units"] = ["rad/s", "mm"]
+        metadata["rpm_min"] = float(omega_to_rpm(plant.omega_min))
+        metadata["rpm_max"] = float(omega_to_rpm(plant.omega_max))
 
     return metadata
 
@@ -151,8 +155,8 @@ def main() -> None:
     parser.add_argument(
         "--randomize-y0",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Sample milling start y0 on each reset",
+        default=True,
+        help="Sample milling start y0 on each reset (covers different pass lines)",
     )
 
     args = parser.parse_args()

@@ -11,6 +11,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import DEFAULT_LOG_DIR, DEFAULT_MODEL_DIR, register_envs
+from custom_rl.plants.plate import RPM_MAX, RPM_MIN
 
 
 ENV_ID = "CustomODEPlate-v0"
@@ -35,8 +36,8 @@ def main() -> None:
     parser.add_argument(
         "--n-envs",
         type=int,
-        default=1,
-        help="Number of parallel environments per training run",
+        default=2,
+        help="Parallel training environments per seed",
     )
 
     parser.add_argument(
@@ -70,8 +71,8 @@ def main() -> None:
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=5,
-        help="Number of evaluation episodes",
+        default=10,
+        help="Evaluation episodes per callback (random y0 explores pass lines)",
     )
 
     parser.add_argument(
@@ -93,6 +94,15 @@ def main() -> None:
 
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
+
+    print(
+        f"Spindle speed range: {RPM_MIN:.0f} - {RPM_MAX:.0f} rpm "
+        f"(physics uses rad/s internally)"
+    )
+    print(
+        f"Stochastic plant: uncertainty_std={args.dynamics_uncertainty_std}, "
+        f"randomize_y0={args.randomize_y0}"
+    )
 
     vec_env_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
 
@@ -145,11 +155,12 @@ def main() -> None:
             seed=seed,
             learning_rate=3e-4,
             n_steps=2048,
-            batch_size=64,
+            batch_size=128,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,
             clip_range=0.2,
+            policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
             verbose=1,
             device="cpu",
         )

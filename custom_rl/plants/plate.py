@@ -21,9 +21,23 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 
 DEFAULT_Y_CUTTER = 0.20
 
-# Spindle speed action bounds [rad/s] used across plant, rewards, and training.
-OMEGA_MIN_RAD_S = 50.0
-OMEGA_MAX_RAD_S = 4000.0
+# Spindle speed operating range [rpm]; internal physics uses rad/s.
+RPM_MIN = 50.0
+RPM_MAX = 4000.0
+
+
+def rpm_to_omega(rpm: float | np.ndarray) -> np.ndarray:
+    """Convert spindle speed from rpm to rad/s (scalar or array)."""
+    return np.asarray(rpm, dtype=np.float64) * 2.0 * np.pi / 60.0
+
+
+def omega_to_rpm(omega: float | np.ndarray) -> np.ndarray:
+    """Convert spindle speed from rad/s to rpm (scalar or array)."""
+    return np.asarray(omega, dtype=np.float64) * 60.0 / (2.0 * np.pi)
+
+
+OMEGA_MIN_RAD_S = float(rpm_to_omega(RPM_MIN))
+OMEGA_MAX_RAD_S = float(rpm_to_omega(RPM_MAX))
 
 
 def estimate_pass_duration(
@@ -88,7 +102,7 @@ class PlatePlant(ODEPlant):
         u = [u_omega, u_ac], each in [-1, 1]
 
     Physical action after scaling:
-        omega [rad/s], ac [mm] depth of cut
+        omega [rad/s] (50-4000 rpm), ac [mm] depth of cut
     """
 
     def __init__(
