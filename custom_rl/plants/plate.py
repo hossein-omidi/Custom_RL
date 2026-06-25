@@ -21,6 +21,10 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 
 DEFAULT_Y_CUTTER = 0.20
 
+# Spindle speed action bounds [rad/s] used across plant, rewards, and training.
+OMEGA_MIN_RAD_S = 50.0
+OMEGA_MAX_RAD_S = 4000.0
+
 
 def estimate_pass_duration(
     L1: float,
@@ -98,8 +102,8 @@ class PlatePlant(ODEPlant):
         rho: float = 2810.0,
         m_max: int = 3,
         n_max: int = 2,
-        omega_min: float = 50,
-        omega_max: float = 4000.0,
+        omega_min: float = OMEGA_MIN_RAD_S,
+        omega_max: float = OMEGA_MAX_RAD_S,
         ac_min: float = 0,
         ac_max: float = 20.0,
         sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
@@ -111,6 +115,10 @@ class PlatePlant(ODEPlant):
         y_cutter: float = DEFAULT_Y_CUTTER,
         x0_cutter: float = 0.0,
         x_pass_end_tol: float = 0.01,
+        dynamics_uncertainty_std: float = 0.0,
+        y0_min: float = 0.05,
+        y0_max: float = 0.45,
+        randomize_y0: bool = True,
     ):
         self.N = N
         self.L1 = L1
@@ -147,6 +155,11 @@ class PlatePlant(ODEPlant):
         self.x_pass_end_tol = float(x_pass_end_tol)
         self.cf = 0.3
         self._last_omega = float(omega_min)
+        self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
+        self.y0_min = float(y0_min)
+        self.y0_max = float(y0_max)
+        self.randomize_y0 = bool(randomize_y0)
+        self._rng: np.random.Generator | None = None
 
         self.u_phys_low = np.array(
             [self.omega_min, self.ac_min],
@@ -259,6 +272,10 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.M_modal = M_modal
         f_nonlinear2.decimal_places = 1
 
+    def bind_rng(self, rng: np.random.Generator) -> None:
+        """Bind Gymnasium RNG for y0 sampling and dynamics uncertainty."""
+        self._rng = rng
+
     def _sync_f_nonlinear2_geometry(self) -> None:
         """Push milling path geometry into f_nonlinear2 module globals."""
         f_nonlinear2.y_traj = self.y_traj
@@ -343,6 +360,14 @@ class PlatePlant(ODEPlant):
                 f"({self.state_dim},), but returned {x_dot.shape}."
             )
 
+        # Process/model disturbance on modal accelerations (before integration).
+        if self.dynamics_uncertainty_std > 0.0 and self._rng is not None:
+            x_dot = x_dot.copy()
+            x_dot[1::2] += (
+                self.dynamics_uncertainty_std
+                * self._rng.standard_normal(self.K)
+            )
+
         return x_dot
 
     def reset(
@@ -353,6 +378,9 @@ class PlatePlant(ODEPlant):
         options = options or {}
         if "y0" in options:
             self.set_milling_start_y(float(options["y0"]))
+        elif self.randomize_y0 and self._rng is not None:
+            y0 = float(self._rng.uniform(self.y0_min, self.y0_max))
+            self.set_milling_start_y(y0)
 
         f_nonlinear2.reset_state_history()
         self._last_omega = float(self.omega_min)
@@ -364,7 +392,7 @@ class PlatePlant(ODEPlant):
         x0[0::2] = eta0
         x0[1::2] = eta_dot0
 
-        return x0, {}
+        return x0, {"y0": float(self.y_cutter)}
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
         x = np.asarray(x, dtype=np.float64).reshape(-1)

@@ -7,7 +7,7 @@ from typing import Any
 import gymnasium as gym
 
 from custom_rl.envs.ode_control_env import ODEControlEnv
-from custom_rl.plants.plate import PlatePlant, estimate_pass_episode_steps
+from custom_rl.plants.plate import PlatePlant, estimate_pass_episode_steps, OMEGA_MAX_RAD_S
 from custom_rl.rewards.plate_rewards import get_plate_reward
 
 
@@ -39,11 +39,12 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
             ac_min, ac_max,
             sensor_points, w_limit, w_obs_scale, wdot_obs_scale,
             y_cutter, x0_cutter, x_pass_end_tol,
+            dynamics_uncertainty_std, y0_min, y0_max, randomize_y0,
             eta_limit
 
         Reward kwargs:
             w_weight, wdot_weight (aliases: eta_weight, eta_dot_weight)
-            action_weight, productivity_weight
+            action_weight, productivity_weight, omega_cost_weight, ac_action_weight
             w_scale, wdot_scale (aliases: eta_scale, eta_dot_scale)
             alive_bonus, termination_penalty, pass_completion_bonus
     """
@@ -80,6 +81,10 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "y_cutter",
         "x0_cutter",
         "x_pass_end_tol",
+        "dynamics_uncertainty_std",
+        "y0_min",
+        "y0_max",
+        "randomize_y0",
     }
 
     reward_keys = {
@@ -91,6 +96,8 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "productivity_weight",
         "negative_ac_weight",
         "ac_productive_target",
+        "omega_cost_weight",
+        "ac_action_weight",
         "w_scale",
         "wdot_scale",
         "w_clip",
@@ -156,5 +163,9 @@ def register_envs() -> None:
             id=env_id,
             entry_point="custom_rl.envs.registration:make_plate_env",
             max_episode_steps=default_max_steps,
-            kwargs={"reward_id": "dense"},
+            kwargs={
+                "reward_id": "dense",
+                "omega_min": 50.0,
+                "omega_max": OMEGA_MAX_RAD_S,
+            },
         )

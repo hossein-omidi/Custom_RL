@@ -23,6 +23,11 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from custom_rl import DEFAULT_PLOT_DIR, register_envs
+from custom_rl.eval.monte_carlo import (
+    physical_w_from_info_or_obs,
+    physical_wdot_from_info_or_obs,
+    plot_monte_carlo_rollouts,
+)
 
 ENV_ID = "CustomODEPlate-v0"
 
@@ -221,9 +226,15 @@ def run_rollout(
   max_steps: int,
   seed: int,
   fixed_action: np.ndarray | None,
+  reset_options: dict | None = None,
 ) -> dict[str, np.ndarray]:
-    obs, info = env.reset(seed=seed)
+    if reset_options is not None:
+        obs, info = env.reset(seed=seed, options=reset_options)
+    else:
+        obs, info = env.reset(seed=seed)
     plant = env.unwrapped.plant
+    if "y0" in info:
+        print(f"  reset y0={info['y0']:.3f} m")
 
     times: list[float] = [0.0]
     observations: list[np.ndarray] = [obs.copy()]
@@ -234,6 +245,10 @@ def run_rollout(
     terminated_flags: list[bool] = []
     truncated_flags: list[bool] = []
 
+    w_sensor_hist: list[np.ndarray] = []
+    wdot_sensor_hist: list[np.ndarray] = []
+    reward_terms_hist: list[dict] = []
+
     for step in range(max_steps):
         if fixed_action is not None:
             action = fixed_action.copy()
@@ -241,6 +256,31 @@ def run_rollout(
             action = env.action_space.sample()
 
         obs, reward, terminated, truncated, info = env.step(action)
+
+        if "w_sensor" in info:
+            w_sensor_hist.append(np.asarray(info["w_sensor"], dtype=np.float64))
+        else:
+            w_sensor_hist.append(
+                physical_w_from_info_or_obs(
+                    info,
+                    obs,
+                    n_sensors=plant.n_sensors,
+                    w_obs_scale=plant.w_obs_scale,
+                )
+            )
+        if "wdot_sensor" in info:
+            wdot_sensor_hist.append(np.asarray(info["wdot_sensor"], dtype=np.float64))
+        else:
+            wdot_sensor_hist.append(
+                physical_wdot_from_info_or_obs(
+                    info,
+                    obs,
+                    n_sensors=plant.n_sensors,
+                    wdot_obs_scale=plant.wdot_obs_scale,
+                )
+            )
+        if "reward_terms" in info:
+            reward_terms_hist.append(dict(info["reward_terms"]))
 
         actions_norm.append(np.asarray(action, dtype=np.float64))
         actions_phys.append(
@@ -281,12 +321,35 @@ def run_rollout(
         "times": np.asarray(times[1:], dtype=np.float64),
         "observations": np.asarray(observations[1:], dtype=np.float64),
         "x_modal": x_modal_arr,
+        "w_sensor": np.asarray(w_sensor_hist, dtype=np.float64) if w_sensor_hist else None,
+        "wdot_sensor": np.asarray(wdot_sensor_hist, dtype=np.float64) if wdot_sensor_hist else None,
+        "reward_terms": reward_terms_hist,
         "actions_norm": np.asarray(actions_norm, dtype=np.float64),
         "actions_phys": np.asarray(actions_phys, dtype=np.float64),
         "rewards": np.asarray(rewards, dtype=np.float64),
         "terminated_flags": np.asarray(terminated_flags, dtype=bool),
         "truncated_flags": np.asarray(truncated_flags, dtype=bool),
     }
+
+
+def plot_monte_carlo_physical(
+    rollouts: list[dict],
+    *,
+    n_sensors: int,
+    w_limit: float | None,
+    out_dir: Path,
+    title_suffix: str,
+    default_dt: float = 0.002,
+) -> None:
+    """Plot mean +/- std bands for physical sensor displacement and velocity."""
+    plot_monte_carlo_rollouts(
+        rollouts,
+        n_sensors=n_sensors,
+        w_limit=w_limit,
+        out_dir=out_dir,
+        title_suffix=title_suffix,
+        default_dt=default_dt,
+    )
 
 
 def main() -> None:
@@ -303,8 +366,27 @@ def main() -> None:
     )
     parser.add_argument("--out-dir", default=str(Path(DEFAULT_PLOT_DIR) / "pretrain"))
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ac.")
-    parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed.")
-    parser.add_argument("--ac", type=float, default=5.0, help="Physical depth of cut.")
+    parser.add_argument("--omega", type=float, default=500.0, help="Physical spindle speed [rad/s].")
+    parser.add_argument("--ac", type=float, default=5.0, help="Physical depth of cut [mm].")
+    parser.add_argument(
+        "--n-mc",
+        type=int,
+        default=1,
+        help="Monte Carlo rollouts (mean/std bands when > 1)",
+    )
+    parser.add_argument(
+        "--dynamics-uncertainty-std",
+        type=float,
+        default=0.0,
+        help="Gaussian disturbance on modal accelerations in dynamics [0=off]",
+    )
+    parser.add_argument(
+        "--randomize-y0",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Sample milling start y0 on each reset (uniform over y0 range)",
+    )
+    parser.add_argument("--y0", type=float, default=None, help="Fixed milling start y0 [m]")
     args = parser.parse_args()
 
     register_envs()
@@ -313,6 +395,8 @@ def main() -> None:
         "reward_id": args.reward,
         "dt": args.dt,
         "n_substeps": 1,
+        "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
+        "randomize_y0": args.randomize_y0,
     }
     if args.max_episode_steps > 0:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
@@ -334,13 +418,31 @@ def main() -> None:
     print("Environment created successfully.")
     print("Observation space:", env.observation_space)
     print("Action space:", env.action_space)
+    print(
+        f"Omega bounds [rad/s]: {plant.omega_min} - {plant.omega_max} "
+        f"({plant.omega_min * 60 / (2 * np.pi):.0f} - "
+        f"{plant.omega_max * 60 / (2 * np.pi):.0f} rpm)"
+    )
+    print(f"Dynamics uncertainty std: {plant.dynamics_uncertainty_std}")
     if fixed_action is not None:
         print(
             f"Fixed physical action: omega={args.omega}, ac={args.ac} "
             f"(normalized={fixed_action})"
         )
 
-    rollout = run_rollout(env, args.steps, args.seed, fixed_action)
+    rollouts: list[dict] = []
+    reset_options = {"y0": args.y0} if args.y0 is not None else None
+    for mc in range(args.n_mc):
+        rollout = run_rollout(
+            env,
+            args.steps,
+            args.seed + mc,
+            fixed_action,
+            reset_options=reset_options,
+        )
+        rollouts.append(rollout)
+
+    rollout = rollouts[0]
 
     assert rollout["observations"].shape[1] == env.observation_space.shape[0]
     assert np.all(np.isfinite(rollout["observations"]))
@@ -370,6 +472,20 @@ def main() -> None:
         out_dir=Path(args.out_dir),
         title_suffix=policy_label,
     )
+
+    if args.n_mc > 1:
+        plot_monte_carlo_physical(
+            rollouts,
+            n_sensors=getattr(plant, "n_sensors", 2),
+            w_limit=getattr(plant, "w_limit", None),
+            out_dir=Path(args.out_dir),
+            title_suffix=f"{policy_label}, n_mc={args.n_mc}",
+            default_dt=args.dt,
+        )
+
+    if rollout["reward_terms"]:
+        terms = rollout["reward_terms"][-1]
+        print("Last-step reward terms:", terms)
 
     print("Rollout test finished successfully.")
     print("Total reward:", float(np.sum(rollout["rewards"])))

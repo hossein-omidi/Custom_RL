@@ -107,6 +107,8 @@ class ODEControlEnv(gym.Env):
         super().reset(seed=seed)
         # Use env's np_random (set by super) for determinism with reset() vs reset(seed=X)
         rng = self.np_random
+        if hasattr(self.plant, "bind_rng"):
+            self.plant.bind_rng(rng)
         reset_options = options or {}
         try:
             self._state, info = self.plant.reset(rng, options=reset_options)
@@ -134,6 +136,9 @@ class ODEControlEnv(gym.Env):
     ) -> tuple[np.ndarray, float, bool, bool, dict[str, Any]]:
         action = np.asarray(action, dtype=np.float64)
         action = self._clamp_action(action)
+
+        if hasattr(self.plant, "bind_rng"):
+            self.plant.bind_rng(self.np_random)
 
         x_prev = self._state.copy()
         self._state = integrate(
@@ -167,6 +172,9 @@ class ODEControlEnv(gym.Env):
             truncated,
             info,
         )
+
+        if hasattr(self.reward_fn, "last_reward_terms"):
+            info["reward_terms"] = dict(self.reward_fn.last_reward_terms)
 
         obs = self.plant.state_to_obs(self._state)
         obs = self._add_obs_noise(obs)

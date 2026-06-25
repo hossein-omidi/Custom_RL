@@ -74,6 +74,19 @@ def main() -> None:
         help="Number of evaluation episodes",
     )
 
+    parser.add_argument(
+        "--dynamics-uncertainty-std",
+        type=float,
+        default=0.0,
+        help="Modal acceleration disturbance std [0=off, e.g. 0.01 for stochastic plant]",
+    )
+    parser.add_argument(
+        "--randomize-y0",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Sample milling start y0 each episode (uniform over y0 range)",
+    )
+
     args = parser.parse_args()
 
     register_envs()
@@ -87,9 +100,12 @@ def main() -> None:
         "reward_id": args.reward,
         "dt": args.dt,
         "n_substeps": args.n_substeps,
+        "randomize_y0": args.randomize_y0,
     }
     if args.max_episode_steps is not None:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
+    if args.dynamics_uncertainty_std > 0.0:
+        env_kwargs["dynamics_uncertainty_std"] = args.dynamics_uncertainty_std
 
     for seed in args.seeds:
         seed_dir = Path(args.log_dir) / f"seed_{seed}"

@@ -74,6 +74,8 @@ class DenseProductivePlateReward:
         action_weight: float = 0.0,
         productivity_weight: float = 10.0,
         negative_ac_weight: float = 2.0,
+        omega_cost_weight: float = 2.0,
+        ac_action_weight: float = 0.0,
         w_scale: float = 1e-3,
         wdot_scale: float = 1e-2,
         omega_min: float = 50.0,
@@ -106,6 +108,8 @@ class DenseProductivePlateReward:
         self.action_weight = action_weight
         self.productivity_weight = productivity_weight
         self.negative_ac_weight = negative_ac_weight
+        self.omega_cost_weight = omega_cost_weight
+        self.ac_action_weight = ac_action_weight
 
         self.w_scale = w_scale
         self.wdot_scale = wdot_scale
@@ -121,6 +125,7 @@ class DenseProductivePlateReward:
         self.alive_bonus = alive_bonus
         self.termination_penalty = termination_penalty
         self.pass_completion_bonus = pass_completion_bonus
+        self.last_reward_terms: dict[str, float] = {}
 
         if self.omega_max <= self.omega_min:
             raise ValueError("omega_max must be greater than omega_min.")
@@ -189,19 +194,39 @@ class DenseProductivePlateReward:
 
         productivity_score = omega_score * ac_score
 
+        omega_norm = omega_score
+        omega_cost = self.omega_cost_weight * (omega_norm ** 2)
+
         negative_ac = max(-ac, 0.0)
         negative_ac_cost = (negative_ac / max(self.ac_max, 1e-12)) ** 2
 
-        action_cost = float(np.sum(np.clip(u, -1.0, 1.0) ** 2))
+        u_clipped = np.clip(u, -1.0, 1.0)
+        ac_u = float(u_clipped[1]) if u_clipped.size > 1 else 0.0
+        ac_action_cost = self.ac_action_weight * (ac_u ** 2)
+        action_cost = float(np.sum(u_clipped ** 2))
+
+        productivity_term = self.productivity_weight * productivity_score
 
         reward = (
             self.alive_bonus
-            + self.productivity_weight * productivity_score
+            + productivity_term
             - w_cost
             - wdot_cost
+            - omega_cost
             - self.negative_ac_weight * negative_ac_cost
+            - ac_action_cost
             - self.action_weight * action_cost
         )
+
+        self.last_reward_terms = {
+            "vibration_w_cost": float(w_cost),
+            "vibration_wdot_cost": float(wdot_cost),
+            "productivity": float(productivity_term),
+            "omega_cost": float(omega_cost),
+            "negative_ac_cost": float(self.negative_ac_weight * negative_ac_cost),
+            "ac_action_cost": float(ac_action_cost),
+            "action_cost": float(self.action_weight * action_cost),
+        }
 
         if terminated:
             reason = str(info.get("termination_reason", ""))

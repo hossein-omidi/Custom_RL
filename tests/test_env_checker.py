@@ -14,6 +14,8 @@ ENV_KWARGS = {
     "dt": 0.001,
     "n_substeps": 1,
     "max_episode_steps": 500,
+    "randomize_y0": False,
+    "dynamics_uncertainty_std": 0.0,
 }
 
 
