@@ -23,6 +23,11 @@ Example single-condition check (same physics, different script):
 3D stability surface (optional):
 
     python scripts/compute_stability_lobe.py --surface-3d --y0-min 0.05 --y0-max 0.45 --y0-points 5
+
+Stochastic multi-y0 lobe (optional, 2D curves with MC mean +/- std bands):
+
+    python scripts/compute_stability_lobe.py --stochastic-lobe --y0 0.1 0.2 0.3 \\
+        --n-mc 5 --dynamics-uncertainty-std 0.01
 """
 
 from __future__ import annotations
@@ -161,6 +166,7 @@ def run_fixed_action_trial(
     seed: int,
     rms_growth_threshold: float,
     w_limit_fraction: float,
+    reset_options: dict | None = None,
 ) -> TrialMetrics:
     """Simulate one fixed (omega, ac) pair with no controller."""
     plant = env.unwrapped.plant
@@ -173,7 +179,7 @@ def run_fixed_action_trial(
         plant.ac_max,
     )
 
-    obs, _ = env.reset(seed=seed)
+    obs, _ = env.reset(seed=seed, options=reset_options)
     info_history: list[dict] = []
     terminated = truncated = False
     termination_reason: str | None = None
@@ -227,6 +233,7 @@ def find_max_stable_ac(
     max_binary_iters: int,
     rms_growth_threshold: float,
     w_limit_fraction: float,
+    reset_options: dict | None = None,
 ) -> tuple[float, TrialMetrics, TrialMetrics | None]:
     """
     Binary search for the largest axial depth of cut that remains stable.
@@ -246,6 +253,7 @@ def find_max_stable_ac(
         seed=seed,
         rms_growth_threshold=rms_growth_threshold,
         w_limit_fraction=w_limit_fraction,
+        reset_options=reset_options,
     )
 
     if not trial_lo.stable:
@@ -259,6 +267,7 @@ def find_max_stable_ac(
         seed=seed + 1,
         rms_growth_threshold=rms_growth_threshold,
         w_limit_fraction=w_limit_fraction,
+        reset_options=reset_options,
     )
 
     if trial_hi.stable:
@@ -280,6 +289,7 @@ def find_max_stable_ac(
             seed=seed + int(ac_mid * 1000),
             rms_growth_threshold=rms_growth_threshold,
             w_limit_fraction=w_limit_fraction,
+            reset_options=reset_options,
         )
 
         if trial_mid.stable:
@@ -602,6 +612,240 @@ def compute_lobe_surface_3d(args: argparse.Namespace) -> tuple[list[dict], dict]
     return rows, metadata
 
 
+def resolve_y0_values(args: argparse.Namespace) -> list[float]:
+    """Return explicit --y0 list or a linspace from y0-min/max/points."""
+    if args.y0:
+        return [float(v) for v in args.y0]
+    return [float(v) for v in np.linspace(args.y0_min, args.y0_max, args.y0_points)]
+
+
+def find_max_stable_ac_mc(
+    env: gym.Env,
+    *,
+    omega_rad_s: float,
+    ac_min: float,
+    ac_max: float,
+    max_steps: int,
+    seed: int,
+    ac_tol_mm: float,
+    max_binary_iters: int,
+    rms_growth_threshold: float,
+    w_limit_fraction: float,
+    n_mc: int,
+    reset_options: dict | None = None,
+) -> tuple[float, float, list[float], TrialMetrics, TrialMetrics | None]:
+    """
+    Estimate max stable ac with Monte Carlo repetitions.
+
+    Each MC run performs a full binary search with a distinct seed so stochastic
+    dynamics uncertainty produces independent boundary estimates.
+
+    Returns:
+        (ac_mean_mm, ac_std_mm, ac_samples_mm, representative_stable_trial,
+         representative_unstable_trial)
+    """
+    ac_samples: list[float] = []
+    last_stable: TrialMetrics | None = None
+    last_unstable: TrialMetrics | None = None
+
+    for mc in range(n_mc):
+        ac_stable, stable_trial, unstable_trial = find_max_stable_ac(
+            env,
+            omega_rad_s=omega_rad_s,
+            ac_min=ac_min,
+            ac_max=ac_max,
+            max_steps=max_steps,
+            seed=seed + mc * 10_000,
+            ac_tol_mm=ac_tol_mm,
+            max_binary_iters=max_binary_iters,
+            rms_growth_threshold=rms_growth_threshold,
+            w_limit_fraction=w_limit_fraction,
+            reset_options=reset_options,
+        )
+        ac_samples.append(ac_stable)
+        last_stable = stable_trial
+        if unstable_trial is not None:
+            last_unstable = unstable_trial
+
+    ac_arr = np.asarray(ac_samples, dtype=np.float64)
+    ac_mean = float(np.mean(ac_arr))
+    ac_std = float(np.std(ac_arr)) if ac_arr.size > 1 else 0.0
+
+    assert last_stable is not None
+    return ac_mean, ac_std, ac_samples, last_stable, last_unstable
+
+
+def sweep_rpm_boundary_stochastic_at_y0(
+    env: gym.Env,
+    plant,
+    rpm_values: np.ndarray,
+    args: argparse.Namespace,
+    *,
+    y0_m: float,
+    seed_offset: int,
+) -> list[dict]:
+    """Estimate stochastic stability boundary over rpm at fixed y0."""
+    plant.set_milling_start_y(y0_m)
+    reset_options = {"y0": y0_m}
+    rows: list[dict] = []
+
+    for index, rpm in enumerate(rpm_values):
+        omega = rpm_to_omega(float(rpm))
+        omega = float(np.clip(omega, plant.omega_min, plant.omega_max))
+        rpm_clipped = omega_to_rpm(omega)
+
+        max_steps = simulation_steps_for_rpm(
+            rpm_clipped,
+            dt=args.dt,
+            n_substeps=args.n_substeps,
+            plant=plant,
+            sim_seconds=args.sim_seconds,
+            max_sim_steps=args.max_sim_steps,
+        )
+
+        print(
+            f"    rpm={rpm_clipped:.0f} (omega={omega:.1f} rad/s), "
+            f"max_steps={max_steps}, n_mc={args.n_mc}"
+        )
+
+        ac_mean, ac_std, ac_samples, stable_trial, unstable_trial = find_max_stable_ac_mc(
+            env,
+            omega_rad_s=omega,
+            ac_min=plant.ac_min,
+            ac_max=plant.ac_max,
+            max_steps=max_steps,
+            seed=args.seed + seed_offset + index,
+            ac_tol_mm=args.ac_tol,
+            max_binary_iters=args.binary_iters,
+            rms_growth_threshold=args.rms_growth_threshold,
+            w_limit_fraction=args.w_limit_fraction,
+            n_mc=args.n_mc,
+            reset_options=reset_options,
+        )
+
+        row = {
+            "rpm": rpm_clipped,
+            "omega_rad_s": omega,
+            "y0_m": y0_m,
+            "ac_stable_mean_mm": ac_mean,
+            "ac_stable_std_mm": ac_std,
+            "ac_stable_samples_mm": json.dumps(ac_samples),
+            "n_mc": args.n_mc,
+            "max_abs_w_m": stable_trial.max_abs_w_m,
+            "rms_w_m": stable_trial.rms_w_m,
+            "rms_growth_ratio": stable_trial.rms_growth_ratio,
+            "sim_steps": stable_trial.steps,
+            "sim_time_s": stable_trial.sim_time_s,
+            "termination_reason": stable_trial.termination_reason,
+            "stable_at_boundary": stable_trial.stable,
+            "unstable_ac_mm": None if unstable_trial is None else unstable_trial.ac_mm,
+            "unstable_max_abs_w_m": None if unstable_trial is None else unstable_trial.max_abs_w_m,
+        }
+        rows.append(row)
+
+        print(
+            f"      -> stable boundary ac ~ {ac_mean:.3f} +/- {ac_std:.3f} mm "
+            f"(samples={ac_samples})"
+        )
+
+    return rows
+
+
+def compute_stochastic_lobe_multi_y0(args: argparse.Namespace) -> tuple[list[dict], dict]:
+    """
+    Stochastic stability lobe: multiple y0 curves on one 2D rpm-ac plot.
+
+    For each y0 and spindle speed, runs n_mc independent binary searches with
+    optional dynamics uncertainty. Boundary depth is summarized as mean +/- std.
+    """
+    register_envs()
+
+    env_kwargs: dict = {
+        "reward_id": "sparse",
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
+        "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
+        "randomize_y0": False,
+    }
+    if args.max_episode_steps > 0:
+        env_kwargs["max_episode_steps"] = args.max_episode_steps
+
+    env = gym.make(ENV_ID, **env_kwargs)
+    plant = env.unwrapped.plant
+
+    rpm_values = np.linspace(args.rpm_min, args.rpm_max, args.rpm_points)
+    y0_values = resolve_y0_values(args)
+    rows: list[dict] = []
+
+    print(
+        "Stochastic no-control stability lobe (multi-y0 curves)\n"
+        f"  rpm range     : {args.rpm_min:.0f} - {args.rpm_max:.0f} rpm "
+        f"({args.rpm_points} points)\n"
+        f"  y0 values     : {y0_values}\n"
+        f"  n_mc          : {args.n_mc}\n"
+        f"  dynamics unc. : {plant.dynamics_uncertainty_std}\n"
+        f"  ac search     : {plant.ac_min:.3f} - {plant.ac_max:.3f} mm\n"
+        f"  dt            : {args.dt} s, substeps={args.n_substeps}\n"
+        f"  w_limit       : {plant.w_limit} m\n"
+    )
+
+    for y_index, y0_m in enumerate(y0_values):
+        print(
+            f"[y0 {y_index + 1}/{len(y0_values)}] milling start y0={y0_m:.3f} m "
+            f"(L2={plant.L2:.3f} m)"
+        )
+        y_rows = sweep_rpm_boundary_stochastic_at_y0(
+            env,
+            plant,
+            rpm_values,
+            args,
+            y0_m=y0_m,
+            seed_offset=y_index * 100_000,
+        )
+        rows.extend(y_rows)
+
+    env.close()
+
+    metadata = {
+        "created_utc": datetime.now(timezone.utc).isoformat(),
+        "method": "time_domain_no_control_binary_search_stochastic_mc",
+        "note": (
+            "Stochastic time-domain estimate of the no-control stability boundary. "
+            "For each (rpm, y0), n_mc independent binary searches with optional "
+            "dynamics uncertainty; boundary reported as mean +/- std across MC runs. "
+            "Physical displacement criteria and growth-ratio chatter detection are "
+            "unchanged from the deterministic lobe. RL/control is not used."
+        ),
+        "env_id": ENV_ID,
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
+        "sim_seconds": args.sim_seconds,
+        "max_sim_steps": args.max_sim_steps,
+        "rpm_min": args.rpm_min,
+        "rpm_max": args.rpm_max,
+        "rpm_points": args.rpm_points,
+        "y0_values_m": y0_values,
+        "y0_min_m": args.y0_min,
+        "y0_max_m": args.y0_max,
+        "y0_points": args.y0_points,
+        "n_mc": args.n_mc,
+        "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
+        "L2_m": plant.L2,
+        "ac_min_mm": plant.ac_min,
+        "ac_max_mm": plant.ac_max,
+        "ac_tol_mm": args.ac_tol,
+        "binary_iters": args.binary_iters,
+        "w_limit_m": plant.w_limit,
+        "w_limit_fraction": args.w_limit_fraction,
+        "rms_growth_threshold": args.rms_growth_threshold,
+        "seed": args.seed,
+        "omega_min_rad_s": plant.omega_min,
+        "omega_max_rad_s": plant.omega_max,
+    }
+
+    return rows, metadata
+
+
 def save_csv(rows: list[dict], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(rows[0].keys()) if rows else []
@@ -748,6 +992,90 @@ def plot_lobe_surface_3d(rows: list[dict], metadata: dict, path: Path) -> None:
     plt.close(fig)
 
 
+def plot_stochastic_lobe_multi_y0(rows: list[dict], metadata: dict, path: Path) -> None:
+    """Plot MC mean stability boundaries with +/- std bands for several y0 values."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    y0_values = sorted({row["y0_m"] for row in rows})
+    ac_max = float(metadata["ac_max_mm"])
+    cmap = plt.get_cmap("tab10")
+
+    fig, ax = plt.subplots(figsize=(10, 6.5))
+
+    for idx, y0_m in enumerate(y0_values):
+        y_rows = sorted(
+            (row for row in rows if row["y0_m"] == y0_m),
+            key=lambda row: row["rpm"],
+        )
+        rpm = np.array([row["rpm"] for row in y_rows], dtype=np.float64)
+        ac_mean = np.array(
+            [row["ac_stable_mean_mm"] for row in y_rows], dtype=np.float64
+        )
+        ac_std = np.array(
+            [row["ac_stable_std_mm"] for row in y_rows], dtype=np.float64
+        )
+
+        color = cmap(idx % 10)
+        label = f"y0 = {y0_m:.3f} m"
+        ax.plot(
+            rpm,
+            ac_mean,
+            "-",
+            color=color,
+            linewidth=2.0,
+            marker="o",
+            markersize=4,
+            label=f"{label} (mean)",
+        )
+        ax.fill_between(
+            rpm,
+            np.maximum(ac_mean - ac_std, 0.0),
+            ac_mean + ac_std,
+            color=color,
+            alpha=0.22,
+            label=f"{label} +/- std",
+        )
+
+    ax.set_xlabel("Spindle speed (rpm)")
+    ax.set_ylabel("Axial depth of cut (mm)")
+    n_mc = metadata.get("n_mc", 1)
+    unc = metadata.get("dynamics_uncertainty_std", 0.0)
+    ax.set_title(
+        "Stochastic no-control stability lobe "
+        f"(MC mean +/- std, n_mc={n_mc}, uncertainty={unc})"
+    )
+    ax.grid(True, which="both", linestyle="--", alpha=0.4)
+    if rows:
+        all_rpm = [row["rpm"] for row in rows]
+        ax.set_xlim(float(np.min(all_rpm)), float(np.max(all_rpm)))
+    ax.set_ylim(0.0, ac_max * 1.05)
+
+    handles, labels = ax.get_legend_handles_labels()
+    # Keep one legend entry per y0 (mean line only) for clarity.
+    mean_handles = [h for h, lab in zip(handles, labels) if "(mean)" in lab]
+    mean_labels = [lab.replace(" (mean)", "") for lab in labels if "(mean)" in lab]
+    ax.legend(mean_handles, mean_labels, loc="best", fontsize=9)
+
+    note = (
+        "Solid line: mean stable ac across MC runs. Shaded band: +/- 1 std.\n"
+        "Below each curve: typically stable. Above: chatter/unstable (time-domain estimate)."
+    )
+    ax.text(
+        0.02,
+        0.02,
+        note,
+        transform=ax.transAxes,
+        fontsize=8,
+        va="bottom",
+        ha="left",
+        bbox={"boxstyle": "round,pad=0.3", "facecolor": "white", "alpha": 0.85},
+    )
+
+    fig.tight_layout()
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Compute a no-control stability lobe for CustomODEPlate-v0."
@@ -806,7 +1134,34 @@ def parse_args() -> argparse.Namespace:
         "--y0-points",
         type=int,
         default=5,
-        help="Number of y0 grid points for 3D surface mode",
+        help="Number of y0 grid points for 3D surface or stochastic multi-y0 mode",
+    )
+    parser.add_argument(
+        "--stochastic-lobe",
+        action="store_true",
+        help=(
+            "Stochastic multi-y0 2D lobe: several y0 curves with MC mean +/- std "
+            "bands on one rpm-ac figure (separate outputs from deterministic lobe)"
+        ),
+    )
+    parser.add_argument(
+        "--y0",
+        type=float,
+        nargs="*",
+        default=None,
+        help="Explicit milling start y0 values [m] for --stochastic-lobe",
+    )
+    parser.add_argument(
+        "--n-mc",
+        type=int,
+        default=5,
+        help="Monte Carlo repetitions per (rpm, y0) in --stochastic-lobe mode",
+    )
+    parser.add_argument(
+        "--dynamics-uncertainty-std",
+        type=float,
+        default=0.01,
+        help="Gaussian disturbance on modal accelerations for stochastic lobe [0=off]",
     )
     return parser.parse_args()
 
@@ -814,6 +1169,25 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
     out_dir = args.out_dir
+
+    if args.surface_3d and args.stochastic_lobe:
+        raise SystemExit("Choose only one of --surface-3d or --stochastic-lobe.")
+
+    if args.stochastic_lobe:
+        rows, metadata = compute_stochastic_lobe_multi_y0(args)
+        csv_path = out_dir / "stability_lobe_stochastic.csv"
+        meta_path = out_dir / "stability_lobe_stochastic_metadata.json"
+        plot_path = out_dir / "stability_lobe_stochastic.png"
+
+        save_csv(rows, csv_path)
+        save_metadata(metadata, meta_path)
+        plot_stochastic_lobe_multi_y0(rows, metadata, plot_path)
+
+        print("\nSaved stochastic lobe outputs:")
+        print(f"  plot     : {plot_path.resolve()}")
+        print(f"  csv      : {csv_path.resolve()}")
+        print(f"  metadata : {meta_path.resolve()}")
+        return
 
     if args.surface_3d:
         rows, metadata = compute_lobe_surface_3d(args)
