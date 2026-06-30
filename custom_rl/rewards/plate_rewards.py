@@ -347,6 +347,7 @@ class DenseQuadraticPlateReward:
         eta_dot_weight: float | None = None,
         eta_scale: float | None = None,
         eta_dot_scale: float | None = None,
+        **_unused_kwargs: Any,
     ):
         if eta_weight is not None:
             w_weight = eta_weight

@@ -265,6 +265,12 @@ class PlatePlant(ODEPlant):
         self.omega_max = float(omega_max)
         self.ap_min = float(ap_min)
         self.ap_max = float(ap_max)
+        # Backward-compatible aliases. Older scripts/configs used ac for the
+        # second action. In the face-milling plant, that same second action is
+        # axial depth of cut ap [mm]. Keep these aliases to avoid interface
+        # breaks without changing the physical meaning.
+        self.ac_min = self.ap_min
+        self.ac_max = self.ap_max
         self.ae_min = float(ae_min)
         self.ae_max = float(ae_max)
         self.ae_default = float(np.clip(ae_default, self.ae_min, self.ae_max))
@@ -316,6 +322,7 @@ class PlatePlant(ODEPlant):
         self.x_pass_end_tol = float(x_pass_end_tol)
         self._last_omega = float(self.omega_min)
         self._last_ap = float(self.ap_min)
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
 
         self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
@@ -576,6 +583,7 @@ class PlatePlant(ODEPlant):
         u_phys = self._scale_action(u)
         self._last_omega = float(u_phys[0])
         self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
 
         # If ae is not controlled, pass [omega, ap].  The force module then uses
@@ -619,6 +627,7 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.reset_state_history()
         self._last_omega = float(self.omega_min)
         self._last_ap = float(self.ap_min)
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
 
         x0 = np.zeros(self.state_dim, dtype=np.float64)
@@ -660,6 +669,7 @@ class PlatePlant(ODEPlant):
         info["omega_rad_s"] = float(self._last_omega)
         info["omega_rpm"] = float(omega_to_rpm(self._last_omega))
         info["ap_mm"] = float(self._last_ap)
+        info["ac_mm"] = float(self._last_ap)  # backward-compatible alias; physically ap
         info["ae_mm"] = float(self._last_ae)
 
         # Expose last cutting-force diagnostics if available.
