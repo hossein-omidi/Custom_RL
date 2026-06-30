@@ -325,6 +325,15 @@ class PlatePlant(ODEPlant):
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
 
+        # Accepted pass kinematics. The modal state remains unchanged; these
+        # variables only keep the cutter x-position and spindle phase continuous
+        # when omega changes between RL steps.
+        self._feed_distance_m = 0.0
+        self._spindle_phase_rad = 0.0
+        self._kinematic_step_t0 = 0.0
+        self._kinematic_step_feed0_m = 0.0
+        self._kinematic_step_phase0_rad = 0.0
+
         self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
         self.y0_min = float(y0_min)
         self.y0_max = float(y0_max)
@@ -497,6 +506,11 @@ class PlatePlant(ODEPlant):
         f_nonlinear2.USE_DELAYED_CUTTER_POSITION_FOR_REGEN = True
         f_nonlinear2.EDGE_FORCE_WHEN_ZERO_CHIP = False
 
+        # Use accepted feed distance/spindle phase rather than omega*t. This is
+        # important when the RL policy changes omega during an episode.
+        if hasattr(f_nonlinear2, "USE_ACCEPTED_PATH_KINEMATICS"):
+            f_nonlinear2.USE_ACCEPTED_PATH_KINEMATICS = True
+
     def _sync_face_milling_geometry(self) -> None:
         """Synchronize pass-line geometry with the force module."""
         f_nonlinear2.y_cutter = self.y_cutter
@@ -518,6 +532,59 @@ class PlatePlant(ODEPlant):
     def bind_rng(self, rng: np.random.Generator) -> None:
         """Bind Gymnasium RNG for random y-line and model uncertainty."""
         self._rng = rng
+
+    # ------------------------------------------------------------------
+    # Accepted cutter-path / spindle kinematics
+    # ------------------------------------------------------------------
+    def _feed_rate_from_omega(self, omega_rad_s: float) -> float:
+        """Return table/feed speed [m/s] from feed per tooth and spindle speed."""
+        omega_rad_s = max(float(omega_rad_s), 1e-12)
+        return (self.feed_per_tooth_mm / 1000.0) * self.N * omega_rad_s / (2.0 * np.pi)
+
+    def _sync_accepted_kinematics_to_force_module(self, t: float, *, append: bool = True) -> None:
+        """Push accepted feed distance and spindle phase into the force module."""
+        if hasattr(f_nonlinear2, "set_accepted_kinematic_state"):
+            f_nonlinear2.set_accepted_kinematic_state(
+                float(t),
+                float(self._feed_distance_m),
+                float(self._spindle_phase_rad),
+                append=append,
+            )
+
+    def begin_step(self, t: float, u: np.ndarray) -> None:
+        """Prepare continuous path/phase kinematics before RK integration.
+
+        ODEControlEnv calls this once per accepted environment step. The action
+        is still held constant during the RK substeps, but the cutter position
+        and tooth phase are propagated from the last accepted values instead of
+        recomputing them as omega*t from the start of the episode.
+        """
+        u_phys = self._scale_action(u)
+        self._last_omega = float(u_phys[0])
+        self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap
+        self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
+
+        self._kinematic_step_t0 = float(t)
+        self._kinematic_step_feed0_m = float(self._feed_distance_m)
+        self._kinematic_step_phase0_rad = float(self._spindle_phase_rad)
+        self._sync_accepted_kinematics_to_force_module(float(t), append=True)
+
+    def end_step(self, t: float, u: np.ndarray) -> None:
+        """Commit accepted cutter feed distance and spindle phase after integration."""
+        u_phys = self._scale_action(u)
+        omega = float(u_phys[0])
+        dt_step = max(float(t) - float(self._kinematic_step_t0), 0.0)
+
+        self._feed_distance_m = self._kinematic_step_feed0_m + self._feed_rate_from_omega(omega) * dt_step
+        self._feed_distance_m = float(np.clip(self._feed_distance_m, 0.0, self.L1 + abs(self.x0_cutter)))
+        self._spindle_phase_rad = self._kinematic_step_phase0_rad + omega * dt_step
+
+        self._last_omega = omega
+        self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap
+        self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
+        self._sync_accepted_kinematics_to_force_module(float(t), append=True)
 
     # ------------------------------------------------------------------
     # Observation wrapper: modal -> physical displacement/velocity
@@ -629,6 +696,12 @@ class PlatePlant(ODEPlant):
         self._last_ap = float(self.ap_min)
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
+        self._feed_distance_m = 0.0
+        self._spindle_phase_rad = 0.0
+        self._kinematic_step_t0 = 0.0
+        self._kinematic_step_feed0_m = 0.0
+        self._kinematic_step_phase0_rad = 0.0
+        self._sync_accepted_kinematics_to_force_module(0.0, append=True)
 
         x0 = np.zeros(self.state_dim, dtype=np.float64)
         if self.initial_eta_std > 0.0:
@@ -641,6 +714,8 @@ class PlatePlant(ODEPlant):
             "x_start": float(self.L1 - self.x0_cutter),
             "x_end": 0.0,
             "path_direction": "x=L1 free side -> x=0 clamped side",
+            "feed_distance_m": float(self._feed_distance_m),
+            "spindle_phase_rad": float(self._spindle_phase_rad),
             "rho_interpreted_as": self.rho_interpreted_as,
         }
         return x0, info
@@ -666,6 +741,8 @@ class PlatePlant(ODEPlant):
         info["cutter_x"] = float(cutter_x)
         info["cutter_y"] = float(cutter_y)
         info["feed_progress"] = float(1.0 - cutter_x / max(self.L1, 1e-12))
+        info["feed_distance_m"] = float(self._feed_distance_m)
+        info["spindle_phase_rad"] = float(self._spindle_phase_rad)
         info["omega_rad_s"] = float(self._last_omega)
         info["omega_rpm"] = float(omega_to_rpm(self._last_omega))
         info["ap_mm"] = float(self._last_ap)

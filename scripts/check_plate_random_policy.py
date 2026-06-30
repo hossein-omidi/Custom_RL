@@ -359,7 +359,7 @@ def main() -> None:
     parser.add_argument("--fixed-action", action="store_true", help="Use constant omega/ap.")
     parser.add_argument("--rpm", type=float, default=1000.0, help="Spindle speed [rpm] for --fixed-action.")
     parser.add_argument("--omega", type=float, default=None, help="Optional spindle speed [rad/s] instead of --rpm.")
-    parser.add_argument("--ap", type=float, default=0.05, help="Axial depth of cut ap [mm] for --fixed-action.")
+    parser.add_argument("--ap", type=float, default=0, help="Axial depth of cut ap [mm] for --fixed-action.")
     parser.add_argument("--ae", type=float, default=None, help="Optional radial immersion ae [mm] if control_ae=True.")
     parser.add_argument("--control-ae", action="store_true", help="Use 3D action [omega, ap, ae].")
     parser.add_argument(

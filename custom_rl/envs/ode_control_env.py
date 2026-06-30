@@ -242,6 +242,12 @@ class ODEControlEnv(gym.Env):
         x_prev = self._state.copy()
         t_prev = float(self._t)
 
+        # Optional plant hook for accepted-step kinematics. Face-milling PlatePlant
+        # uses this to keep cutter feed distance and spindle phase continuous when
+        # omega changes between environment steps.
+        if hasattr(self.plant, "begin_step"):
+            self.plant.begin_step(t_prev, action)
+
         self._state = integrate(
             self.plant.dynamics,
             self._t,
@@ -263,6 +269,9 @@ class ODEControlEnv(gym.Env):
                 * self.np_random.standard_normal(self._state.shape)
             )
             self._replace_last_history_state(history_module, self._t, self._state)
+
+        if hasattr(self.plant, "end_step"):
+            self.plant.end_step(self._t, action)
 
         self._step_count += 1
 

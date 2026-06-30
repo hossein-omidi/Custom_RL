@@ -26,7 +26,7 @@ Implemented face-milling model
 ------------------------------
 For tooth i:
 
-    theta_i = omega*t + theta0 + (i-1)*2*pi/N
+    theta_i = theta_base(t) + theta0 + (i-1)*2*pi/N
     tau     = 2*pi/(N*omega)
 
     h_i = ft*sin(theta_i)
@@ -155,11 +155,29 @@ MIN_IMMERSION = 0.0
 _state_history = []              # sorted list of (t, x_copy)
 _MAX_HISTORY = 200000
 
+# Accepted tool-path/spindle kinematics for variable-omega RL control.
+# If disabled, the module falls back to the old constant-omega convention:
+#   x_c(t) = L1 - feed_rate(omega_current)*t - x0_cutter
+#   theta(t) = omega_current*t + theta0
+# PlatePlant enables this flag and updates the accepted feed distance and
+# spindle phase at the beginning/end of each environment step.
+USE_ACCEPTED_PATH_KINEMATICS = False
+_kinematic_history = []          # sorted list of (t, feed_distance_m, spindle_phase_rad)
+_KINEMATIC_TOL = 1e-14
+_kinematic_t0 = 0.0
+_kinematic_feed0_m = 0.0
+_kinematic_phase0_rad = 0.0
+
 
 def reset_state_history() -> None:
-    """Clear modal history. Call at the beginning of each episode/pass."""
+    """Clear modal and accepted-kinematic histories at episode/pass reset."""
     global _state_history, last_force_info
+    global _kinematic_history, _kinematic_t0, _kinematic_feed0_m, _kinematic_phase0_rad
     _state_history = []
+    _kinematic_history = []
+    _kinematic_t0 = 0.0
+    _kinematic_feed0_m = 0.0
+    _kinematic_phase0_rad = 0.0
     last_force_info = None
 
 
@@ -211,6 +229,125 @@ def _get_state_at_time(t_query: float) -> Optional[np.ndarray]:
     a = (t_query - t1) / (t2 - t1)
     return (1.0 - a) * x1 + a * x2
 
+
+
+# ============================================================
+# Accepted tool-path / spindle kinematic history
+# ============================================================
+
+
+def _append_kinematic_history(t: float, feed_distance_m: float, spindle_phase_rad: float) -> None:
+    """Append accepted feed distance and spindle phase for interpolation."""
+    global _kinematic_history
+    t = float(t)
+    entry = (t, float(feed_distance_m), float(spindle_phase_rad))
+
+    if len(_kinematic_history) == 0 or t >= _kinematic_history[-1][0]:
+        if len(_kinematic_history) > 0 and abs(_kinematic_history[-1][0] - t) < _KINEMATIC_TOL:
+            _kinematic_history[-1] = entry
+        else:
+            _kinematic_history.append(entry)
+    else:
+        times = [e[0] for e in _kinematic_history]
+        idx = bisect.bisect_left(times, t)
+        if idx < len(_kinematic_history) and abs(_kinematic_history[idx][0] - t) < _KINEMATIC_TOL:
+            _kinematic_history[idx] = entry
+        else:
+            _kinematic_history.insert(idx, entry)
+
+    if len(_kinematic_history) > _MAX_HISTORY:
+        _kinematic_history = _kinematic_history[-_MAX_HISTORY:]
+
+
+def set_accepted_kinematic_state(
+    t: float,
+    feed_distance_m: float,
+    spindle_phase_rad: float,
+    *,
+    append: bool = True,
+) -> None:
+    """Set accepted tool-path/spindle kinematics used by cutter_point().
+
+    Parameters
+    ----------
+    t:
+        Accepted time [s].
+    feed_distance_m:
+        Accumulated feed distance from the free side toward the clamped side [m].
+    spindle_phase_rad:
+        Accumulated spindle phase angle [rad]. This may be unbounded.
+    append:
+        If True, store the accepted kinematic state for delayed interpolation.
+    """
+    global _kinematic_t0, _kinematic_feed0_m, _kinematic_phase0_rad
+    _kinematic_t0 = float(t)
+    _kinematic_feed0_m = max(float(feed_distance_m), 0.0)
+    _kinematic_phase0_rad = float(spindle_phase_rad)
+    if append:
+        _append_kinematic_history(_kinematic_t0, _kinematic_feed0_m, _kinematic_phase0_rad)
+
+
+def _get_kinematic_at_time(t_query: float):
+    """Return (feed_distance_m, spindle_phase_rad) at t_query by interpolation."""
+    if len(_kinematic_history) == 0:
+        return None
+
+    t_query = float(t_query)
+    times = [entry[0] for entry in _kinematic_history]
+    idx = bisect.bisect_left(times, t_query)
+
+    if idx == 0:
+        if abs(times[0] - t_query) < _KINEMATIC_TOL:
+            return _kinematic_history[0][1], _kinematic_history[0][2]
+        return None
+
+    if idx == len(times):
+        # For queries after the last accepted point, the caller should normally
+        # propagate from the current accepted state using the current held omega.
+        return _kinematic_history[-1][1], _kinematic_history[-1][2]
+
+    t1, feed1, phase1 = _kinematic_history[idx - 1]
+    t2, feed2, phase2 = _kinematic_history[idx]
+    if abs(t2 - t1) < _KINEMATIC_TOL:
+        return feed1, phase1
+
+    a = (t_query - t1) / (t2 - t1)
+    feed = (1.0 - a) * feed1 + a * feed2
+    phase = (1.0 - a) * phase1 + a * phase2
+    return float(feed), float(phase)
+
+
+def feed_phase_at_time(t: float, omega_rad_s: float) -> Tuple[float, float]:
+    """Return accumulated feed distance [m] and spindle phase [rad] at time t.
+
+    With USE_ACCEPTED_PATH_KINEMATICS=True, past times are interpolated from
+    accepted kinematic history and current RK-stage times are propagated from
+    the last accepted state. This avoids artificial jumps when the RL action
+    changes omega between environment steps.
+    """
+    t = float(t)
+    omega_rad_s = max(float(omega_rad_s), OMEGA_EPS)
+
+    if not USE_ACCEPTED_PATH_KINEMATICS:
+        return feed_rate_m_s(omega_rad_s) * max(t, 0.0), omega_rad_s * max(t, 0.0)
+
+    if t >= _kinematic_t0 - _KINEMATIC_TOL:
+        dt_local = max(t - _kinematic_t0, 0.0)
+        feed = _kinematic_feed0_m + feed_rate_m_s(omega_rad_s) * dt_local
+        phase = _kinematic_phase0_rad + omega_rad_s * dt_local
+        return float(feed), float(phase)
+
+    past = _get_kinematic_at_time(max(t, 0.0))
+    if past is not None:
+        return past
+
+    return 0.0, 0.0
+
+
+def spindle_phase(t: float, omega_rad_s: float) -> float:
+    """Return accumulated spindle phase [rad] at time t."""
+    _, phase = feed_phase_at_time(t, omega_rad_s)
+    return float(phase)
 
 # ============================================================
 # Debug information from the last force calculation
@@ -408,11 +545,12 @@ def cutter_point(t: float, omega_rad_s: float) -> Tuple[float, float]:
     """
     Nominal tool-center/contact point for force projection [m].
 
-    The default path starts near x=L1 and feeds toward x=0. Change this function
-    if the face-milling pass in your model follows another path.
+    The path starts at the free side x=L1 and feeds toward the clamped side x=0.
+    With accepted kinematics enabled, accumulated feed distance is continuous
+    when omega changes between RL steps.
     """
-    feed_dist = feed_rate_m_s(omega_rad_s) * max(float(t), 0.0)
-    xc = float(L1) - (feed_dist + float(x0_cutter))
+    feed_dist, _ = feed_phase_at_time(t, omega_rad_s)
+    xc = float(L1) - (float(feed_dist) + float(x0_cutter))
     xc = float(np.clip(xc, 0.0, float(L1)))
     yc = float(y_cutter)
     return xc, yc
@@ -553,6 +691,7 @@ def compute_face_milling_force(t: float, x_modal: np.ndarray, x_delay_modal: np.
     rel_vel_now = relative_velocity_mm_s(x_modal, xc, yc)
 
     phi_pitch = 2.0 * np.pi / float(N)
+    theta_base = spindle_phase(t, omega_rad_s) + float(theta0)
     theta_values = np.zeros(int(N), dtype=np.float64)
     engagement = np.zeros(int(N), dtype=bool)
     chip_raw = np.zeros(int(N), dtype=np.float64)
@@ -564,7 +703,7 @@ def compute_face_milling_force(t: float, x_modal: np.ndarray, x_delay_modal: np.
     sin_gL = np.sin(float(gamma_L))
 
     for i in range(int(N)):
-        theta = (omega_rad_s * t + float(theta0) + i * phi_pitch) % (2.0 * np.pi)
+        theta = (theta_base + i * phi_pitch) % (2.0 * np.pi)
         theta_values[i] = theta
 
         is_engaged = _engaged(theta, theta_s, theta_e)
