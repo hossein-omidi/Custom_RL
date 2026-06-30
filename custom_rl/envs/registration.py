@@ -9,7 +9,7 @@ import gymnasium as gym
 from custom_rl.envs.ode_control_env import ODEControlEnv
 from custom_rl.plants.plate import (
     PlatePlant,
-    estimate_pass_episode_steps,
+    estimate_training_episode_steps,
     OMEGA_MAX_RAD_S,
     OMEGA_MIN_RAD_S,
 )
@@ -121,11 +121,10 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     step_dt = dt * n_substeps
     if max_episode_steps is None:
-        max_episode_steps = estimate_pass_episode_steps(
+        max_episode_steps = estimate_training_episode_steps(
             plant.L1,
             plant.cf,
             plant.N,
-            plant.omega_min,
             step_dt,
         )
 
@@ -155,11 +154,10 @@ def register_envs() -> None:
     """Register custom RL environment with Gymnasium. Call before gymnasium.make()."""
     env_id = "CustomODEPlate-v0"
 
-    default_max_steps = estimate_pass_episode_steps(
+    default_max_steps = estimate_training_episode_steps(
         L1=1.0,
         cf=0.3,
         N=5,
-        omega_min=OMEGA_MIN_RAD_S,
         step_dt=0.002,
     )
 

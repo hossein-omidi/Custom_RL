@@ -5,12 +5,14 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import gymnasium as gym
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import DEFAULT_LOG_DIR, DEFAULT_MODEL_DIR, register_envs
+from custom_rl.eval.pipeline import plate_env_kwargs
 from custom_rl.plants.plate import RPM_MAX, RPM_MIN
 
 
@@ -29,7 +31,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=500_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -50,7 +52,7 @@ def main() -> None:
     parser.add_argument(
         "--dt",
         type=float,
-        default=0.002,
+        default=0.001,
         help="ODE integration step size [s]",
     )
 
@@ -71,8 +73,14 @@ def main() -> None:
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=10,
+        default=5,
         help="Evaluation episodes per callback (random y0 explores pass lines)",
+    )
+    parser.add_argument(
+        "--eval-freq",
+        type=int,
+        default=20_000,
+        help="Evaluate every N total env steps (higher = less eval overhead)",
     )
 
     parser.add_argument(
@@ -103,19 +111,34 @@ def main() -> None:
         f"Stochastic plant: uncertainty_std={args.dynamics_uncertainty_std}, "
         f"randomize_y0={args.randomize_y0}"
     )
+    print(
+        "Directories:\n"
+        f"  logs     -> {Path(args.log_dir).resolve()}/seed_<N>/\n"
+        f"  models   -> {Path(args.save_dir).resolve()}/best_<N>/best_model.zip\n"
+        f"            {Path(args.save_dir).resolve()}/final_<N>.zip (after training)\n"
+        f"  eval     -> python scripts/eval_policy.py --save-dir {args.save_dir}\n"
+        f"  plots    -> python scripts/plot_results.py --log-dir {args.log_dir}"
+    )
 
     vec_env_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
 
-    env_kwargs: dict = {
-        "reward_id": args.reward,
-        "dt": args.dt,
-        "n_substeps": args.n_substeps,
-        "randomize_y0": args.randomize_y0,
-    }
-    if args.max_episode_steps is not None:
-        env_kwargs["max_episode_steps"] = args.max_episode_steps
-    if args.dynamics_uncertainty_std > 0.0:
-        env_kwargs["dynamics_uncertainty_std"] = args.dynamics_uncertainty_std
+    env_kwargs = plate_env_kwargs(
+        reward_id=args.reward,
+        dt=args.dt,
+        n_substeps=args.n_substeps,
+        max_episode_steps=args.max_episode_steps,
+        dynamics_uncertainty_std=args.dynamics_uncertainty_std,
+        randomize_y0=args.randomize_y0,
+    )
+
+    # Show practical episode cap (pass completion usually ends sooner).
+    _probe = gym.make(ENV_ID, **env_kwargs)
+    print(f"Max episode steps (cap): {_probe.unwrapped.max_episode_steps}")
+    print(
+        "Note: first PPO rollout (~8192 env steps with defaults) can take several "
+        "minutes on CPU before progress logs appear."
+    )
+    _probe.close()
 
     for seed in args.seeds:
         seed_dir = Path(args.log_dir) / f"seed_{seed}"
@@ -144,7 +167,7 @@ def main() -> None:
             eval_env,
             best_model_save_path=save_path,
             log_path=str(seed_dir),
-            eval_freq=max(5000 // args.n_envs, 1),
+            eval_freq=max(args.eval_freq // args.n_envs, 1),
             n_eval_episodes=args.n_eval_episodes,
             deterministic=True,
         )
@@ -154,8 +177,8 @@ def main() -> None:
             env,
             seed=seed,
             learning_rate=3e-4,
-            n_steps=2048,
-            batch_size=128,
+            n_steps=4096,
+            batch_size=256,
             n_epochs=10,
             gamma=0.99,
             gae_lambda=0.95,

@@ -39,6 +39,9 @@ def omega_to_rpm(omega: float | np.ndarray) -> np.ndarray:
 OMEGA_MIN_RAD_S = float(rpm_to_omega(RPM_MIN))
 OMEGA_MAX_RAD_S = float(rpm_to_omega(RPM_MAX))
 
+# Reference pass speed for RL episode truncation (not slowest 50 rpm).
+TRAINING_REFERENCE_RPM = 1000.0
+
 
 def estimate_pass_duration(
     L1: float,
@@ -62,6 +65,26 @@ def estimate_pass_episode_steps(
     """Episode step budget for the slowest pass (omega_min)."""
     duration = estimate_pass_duration(L1, cf, N, omega_min) * margin
     return int(np.ceil(duration / max(step_dt, 1e-12))) + 200
+
+
+def estimate_training_episode_steps(
+    L1: float,
+    cf: float,
+    N: int,
+    step_dt: float,
+    *,
+    reference_rpm: float = TRAINING_REFERENCE_RPM,
+    margin: float = 1.35,
+) -> int:
+    """
+    Practical RL episode cap from a typical pass duration (~reference_rpm).
+
+    Using omega_min (50 rpm) can exceed 800k steps at dt=0.001 and makes PPO
+    eval rollouts appear hung. Pass completion still terminates earlier when
+    the tool finishes the cut.
+    """
+    omega_ref = float(rpm_to_omega(reference_rpm))
+    return estimate_pass_episode_steps(L1, cf, N, omega_ref, step_dt, margin=margin)
 
 
 def build_sensor_mode_matrix(

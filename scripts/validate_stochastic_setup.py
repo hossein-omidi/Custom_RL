@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import gymnasium as gym
 import numpy as np
@@ -142,8 +143,36 @@ def check_y0_randomization() -> None:
     print("[ok] y0 randomization explores different start lines")
 
 
+def check_pipeline_env_kwargs() -> None:
+    from custom_rl.eval.pipeline import (
+        discover_model_seeds,
+        plate_env_kwargs,
+        plant_plot_metadata,
+        resolve_ppo_model_path,
+    )
+
+    register_envs()
+    kwargs = plate_env_kwargs(
+        reward_id="productive",
+        dynamics_uncertainty_std=0.0,
+        randomize_y0=True,
+        max_episode_steps=20,
+    )
+    env = gym.make(ENV_ID, **kwargs)
+    meta = plant_plot_metadata(env)
+    assert np.isclose(meta["rpm_min"], RPM_MIN)
+    assert np.isclose(meta["rpm_max"], RPM_MAX)
+    assert meta["physical_actions_are_rad_s_mm"] is True
+    assert kwargs["dynamics_uncertainty_std"] == 0.0
+    assert resolve_ppo_model_path(Path("models/ppo_plate"), 99) is None
+    assert discover_model_seeds(Path("models/ppo_plate_missing")) == []
+    env.close()
+    print("[ok] shared train/eval env kwargs and plot metadata")
+
+
 def main() -> int:
     check_omega_bounds()
+    check_pipeline_env_kwargs()
     check_deterministic_without_uncertainty()
     check_stochastic_differs_with_uncertainty()
     check_reward_terms()
