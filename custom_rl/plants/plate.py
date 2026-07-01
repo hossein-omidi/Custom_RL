@@ -180,7 +180,7 @@ class PlatePlant(ODEPlant):
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
-        ap_max: float = 20,
+        ap_max: float = 1,
         ae_min: float = 1.0,
         ae_max: float = 50.0,
         ae_default: float = 25.0,
