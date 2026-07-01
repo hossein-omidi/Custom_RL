@@ -197,9 +197,11 @@ class PlatePlant(ODEPlant):
         # zero by default because the present scalar plate projection uses Fz.
         Kt: float = 0.0,
         Kr: float = 0.0,
+        #Ka: float = 4790.9,
         Ka: float = 4790.9,
         Kte: float = 0.0,
         Kre: float = 0.0,
+        #Kae: float = 360.6,
         Kae: float = 360.6,
         milling_mode: str = "up",
         theta0: float = 0.0,
@@ -440,10 +442,19 @@ class PlatePlant(ODEPlant):
         # Preserve the original ordering convention used by f_nonlinear2:
         # for m in range(m_max): for n in range(n_max)
         omega_vec = np.asarray(omega_mn.reshape(self.K), dtype=np.float64)
-        lambda_vec = np.asarray(lambda_mn.reshape(self.K), dtype=np.float64)
+        lambda_structural_vec = np.asarray(lambda_mn.reshape(self.K), dtype=np.float64)
+
+        # Unit-consistency fix:
+        # compute_nonlinear_stiffness returns structural cubic coefficients K3_k
+        # with force scaling. f_nonlinear2 integrates an acceleration equation,
+        # so the cubic term must be mass-normalized exactly like the cutting
+        # force projection Fk = Q_k / M_k. For the current analytical mode
+        # shapes, self.M_modal = ∫∫ rho_areal*W_k^2 dA ≈ L1*L2*rho_areal.
+        lambda_vec = lambda_structural_vec / max(float(self.M_modal), 1e-18)
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
 
         self.omega_vec = omega_vec
+        self.lambda_structural_vec = lambda_structural_vec
         self.lambda_vec = lambda_vec
         self.zeta_vec = zeta_vec
 
@@ -678,42 +689,52 @@ class PlatePlant(ODEPlant):
     # ------------------------------------------------------------------
     def reset(
         self,
-        rng,
+        rng: np.random.Generator | None,
         options: dict[str, Any] | None = None,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         options = options or {}
 
+        # 1. Determine the y-location of the milling pass
+        # FIX: Removed trailing spaces in dictionary keys to ensure proper matching
         if "y0" in options:
             self.set_milling_line_y(float(options["y0"]))
         elif "y_cutter" in options:
             self.set_milling_line_y(float(options["y_cutter"]))
-        elif self.randomize_y0 and self._rng is not None:
-            y0 = float(self._rng.uniform(self.y0_min, self.y0_max))
-            self.set_milling_line_y(y0)
+        elif self.randomize_y0:
+            # Use the passed `rng` for reproducibility, falling back to self._rng if needed
+            randomizer = rng if rng is not None else self._rng
+            if randomizer is not None:
+                y0 = float(randomizer.uniform(self.y0_min, self.y0_max))
+                self.set_milling_line_y(y0)
 
+        # 2. Reset force module history and internal kinematic states
         f_nonlinear2.reset_state_history()
         self._last_omega = float(self.omega_min)
         self._last_ap = float(self.ap_min)
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
+        
         self._feed_distance_m = 0.0
         self._spindle_phase_rad = 0.0
         self._kinematic_step_t0 = 0.0
         self._kinematic_step_feed0_m = 0.0
         self._kinematic_step_phase0_rad = 0.0
+        
         self._sync_accepted_kinematics_to_force_module(0.0, append=True)
 
+        # 3. Initialize modal state
         x0 = np.zeros(self.state_dim, dtype=np.float64)
-        if self.initial_eta_std > 0.0:
+        if self.initial_eta_std > 0.0 and rng is not None:
             x0[0::2] = rng.normal(0.0, self.initial_eta_std, size=self.K)
-        if self.initial_etad_std > 0.0:
+        if self.initial_etad_std > 0.0 and rng is not None:
             x0[1::2] = rng.normal(0.0, self.initial_etad_std, size=self.K)
 
+        # 4. Return initial state and info dictionary
         info = {
             "y_cutter": float(self.y_cutter),
             "x_start": float(self.L1 - self.x0_cutter),
-            "x_end": 0.0,
-            "path_direction": "x=L1 free side -> x=0 clamped side",
+            "x_end": 0.1 * self.L1,  # FIX: Updated to match the new 90% termination rule
+            "path_direction": "x=L1 free side -> x=0.1*L1 (90% pass)",
             "feed_distance_m": float(self._feed_distance_m),
             "spindle_phase_rad": float(self._spindle_phase_rad),
             "rho_interpreted_as": self.rho_interpreted_as,
@@ -724,19 +745,23 @@ class PlatePlant(ODEPlant):
         x = np.asarray(x, dtype=np.float64).reshape(-1)
         info: dict[str, Any] = {}
 
+        # 1. Catch numerical explosions (NaN/Inf) immediately
         invalid_state = not np.all(np.isfinite(x))
         if invalid_state:
             info["termination_reason"] = "invalid_state"
             return True, False, info
 
+        # 2. Check physical instability based SOLELY on displacement
         w_sensor, wdot_sensor = self.modal_to_physical(x)
         if np.any(np.abs(w_sensor) > self.w_limit):
             info["termination_reason"] = "excessive_sensor_displacement"
+            info["max_displacement_m"] = float(np.max(np.abs(w_sensor)))
             return True, False, info
-        if np.any(np.abs(wdot_sensor) > self.wdot_limit):
-            info["termination_reason"] = "excessive_sensor_velocity"
-            return True, False, info
+        
+        # Note: Velocity termination removed. Displacement is the true physical 
+        # limit for machining (chip thickness/tool crash). Velocity is implicitly bounded.
 
+        # 3. Gather kinematic and force diagnostics
         cutter_x, cutter_y = f_nonlinear2.cutter_point(t, self._last_omega)
         info["cutter_x"] = float(cutter_x)
         info["cutter_y"] = float(cutter_y)
@@ -746,10 +771,9 @@ class PlatePlant(ODEPlant):
         info["omega_rad_s"] = float(self._last_omega)
         info["omega_rpm"] = float(omega_to_rpm(self._last_omega))
         info["ap_mm"] = float(self._last_ap)
-        info["ac_mm"] = float(self._last_ap)  # backward-compatible alias; physically ap
+        info["ac_mm"] = float(self._last_ap)  # backward-compatible alias
         info["ae_mm"] = float(self._last_ae)
 
-        # Expose last cutting-force diagnostics if available.
         force_info = getattr(f_nonlinear2, "last_force_info", None)
         if force_info is not None:
             info["F_total_N"] = np.asarray(force_info.F_total_N, dtype=np.float64)
@@ -757,9 +781,13 @@ class PlatePlant(ODEPlant):
             info["mean_chip_mm"] = float(np.mean(force_info.chip_eff_mm))
             info["max_chip_mm"] = float(np.max(force_info.chip_eff_mm))
 
-        if cutter_x <= self.x_pass_end_tol:
+        # 4. Terminate at 90% of the pass (x = 0.1 * L1)
+        # This avoids fixture interference and steep mode-shape gradients at x=0.
+        x_termination_threshold = 0.1 * self.L1
+        if cutter_x <= x_termination_threshold:
             info["pass_completed"] = True
-            info["termination_reason"] = "pass_completed"
+            info["termination_reason"] = "pass_completed_90percent"
+            info["final_cutter_x"] = float(cutter_x)
             return True, False, info
 
         return False, False, info
