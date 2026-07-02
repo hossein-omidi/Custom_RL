@@ -88,10 +88,12 @@ def normalized_to_physical(
 
 
 def obs_labels(n_sensors: int) -> list[str]:
-    """Observation labels after converting scaled obs to physical units."""
+    """Observation labels after converting scaled sensor terms to physical units."""
     return [
         *[f"w_sensor_{i + 1} (m)" for i in range(n_sensors)],
         *[f"wdot_sensor_{i + 1} (m/s)" for i in range(n_sensors)],
+        "cutter_x/L1",
+        "cutter_y/L2",
     ]
 
 
@@ -240,7 +242,7 @@ def plot_rollout(
     for ax in axes[obs_physical.shape[1] :]:
         ax.axis("off")
     axes[min(obs_physical.shape[1] - 1, len(axes) - 1)].set_xlabel("Time (s)")
-    fig.suptitle(f"Physical sensor response ({title_suffix})")
+    fig.suptitle(f"Physical sensor and path observations ({title_suffix})")
     fig.tight_layout()
     fig.savefig(out_dir / "pretrain_physical_sensor_response.png", dpi=150)
     plt.close(fig)

@@ -12,7 +12,7 @@ The default plant control is
 
 where ``ap`` is the axial depth of cut [mm].  The radial immersion/depth
 ``ae`` is a fixed plant parameter by default.  In the current face-milling
-plant this is ``plant.ae_default``; with the usual D=50 mm and ae_default=25 mm
+plant this is ``plant.ae_default``; with the usual D=63 mm and ae_default=28 mm
 this corresponds to half immersion, ae/D = 0.5.  Only when the plant is created
 with ``control_ae=True`` should ``ae`` be treated as a third action component.
 """
@@ -101,7 +101,7 @@ def face_milling_process_from_info(info: dict[str, Any], plant: Any | None = Non
 
     1. ``info["ae_mm"]`` if the environment supplied it;
     2. ``plant.ae_default`` if a plant object is supplied;
-    3. ``D_mm/2`` if only cutter diameter is known, corresponding to 50% radial
+    3. ``D_mm/2`` if only cutter diameter is known, corresponding to about 44% radial
        immersion;
     4. NaN if none of the above is available.
 

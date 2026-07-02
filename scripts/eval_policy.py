@@ -63,7 +63,7 @@ def _physical_signal_from_info_or_obs(
     obs_arr = np.asarray(obs, dtype=np.float64).reshape(-1)
     n_sensors = int(metadata.get("n_sensors", obs_arr.size // 2))
 
-    if n_sensors <= 0 or obs_arr.size != 2 * n_sensors:
+    if n_sensors <= 0 or obs_arr.size < 2 * n_sensors:
         return []
 
     w_obs_scale = float(metadata.get("w_obs_scale", 1.0))
@@ -75,9 +75,12 @@ def _physical_signal_from_info_or_obs(
     if not np.isfinite(wdot_obs_scale) or abs(wdot_obs_scale) < 1e-12:
         wdot_obs_scale = 1.0
 
-    physical_signal = obs_arr.copy()
-    physical_signal[:n_sensors] /= w_obs_scale
-    physical_signal[n_sensors:] /= wdot_obs_scale
+    # Observation may contain extra non-sensor terms after the first
+    # 2*n_sensors entries, e.g. [cutter_x/L1, cutter_y/L2].  Only convert
+    # the physical sensor displacement/velocity part here.
+    physical_signal = obs_arr[: 2 * n_sensors].copy()
+    physical_signal[:n_sensors] *= w_obs_scale
+    physical_signal[n_sensors : 2 * n_sensors] *= wdot_obs_scale
 
     return physical_signal.tolist()
 

@@ -54,7 +54,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         Kt, Kr, Ka, Kte, Kre, Kae, milling_mode,
         use_process_damping, Ksp, mu, VB,
         sensor_points, w_limit, w_obs_scale, wdot_limit, wdot_obs_scale,
-        y_cutter, x0_cutter, x_pass_end_tol.
+        y_cutter, x0_cutter, x_pass_end_tol, modal_damping_ratio.
 
     Backward-compatible input:
         ac_min/ac_max are accepted and translated to ap_min/ap_max for the plant.
@@ -87,6 +87,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "n_max",
         "mode_clamped_axis",
         "stiffness_grid_points",
+        "modal_damping_ratio",
         # Action/process bounds
         "omega_min",
         "omega_max",
@@ -236,7 +237,7 @@ def register_envs() -> None:
 
     default_max_steps = estimate_training_episode_steps(
         L1=1.0,
-        feed_per_tooth_mm=0.05,
+        feed_per_tooth_mm=0.10,
         n_teeth=4,
         step_dt=0.002,
     )

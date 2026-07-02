@@ -16,7 +16,7 @@ where ``omega`` is spindle speed [rad/s] and ``ap`` is axial depth of cut [mm].
 
 The radial immersion/depth ``ae`` is a fixed process parameter by default.  In
 our current face-milling plant this is ``plant.ae_default``; with the default
-D=50 mm and ae_default=25 mm, this gives ae/D = 0.5 half-immersion milling.
+D=63 mm and ae_default=28 mm, this gives ae/D ≈ 0.444 partial-immersion milling.
 Only when the plant is created with ``control_ae=True`` does the action become::
 
     [omega_rad_s, ap_mm, ae_mm]
@@ -188,8 +188,11 @@ def plant_plot_metadata(env) -> dict[str, Any]:
         "step_dt": float(base_env._step_dt),
         "max_episode_steps": int(base_env.max_episode_steps),
         # Observation convention
-        "observation_type": "scaled_physical_sensor_disp_vel",
-        "observation_description": "[w_sensor/w_obs_scale, wdot_sensor/wdot_obs_scale]",
+        "observation_type": "scaled_physical_sensor_disp_vel_and_normalized_path",
+        "observation_description": (
+            "[w_sensor/w_obs_scale, wdot_sensor/wdot_obs_scale, "
+            "cutter_x/L1, cutter_y/L2]"
+        ),
         "n_sensors": int(getattr(plant, "n_sensors", 0)),
         "sensor_points_m": np.asarray(
             getattr(plant, "sensor_points", []),
@@ -215,6 +218,9 @@ def plant_plot_metadata(env) -> dict[str, Any]:
         "L1_m": _safe_float(getattr(plant, "L1", np.nan)),
         "L2_m": _safe_float(getattr(plant, "L2", np.nan)),
         "h_m": _safe_float(getattr(plant, "h", np.nan)),
+        "E_Pa": _safe_float(getattr(plant, "E", np.nan)),
+        "nu": _safe_float(getattr(plant, "nu", np.nan)),
+        "modal_damping_ratio": _safe_float(getattr(plant, "modal_damping_ratio", np.nan)),
         "rho_input": _safe_float(getattr(plant, "rho", np.nan)),
         "rho_type": str(getattr(plant, "rho_type", "auto")),
         "rho_areal_kg_m2": _safe_float(getattr(plant, "rho_areal", np.nan)),
@@ -234,6 +240,10 @@ def plant_plot_metadata(env) -> dict[str, Any]:
         "Kte_N_mm": _safe_float(getattr(plant, "Kte", np.nan)),
         "Kre_N_mm": _safe_float(getattr(plant, "Kre", np.nan)),
         "Kae_N_mm": _safe_float(getattr(plant, "Kae", np.nan)),
+        "use_process_damping": _safe_bool(getattr(plant, "use_process_damping", False)),
+        "Ksp_N_mm3": _safe_float(getattr(plant, "Ksp", np.nan)),
+        "VB_mm": _safe_float(getattr(plant, "VB", np.nan)),
+        "mu_process_damping": _safe_float(getattr(plant, "mu", np.nan)),
         # ae convention: fixed by default, controlled only if control_ae=True.
         "control_ae": _safe_bool(getattr(plant, "control_ae", False)),
         "ae_default_mm": ae_default,

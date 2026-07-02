@@ -151,7 +151,12 @@ class PlatePlant(ODEPlant):
         x_modal = [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
 
     Agent observation
-        [w_sensor / w_obs_scale, wdot_sensor / wdot_obs_scale]
+        [
+            w_sensor / w_obs_scale,
+            wdot_sensor / wdot_obs_scale,
+            cutter_x / L1,
+            cutter_y / L2,
+        ]
 
     Default normalized action
         u = [u_omega, u_ap] in [-1, 1]^2
@@ -170,9 +175,9 @@ class PlatePlant(ODEPlant):
         L1: float = 1.0,
         L2: float = 1.0,
         h: float = 0.02,
-        E: float = 113.8e9,
-        nu: float = 0.34,
-        rho: float = 4430.0,
+        E: float = 71.7e9,
+        nu: float = 0.33,
+        rho: float = 2810.0,
         rho_type: str = "volumetric",
         m_max: int = 3,
         n_max: int = 2,
@@ -180,7 +185,7 @@ class PlatePlant(ODEPlant):
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
-        ap_max: float = 1,
+        ap_max: float = 20
         ae_min: float = 1.0,
         ae_max: float = 50.0,
         ae_default: float = 25.0,
@@ -191,22 +196,24 @@ class PlatePlant(ODEPlant):
         gamma_r_deg: float = 5.0,
         gamma_a_deg: float = 5.0,
         eta_c_deg: float = 0.0,
-        # Force coefficients [N/mm^2].  Ka=4790.9 is the value identified in
-        # the uploaded thin-wall face-milling paper for Ti-6Al-4V.  Kt/Kr must
-        # be experimentally identified for a full 3D force diagnostic; they are
-        # zero by default because the present scalar plate projection uses Fz.
-        Kt: float = 0.0,
-        Kr: float = 0.0,
-        #Ka: float = 4790.9,
-        Ka: float = 4790.9,
-        Kte: float = 0.0,
-        Kre: float = 0.0,
-        #Kae: float = 360.6,
-        Kae: float = 360.6,
+        # AL7075 face-milling coefficients for square inserts.
+        # Units follow f_nonlinear2_face_milling:
+        #   Kt, Kr, Ka     [N/mm^2]
+        #   Kte, Kre, Kae  [N/mm]
+        # The signs are kept from the identified local force convention.
+        # With the current scalar plate projection mode, only Fz=Fa is projected
+        # into the modal plate equation, so Ka/Kae directly set the transverse
+        # excitation direction and magnitude.
+        Kt: float = 538.127,
+        Kr: float = 185.967,
+        Ka: float = -691.297,
+        Kte: float = 11.253,
+        Kre: float = 6.991,
+        Kae: float = -32.971,
         milling_mode: str = "up",
         theta0: float = 0.0,
-        use_process_damping: bool = True,
-        Ksp: float | None = 30000.0,
+        use_process_damping: bool = False,
+        Ksp: float | None = None,
         mu: float = 0.3,
         VB: float = 0.08,
         lambda_L_deg: float | None = 45.0,
@@ -311,7 +318,11 @@ class PlatePlant(ODEPlant):
         # ------------------------------------------------------------------
         self.sensor_points = tuple((float(xs), float(ys)) for xs, ys in sensor_points)
         self.n_sensors = len(self.sensor_points)
-        self.obs_dim = 2 * self.n_sensors
+        # Observation = physical sensor displacement/velocity plus normalized
+        # cutter location.  The path coordinates are part of the state observed
+        # by the agent because the face-milling excitation and modal projection
+        # depend on where the cutter is on the plate.
+        self.obs_dim = 2 * self.n_sensors + 2
 
         self.w_limit = float(w_limit)
         self.w_obs_scale = float(w_obs_scale)
@@ -629,10 +640,24 @@ class PlatePlant(ODEPlant):
         """Return scaled physical observation for the RL agent."""
         return self.state_to_obs(x_modal)
 
+    def _normalized_cutter_position_obs(self) -> np.ndarray:
+        """Return [cutter_x/L1, cutter_y/L2] from accepted pass kinematics."""
+        cutter_x = self.L1 - self._feed_distance_m - self.x0_cutter
+        cutter_x = float(np.clip(cutter_x, 0.0, self.L1))
+        cutter_y = float(np.clip(self.y_cutter, 0.0, self.L2))
+
+        x_norm = cutter_x / max(self.L1, 1e-12)
+        y_norm = cutter_y / max(self.L2, 1e-12)
+        return np.asarray([x_norm, y_norm], dtype=np.float64)
+
     def state_to_obs(self, x: np.ndarray) -> np.ndarray:
         w_sensor, wdot_sensor = self.modal_to_physical(x)
         obs = np.concatenate(
-            [w_sensor / self.w_obs_scale, wdot_sensor / self.wdot_obs_scale]
+            [
+                w_sensor / self.w_obs_scale,
+                wdot_sensor / self.wdot_obs_scale,
+                self._normalized_cutter_position_obs(),
+            ]
         )
         return np.asarray(obs, dtype=np.float64)
 
@@ -798,8 +823,16 @@ class PlatePlant(ODEPlant):
 
         low[: self.n_sensors] = -self.w_limit / self.w_obs_scale
         high[: self.n_sensors] = self.w_limit / self.w_obs_scale
-        low[self.n_sensors :] = -self.wdot_limit / self.wdot_obs_scale
-        high[self.n_sensors :] = self.wdot_limit / self.wdot_obs_scale
+        low[self.n_sensors : 2 * self.n_sensors] = (
+            -self.wdot_limit / self.wdot_obs_scale
+        )
+        high[self.n_sensors : 2 * self.n_sensors] = (
+            self.wdot_limit / self.wdot_obs_scale
+        )
+
+        # Normalized cutter coordinates [cutter_x/L1, cutter_y/L2].
+        low[2 * self.n_sensors :] = 0.0
+        high[2 * self.n_sensors :] = 1.0
 
         return spaces.Box(low=low, high=high, shape=(self.obs_dim,), dtype=np.float64)
 

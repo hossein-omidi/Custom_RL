@@ -181,7 +181,7 @@ class ODEControlEnv(gym.Env):
 
         if hasattr(self.plant, "modal_to_physical"):
             w_sensor, wdot_sensor = self.plant.modal_to_physical(
-                self._state, clip=True
+                self._state, clip=False
             )
             info["w_sensor"] = w_sensor
             info["wdot_sensor"] = wdot_sensor
@@ -221,7 +221,7 @@ class ODEControlEnv(gym.Env):
         info["x_modal"] = self._state.copy()
         if hasattr(self.plant, "modal_to_physical"):
             w_sensor, wdot_sensor = self.plant.modal_to_physical(
-                self._state, clip=True
+                self._state, clip=False
             )
             info["w_sensor"] = w_sensor
             info["wdot_sensor"] = wdot_sensor

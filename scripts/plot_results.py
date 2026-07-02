@@ -205,8 +205,10 @@ def _physical_signals_from_episode(ep: dict) -> np.ndarray:
         ep["physical_signals"] = [w_sensor, wdot_sensor]
 
     Fallback:
-        ep["observations"] contains scaled [w_sensor, wdot_sensor], so unscale
-        using metadata["w_obs_scale"] and metadata["wdot_obs_scale"].
+        ep["observations"] begins with scaled [w_sensor, wdot_sensor], so unscale
+        using metadata["w_obs_scale"] and metadata["wdot_obs_scale"].  Any
+        additional observation terms, such as normalized cutter path coordinates,
+        are ignored for physical sensor plots.
 
     Old trajectory files with only ep["states"] are intentionally skipped because
     they may contain modal coordinates and should not be relabeled as physical
@@ -236,11 +238,10 @@ def _physical_signals_from_episode(ep: dict) -> np.ndarray:
         if not np.isfinite(wdot_scale) or abs(wdot_scale) < 1e-12:
             wdot_scale = 1.0
 
-        signals = obs.copy()
-
-        if n_sensors > 0 and signals.shape[1] >= 2 * n_sensors:
-            signals[:, :n_sensors] /= w_scale
-            signals[:, n_sensors : 2 * n_sensors] /= wdot_scale
+        if n_sensors > 0 and obs.shape[1] >= 2 * n_sensors:
+            signals = obs[:, : 2 * n_sensors].copy()
+            signals[:, :n_sensors] *= w_scale
+            signals[:, n_sensors : 2 * n_sensors] *= wdot_scale
         else:
             return np.asarray([], dtype=np.float64)
 
