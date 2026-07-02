@@ -1,123 +1,416 @@
-"""Nonlinear plate vibration ODE plant."""
+"""Face-milling flexible-plate ODE plant for RL environments.
+
+This module replaces the old peripheral-milling plant wiring.  The structural
+part remains modal, while the cutting-force module is now
+``f_nonlinear2_face_milling`` and computes the face-milling force tooth-by-tooth:
+
+    [Ft, Fr, Fa] -> [Fx, Fy, Fz] -> modal generalized force
+
+Default geometric convention
+----------------------------
+The updated mode-shape module defaults to ``clamped_axis='x'``.  In that
+convention the clamped side is x=0 and the free side is x=L1.  The milling pass
+therefore starts at x=L1 and moves toward x=0, i.e. from the free side toward
+
+the clamped side.  This is consistent with the current face-milling force
+module's ``cutter_point`` function.
+
+If your physical plate is clamped along y instead of x, the mode shapes and the
+force-module path function must both be changed together.  Do not only change
+one of them.
+"""
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 from gymnasium import spaces
 
 from custom_rl.plants.base import ODEPlant
-from custom_rl.plants import f_nonlinear2
-from custom_rl.plants.compute_mode_shapes import compute_mode_shapes
-from custom_rl.plants.compute_natural_frequencies import compute_natural_frequencies
-from custom_rl.plants.compute_nonlinear_stiffness import compute_nonlinear_stiffness
+from custom_rl.plants import f_nonlinear2_face_milling as f_nonlinear2
+from custom_rl.plants.compute_mode_shapes_updated import (
+    build_mode_shape_matrix,
+    compute_mode_shapes,
+)
+from custom_rl.plants.compute_natural_frequencies_updated import (
+    compute_natural_frequencies,
+)
+from custom_rl.plants.compute_nonlinear_stiffness_updated import (
+    compute_nonlinear_stiffness,
+)
+
+
+# ---------------------------------------------------------------------------
+# Default sensor/observation locations [m].
+# They are abstract displacement/velocity evaluation points, not necessarily
+# physical accelerometer models.
+# ---------------------------------------------------------------------------
+DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
+    (0.83, 0.20),
+    (0.17, 0.20),
+)
+
+# The face-milling force module currently supports a straight x-pass with
+# constant y.  With clamped_axis='x', the pass starts at x=L1 and moves to x=0.
+DEFAULT_Y_CUTTER = 0.20
+
+# Spindle speed operating range [rpm]; internal physics uses rad/s.
+RPM_MIN = 50.0
+RPM_MAX = 4000.0
+
+# Practical reference speed for episode cap estimation.  This does not change
+# pass termination; it only avoids extremely long RL rollout caps at very low rpm.
+TRAINING_REFERENCE_RPM = 1000.0
+
+
+def rpm_to_omega(rpm: float | np.ndarray) -> np.ndarray:
+    """Convert spindle speed from rpm to rad/s."""
+    return np.asarray(rpm, dtype=np.float64) * 2.0 * np.pi / 60.0
+
+
+def omega_to_rpm(omega: float | np.ndarray) -> np.ndarray:
+    """Convert spindle speed from rad/s to rpm."""
+    return np.asarray(omega, dtype=np.float64) * 60.0 / (2.0 * np.pi)
+
+
+OMEGA_MIN_RAD_S = float(rpm_to_omega(RPM_MIN))
+OMEGA_MAX_RAD_S = float(rpm_to_omega(RPM_MAX))
+
+
+def _resolve_areal_mass(rho: float, h: float, rho_type: str = "auto") -> tuple[float, str]:
+    """Return areal mass [kg/m^2] from density or areal-mass input."""
+    rho = float(rho)
+    h = float(h)
+    if not np.isfinite(rho) or rho <= 0.0:
+        raise ValueError(f"rho must be positive and finite, got {rho!r}.")
+    if not np.isfinite(h) or h <= 0.0:
+        raise ValueError(f"h must be positive and finite, got {h!r}.")
+
+    kind = str(rho_type).lower().strip()
+    if kind in {"volumetric", "density", "kg/m3", "kg/m^3"}:
+        return rho * h, "volumetric"
+    if kind in {"areal", "surface", "kg/m2", "kg/m^2"}:
+        return rho, "areal"
+    if kind == "auto":
+        if rho > 500.0:
+            return rho * h, "volumetric(auto)"
+        return rho, "areal(auto)"
+    raise ValueError("rho_type must be 'auto', 'volumetric', or 'areal'.")
+
+
+def estimate_pass_duration(
+    L1: float,
+    feed_per_tooth_mm: float,
+    n_teeth: int,
+    omega: float,
+) -> float:
+    """Seconds to complete a straight free-side-to-clamped-side x-pass."""
+    feed_m_s = (float(feed_per_tooth_mm) / 1000.0) * int(n_teeth) * float(omega) / (2.0 * np.pi)
+    return float(L1) / max(feed_m_s, 1e-12)
+
+
+def estimate_pass_episode_steps(
+    L1: float,
+    feed_per_tooth_mm: float,
+    n_teeth: int,
+    omega: float,
+    step_dt: float,
+    margin: float = 1.1,
+) -> int:
+    """Episode step budget from a pass duration estimate."""
+    duration = estimate_pass_duration(L1, feed_per_tooth_mm, n_teeth, omega) * margin
+    return int(np.ceil(duration / max(float(step_dt), 1e-12))) + 200
+
+
+def estimate_training_episode_steps(
+    L1: float,
+    feed_per_tooth_mm: float,
+    n_teeth: int,
+    step_dt: float,
+    *,
+    reference_rpm: float = TRAINING_REFERENCE_RPM,
+    margin: float = 1.35,
+) -> int:
+    """Practical RL episode cap from a typical pass duration."""
+    omega_ref = float(rpm_to_omega(reference_rpm))
+    return estimate_pass_episode_steps(
+        L1=L1,
+        feed_per_tooth_mm=feed_per_tooth_mm,
+        n_teeth=n_teeth,
+        omega=omega_ref,
+        step_dt=step_dt,
+        margin=margin,
+    )
 
 
 class PlatePlant(ODEPlant):
-    """
-    Nonlinear plate vibration plant.
+    """Nonlinear flexible-plate plant driven by a face-milling force model.
 
-    State:
-        [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
+    Internal modal state
+        x_modal = [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
 
-    Normalized action:
-        u = [u_omega, u_ac], each in [-1, 1]
+    Agent observation
+        [w_sensor / w_obs_scale, wdot_sensor / wdot_obs_scale]
 
-    Physical action passed to f_nonlinear2:
-        omega in [omega_min, omega_max]
-        ac    in [ac_min, ac_max]
+    Default normalized action
+        u = [u_omega, u_ap] in [-1, 1]^2
+
+    Physical action after scaling
+        [omega_rad_s, ap_mm]
+
+    Optional action if ``control_ae=True``
+        u = [u_omega, u_ap, u_ae]
+        physical = [omega_rad_s, ap_mm, ae_mm]
     """
 
     def __init__(
         self,
-        N: int = 5,
+        N: int = 4,
         L1: float = 1.0,
-        L2: float = 0.5,
+        L2: float = 1.0,
         h: float = 0.02,
-        E: float = 70e9,
-        nu: float = 0.3,
-        rho: float = 7850.0,
-        m_max: int = 2,
+        E: float = 113.8e9,
+        nu: float = 0.34,
+        rho: float = 4430.0,
+        rho_type: str = "volumetric",
+        m_max: int = 3,
         n_max: int = 2,
-        omega_min: float = 50,
-        omega_max: float = 2000.0,
-        ac_min: float = 0,
-        ac_max: float = 10.0,
+        mode_clamped_axis: str = "x",
+        omega_min: float = OMEGA_MIN_RAD_S,
+        omega_max: float = OMEGA_MAX_RAD_S,
+        ap_min: float = 0.0,
+        ap_max: float = 1,
+        ae_min: float = 1.0,
+        ae_max: float = 50.0,
+        ae_default: float = 25.0,
+        control_ae: bool = False,
+        D_mm: float = 50.0,
+        feed_per_tooth_mm: float = 0.05,
+        gamma_L_deg: float = 45.0,
+        gamma_r_deg: float = 5.0,
+        gamma_a_deg: float = 5.0,
+        eta_c_deg: float = 0.0,
+        # Force coefficients [N/mm^2].  Ka=4790.9 is the value identified in
+        # the uploaded thin-wall face-milling paper for Ti-6Al-4V.  Kt/Kr must
+        # be experimentally identified for a full 3D force diagnostic; they are
+        # zero by default because the present scalar plate projection uses Fz.
+        Kt: float = 0.0,
+        Kr: float = 0.0,
+        #Ka: float = 4790.9,
+        Ka: float = 4790.9,
+        Kte: float = 0.0,
+        Kre: float = 0.0,
+        #Kae: float = 360.6,
+        Kae: float = 360.6,
+        milling_mode: str = "up",
+        theta0: float = 0.0,
+        use_process_damping: bool = True,
+        Ksp: float | None = 30000.0,
+        mu: float = 0.3,
+        VB: float = 0.08,
+        lambda_L_deg: float | None = 45.0,
+        force_projection_mode: str = "z",
+        sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
+        w_limit: float = 0.01,
+        w_obs_scale: float = 0.01,
+        wdot_limit: float = 10.0,
+        wdot_obs_scale: float = 1.0,
         eta_limit: float = 0.01,
-        eta_obs_limit: float = 1e6,
-        eta_dot_obs_limit: float = 1e6,
+        y_cutter: float = DEFAULT_Y_CUTTER,
+        x0_cutter: float = 0.0,
+        x_pass_end_tol: float = 0.01,
+        dynamics_uncertainty_std: float = 0.0,
+        y0_min: float = 0.05,
+        y0_max: float = 0.45,
+        randomize_y0: bool = True,
+        initial_eta_std: float = 0.0,
+        initial_etad_std: float = 0.0,
+        stiffness_grid_points: int = 100,
     ):
-        """
-        Args:
-            N: number of teeth / force-related model parameter used by f_nonlinear2
-            L1: plate length in x direction
-            L2: plate length in y direction
-            h: plate thickness
-            E: Young's modulus
-            nu: Poisson's ratio
-            rho: density
-            m_max: maximum mode index in x direction
-            n_max: maximum mode index in y direction
-            omega_min: minimum physical spindle/angular input
-            omega_max: maximum physical spindle/angular input
-            ac_min: minimum physical control coefficient/input
-            ac_max: maximum physical control coefficient/input
-            eta_limit: modal displacement safety limit for termination
-            eta_obs_limit: observation bound for modal displacement
-            eta_dot_obs_limit: observation bound for modal velocity
-        """
-        self.N = N
-        self.L1 = L1
-        self.L2 = L2
-        self.h = h
+        # ------------------------------------------------------------------
+        # Basic structural parameters
+        # ------------------------------------------------------------------
+        self.N = int(N)
+        self.L1 = float(L1)
+        self.L2 = float(L2)
+        self.h = float(h)
+        self.E = float(E)
+        self.nu = float(nu)
+        self.rho = float(rho)
+        self.rho_type = str(rho_type)
+        self.rho_areal, self.rho_interpreted_as = _resolve_areal_mass(
+            self.rho, self.h, self.rho_type
+        )
 
-        self.E = E
-        self.nu = nu
-        self.rho = rho
-
-        self.m_max = m_max
-        self.n_max = n_max
+        self.m_max = int(m_max)
+        self.n_max = int(n_max)
         self.K = self.m_max * self.n_max
         self.state_dim = 2 * self.K
+        self.mode_clamped_axis = str(mode_clamped_axis).lower().strip()
 
-        self.omega_min = omega_min
-        self.omega_max = omega_max
-        self.ac_min = ac_min
-        self.ac_max = ac_max
+        if self.mode_clamped_axis != "x":
+            raise ValueError(
+                "This PlatePlant version is wired to f_nonlinear2_face_milling, "
+                "whose cutter_point currently feeds along x from x=L1 to x=0. "
+                "Use mode_clamped_axis='x' for a free-side-to-clamped-side pass, "
+                "or update the force module path function before using a y-clamped model."
+            )
 
-        self.eta_limit = eta_limit
-        self.eta_obs_limit = eta_obs_limit
-        self.eta_dot_obs_limit = eta_dot_obs_limit
+        if self.N <= 0 or self.K <= 0:
+            raise ValueError("N, m_max, and n_max must be positive.")
 
-        self.u_phys_low = np.array(
-            [self.omega_min, self.ac_min],
-            dtype=np.float64,
+        # ------------------------------------------------------------------
+        # Face-milling process parameters
+        # ------------------------------------------------------------------
+        self.omega_min = float(omega_min)
+        self.omega_max = float(omega_max)
+        self.ap_min = float(ap_min)
+        self.ap_max = float(ap_max)
+        # Backward-compatible aliases. Older scripts/configs used ac for the
+        # second action. In the face-milling plant, that same second action is
+        # axial depth of cut ap [mm]. Keep these aliases to avoid interface
+        # breaks without changing the physical meaning.
+        self.ac_min = self.ap_min
+        self.ac_max = self.ap_max
+        self.ae_min = float(ae_min)
+        self.ae_max = float(ae_max)
+        self.ae_default = float(np.clip(ae_default, self.ae_min, self.ae_max))
+        self.control_ae = bool(control_ae)
+
+        self.D_mm = float(D_mm)
+        self.feed_per_tooth_mm = float(feed_per_tooth_mm)
+        self.cf = self.feed_per_tooth_mm  # compatibility alias: cf = ft [mm/tooth]
+
+        self.gamma_L = float(np.deg2rad(gamma_L_deg))
+        self.gamma_r = float(np.deg2rad(gamma_r_deg))
+        self.gamma_a = float(np.deg2rad(gamma_a_deg))
+        self.eta_c = float(np.deg2rad(eta_c_deg))
+
+        self.Kt = float(Kt)
+        self.Kr = float(Kr)
+        self.Ka = float(Ka)
+        self.Kte = float(Kte)
+        self.Kre = float(Kre)
+        self.Kae = float(Kae)
+
+        self.milling_mode = str(milling_mode).lower().strip()
+        self.theta0 = float(theta0)
+
+        self.use_process_damping = bool(use_process_damping)
+        self.Ksp = None if Ksp is None else float(Ksp)
+        self.mu = float(mu)
+        self.VB = float(VB)
+        self.lambda_L = (
+            None if lambda_L_deg is None else float(np.deg2rad(lambda_L_deg))
         )
-        self.u_phys_high = np.array(
-            [self.omega_max, self.ac_max],
-            dtype=np.float64,
+        self.force_projection_mode = str(force_projection_mode).lower().strip()
+
+        # ------------------------------------------------------------------
+        # Observation, path, and RL helper parameters
+        # ------------------------------------------------------------------
+        self.sensor_points = tuple((float(xs), float(ys)) for xs, ys in sensor_points)
+        self.n_sensors = len(self.sensor_points)
+        self.obs_dim = 2 * self.n_sensors
+
+        self.w_limit = float(w_limit)
+        self.w_obs_scale = float(w_obs_scale)
+        self.wdot_limit = float(wdot_limit)
+        self.wdot_obs_scale = float(wdot_obs_scale)
+        self.eta_limit = float(eta_limit)
+
+        self.y_cutter = float(y_cutter)
+        self.x0_cutter = float(x0_cutter)
+        self.x_pass_end_tol = float(x_pass_end_tol)
+        self._last_omega = float(self.omega_min)
+        self._last_ap = float(self.ap_min)
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
+        self._last_ae = float(self.ae_default)
+
+        # Accepted pass kinematics. The modal state remains unchanged; these
+        # variables only keep the cutter x-position and spindle phase continuous
+        # when omega changes between RL steps.
+        self._feed_distance_m = 0.0
+        self._spindle_phase_rad = 0.0
+        self._kinematic_step_t0 = 0.0
+        self._kinematic_step_feed0_m = 0.0
+        self._kinematic_step_phase0_rad = 0.0
+
+        self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
+        self.y0_min = float(y0_min)
+        self.y0_max = float(y0_max)
+        self.randomize_y0 = bool(randomize_y0)
+        self.initial_eta_std = float(max(initial_eta_std, 0.0))
+        self.initial_etad_std = float(max(initial_etad_std, 0.0))
+        self._rng: np.random.Generator | None = None
+
+        # Explicit regenerative-history module handle.  ODEControlEnv can use
+        # this to pass history_module=f_nonlinear2_face_milling into RK4.
+        self.history_module = f_nonlinear2
+        self.dynamics_history_module = f_nonlinear2
+        self.force_module = f_nonlinear2
+        self.face_milling_force_module = f_nonlinear2
+
+        # Normalized action bounds.  Default action is [omega, ap].
+        if self.control_ae:
+            self.u_phys_low = np.array(
+                [self.omega_min, self.ap_min, self.ae_min], dtype=np.float64
+            )
+            self.u_phys_high = np.array(
+                [self.omega_max, self.ap_max, self.ae_max], dtype=np.float64
+            )
+        else:
+            self.u_phys_low = np.array(
+                [self.omega_min, self.ap_min], dtype=np.float64
+            )
+            self.u_phys_high = np.array(
+                [self.omega_max, self.ap_max], dtype=np.float64
+            )
+        self.action_dim = int(self.u_phys_low.size)
+
+        # Straight x-pass reference timeline, used for diagnostics and y path.
+        pass_duration = estimate_pass_duration(
+            self.L1, self.feed_per_tooth_mm, self.N, self.omega_min
         )
+        self.t_original = np.arange(0.0, pass_duration * 1.1, 0.02, dtype=np.float64)
+        feed_slow = (
+            (self.feed_per_tooth_mm / 1000.0)
+            * self.N
+            * self.omega_min
+            / (2.0 * np.pi)
+        )
+        self.x_traj = np.clip(
+            self.L1 - feed_slow * self.t_original - self.x0_cutter,
+            0.0,
+            self.L1,
+        )
+        self.y_traj = np.full_like(self.t_original, self.y_cutter, dtype=np.float64)
 
-        # Trajectory input
-        self.t_original = np.arange(0.0, 20.0, 0.02, dtype=np.float64)
-        self.x_traj = 0.1 * np.sin(2.0 * np.pi * 0.2 * self.t_original)
-        self.y_traj = 0.1 * np.cos(2.0 * np.pi * 0.2 * self.t_original)
+        # Modal mass.  Use areal mass rho*h once; do not double count h.
+        self.M_modal = self.L1 * self.L2 * self.rho_areal
 
-        # Modal mass
-        M_modal = self.L1 * self.L2 * self.rho * self.h
-
-        # Mode shapes
+        # ------------------------------------------------------------------
+        # Structural mode shapes, frequencies, nonlinear stiffness
+        # ------------------------------------------------------------------
         W_mn, V_mn = compute_mode_shapes(
             self.L1,
             self.L2,
             self.h,
             self.m_max,
             self.n_max,
+            clamped_axis=self.mode_clamped_axis,
+        )
+        self.W_mn = W_mn
+        self.V_mn = V_mn
+
+        self.Phi = build_mode_shape_matrix(
+            W_mn,
+            self.sensor_points,
+            self.m_max,
+            self.n_max,
         )
 
-        # Natural frequencies
-        omega_mn = compute_natural_frequencies(
+        omega_result = compute_natural_frequencies(
             self.E,
             self.nu,
             self.rho,
@@ -126,10 +419,13 @@ class PlatePlant(ODEPlant):
             self.L2,
             self.m_max,
             self.n_max,
+            rho_type=self.rho_type,
+            return_info=True,
         )
+        omega_mn, omega_info = omega_result
+        self.frequency_info = omega_info
 
-        # Nonlinear stiffness
-        lambda_mn, _lambda_prime_mn = compute_nonlinear_stiffness(
+        lambda_mn, lambda_prime_mn = compute_nonlinear_stiffness(
             self.E,
             self.nu,
             self.h,
@@ -139,171 +435,393 @@ class PlatePlant(ODEPlant):
             V_mn,
             self.m_max,
             self.n_max,
+            grid_points=stiffness_grid_points,
         )
+        self.lambda_prime_mn = lambda_prime_mn
 
-        omega_vec = np.asarray(omega_mn.T.reshape(self.K), dtype=np.float64)
-        lambda_vec = np.asarray(lambda_mn.T.reshape(self.K), dtype=np.float64)
+        # Preserve the original ordering convention used by f_nonlinear2:
+        # for m in range(m_max): for n in range(n_max)
+        omega_vec = np.asarray(omega_mn.reshape(self.K), dtype=np.float64)
+        lambda_structural_vec = np.asarray(lambda_mn.reshape(self.K), dtype=np.float64)
 
+        # Unit-consistency fix:
+        # compute_nonlinear_stiffness returns structural cubic coefficients K3_k
+        # with force scaling. f_nonlinear2 integrates an acceleration equation,
+        # so the cubic term must be mass-normalized exactly like the cutting
+        # force projection Fk = Q_k / M_k. For the current analytical mode
+        # shapes, self.M_modal = ∫∫ rho_areal*W_k^2 dA ≈ L1*L2*rho_areal.
+        lambda_vec = lambda_structural_vec / max(float(self.M_modal), 1e-18)
         zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
 
-        cf = 0.3
+        self.omega_vec = omega_vec
+        self.lambda_structural_vec = lambda_structural_vec
+        self.lambda_vec = lambda_vec
+        self.zeta_vec = zeta_vec
 
-        xi_base = np.array(
-            [6765e9, -4910e6, 2840e3, 132],
-            dtype=np.float64,
-        ) / 2.5
+        self._initialize_face_milling_dynamics_module()
 
-        delta_base = np.array(
-            [12740e9, -7452e6, 1674e3, 246],
-            dtype=np.float64,
-        ) / 2.5
-
-        # Set required variables inside the existing f_nonlinear2 module.
-        # This preserves your original nonlinear dynamics implementation.
+    # ------------------------------------------------------------------
+    # Module/global synchronization
+    # ------------------------------------------------------------------
+    def _initialize_face_milling_dynamics_module(self) -> None:
+        """Push all structural and face-milling parameters into the dynamics module."""
         f_nonlinear2.m_max = self.m_max
         f_nonlinear2.n_max = self.n_max
         f_nonlinear2.N = self.N
         f_nonlinear2.K = self.K
 
-        f_nonlinear2.zeta_vec = zeta_vec
-        f_nonlinear2.lambda_vec = lambda_vec
-        f_nonlinear2.omega_vec = omega_vec
+        f_nonlinear2.zeta_vec = self.zeta_vec
+        f_nonlinear2.lambda_vec = self.lambda_vec
+        f_nonlinear2.omega_vec = self.omega_vec
 
-        f_nonlinear2.xi_base = xi_base
-        f_nonlinear2.delta_base = delta_base
-        f_nonlinear2.W_mn = W_mn
-        f_nonlinear2.cf = cf
+        f_nonlinear2.W_mn = self.W_mn
+        f_nonlinear2.W_mn_x = None
+        f_nonlinear2.W_mn_y = None
+        f_nonlinear2.W_mn_z = None
+        f_nonlinear2.M_modal = self.M_modal
 
-        f_nonlinear2.t_original = self.t_original
-        f_nonlinear2.x_traj = self.x_traj
-        f_nonlinear2.y_traj = self.y_traj
+        f_nonlinear2.L1 = self.L1
+        f_nonlinear2.L2 = self.L2
+        f_nonlinear2.x0_cutter = self.x0_cutter
+        f_nonlinear2.y_cutter = self.y_cutter
 
-        f_nonlinear2.M_modal = M_modal
-        f_nonlinear2.decimal_places = 1
+        f_nonlinear2.cf = self.feed_per_tooth_mm
+        f_nonlinear2.ACTION_OMEGA_UNIT = "rad/s"
 
-    def _scale_action(self, u: np.ndarray) -> np.ndarray:
-        """
-        Map normalized action from [-1, 1]^2 to physical action [omega, ac].
-        """
-        u = np.asarray(u, dtype=np.float64).reshape(-1)
+        f_nonlinear2.D_mm = self.D_mm
+        f_nonlinear2.ae_default_mm = self.ae_default
+        f_nonlinear2.gamma_L = self.gamma_L
+        f_nonlinear2.gamma_r = self.gamma_r
+        f_nonlinear2.gamma_a = self.gamma_a
+        f_nonlinear2.eta_c = self.eta_c
 
-        if u.size != 2:
-            raise ValueError(
-                f"PlatePlant expects action with shape (2,), but received {u.shape}."
+        f_nonlinear2.Kt = self.Kt
+        f_nonlinear2.Kr = self.Kr
+        f_nonlinear2.Ka = self.Ka
+        f_nonlinear2.Kte = self.Kte
+        f_nonlinear2.Kre = self.Kre
+        f_nonlinear2.Kae = self.Kae
+
+        f_nonlinear2.milling_mode = self.milling_mode
+        f_nonlinear2.theta0 = self.theta0
+
+        f_nonlinear2.USE_PROCESS_DAMPING = self.use_process_damping
+        f_nonlinear2.Ksp = self.Ksp
+        f_nonlinear2.mu = self.mu
+        f_nonlinear2.VB = self.VB
+        f_nonlinear2.lambda_L = self.lambda_L
+        f_nonlinear2.FORCE_PROJECTION_MODE = self.force_projection_mode
+
+        # The scalar W_mn projection represents transverse/axial plate bending.
+        f_nonlinear2.MODAL_DISPLACEMENT_TO_MM = 1000.0
+        f_nonlinear2.USE_DELAYED_CUTTER_POSITION_FOR_REGEN = True
+        f_nonlinear2.EDGE_FORCE_WHEN_ZERO_CHIP = False
+
+        # Use accepted feed distance/spindle phase rather than omega*t. This is
+        # important when the RL policy changes omega during an episode.
+        if hasattr(f_nonlinear2, "USE_ACCEPTED_PATH_KINEMATICS"):
+            f_nonlinear2.USE_ACCEPTED_PATH_KINEMATICS = True
+
+    def _sync_face_milling_geometry(self) -> None:
+        """Synchronize pass-line geometry with the force module."""
+        f_nonlinear2.y_cutter = self.y_cutter
+        f_nonlinear2.x0_cutter = self.x0_cutter
+        f_nonlinear2.L1 = self.L1
+        f_nonlinear2.L2 = self.L2
+
+    def set_milling_line_y(self, y_m: float) -> None:
+        """Set the constant y-location of the straight x-direction face-milling pass."""
+        y_m = float(np.clip(y_m, 0.0, self.L2))
+        self.y_cutter = y_m
+        self.y_traj = np.full_like(self.t_original, y_m, dtype=np.float64)
+        self._sync_face_milling_geometry()
+
+    # Backward-compatible name used by earlier experiments.
+    def set_milling_start_y(self, y0_m: float) -> None:
+        self.set_milling_line_y(y0_m)
+
+    def bind_rng(self, rng: np.random.Generator) -> None:
+        """Bind Gymnasium RNG for random y-line and model uncertainty."""
+        self._rng = rng
+
+    # ------------------------------------------------------------------
+    # Accepted cutter-path / spindle kinematics
+    # ------------------------------------------------------------------
+    def _feed_rate_from_omega(self, omega_rad_s: float) -> float:
+        """Return table/feed speed [m/s] from feed per tooth and spindle speed."""
+        omega_rad_s = max(float(omega_rad_s), 1e-12)
+        return (self.feed_per_tooth_mm / 1000.0) * self.N * omega_rad_s / (2.0 * np.pi)
+
+    def _sync_accepted_kinematics_to_force_module(self, t: float, *, append: bool = True) -> None:
+        """Push accepted feed distance and spindle phase into the force module."""
+        if hasattr(f_nonlinear2, "set_accepted_kinematic_state"):
+            f_nonlinear2.set_accepted_kinematic_state(
+                float(t),
+                float(self._feed_distance_m),
+                float(self._spindle_phase_rad),
+                append=append,
             )
 
-        u = np.clip(u, -1.0, 1.0)
+    def begin_step(self, t: float, u: np.ndarray) -> None:
+        """Prepare continuous path/phase kinematics before RK integration.
 
+        ODEControlEnv calls this once per accepted environment step. The action
+        is still held constant during the RK substeps, but the cutter position
+        and tooth phase are propagated from the last accepted values instead of
+        recomputing them as omega*t from the start of the episode.
+        """
+        u_phys = self._scale_action(u)
+        self._last_omega = float(u_phys[0])
+        self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap
+        self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
+
+        self._kinematic_step_t0 = float(t)
+        self._kinematic_step_feed0_m = float(self._feed_distance_m)
+        self._kinematic_step_phase0_rad = float(self._spindle_phase_rad)
+        self._sync_accepted_kinematics_to_force_module(float(t), append=True)
+
+    def end_step(self, t: float, u: np.ndarray) -> None:
+        """Commit accepted cutter feed distance and spindle phase after integration."""
+        u_phys = self._scale_action(u)
+        omega = float(u_phys[0])
+        dt_step = max(float(t) - float(self._kinematic_step_t0), 0.0)
+
+        self._feed_distance_m = self._kinematic_step_feed0_m + self._feed_rate_from_omega(omega) * dt_step
+        self._feed_distance_m = float(np.clip(self._feed_distance_m, 0.0, self.L1 + abs(self.x0_cutter)))
+        self._spindle_phase_rad = self._kinematic_step_phase0_rad + omega * dt_step
+
+        self._last_omega = omega
+        self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap
+        self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
+        self._sync_accepted_kinematics_to_force_module(float(t), append=True)
+
+    # ------------------------------------------------------------------
+    # Observation wrapper: modal -> physical displacement/velocity
+    # ------------------------------------------------------------------
+    def modal_to_physical(
+        self,
+        x_modal: np.ndarray,
+        *,
+        clip: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Map modal coordinates to displacement/velocity at observation points."""
+        x_modal = np.asarray(x_modal, dtype=np.float64).reshape(-1)
+        if x_modal.size != self.state_dim:
+            raise ValueError(
+                f"Expected modal state shape ({self.state_dim},), got {x_modal.shape}."
+            )
+
+        eta = x_modal[0::2]
+        eta_dot = x_modal[1::2]
+
+        w_sensor = np.asarray(self.Phi @ eta, dtype=np.float64)
+        wdot_sensor = np.asarray(self.Phi @ eta_dot, dtype=np.float64)
+
+        if clip:
+            w_sensor = np.clip(w_sensor, -self.w_limit, self.w_limit)
+            wdot_sensor = np.clip(wdot_sensor, -self.wdot_limit, self.wdot_limit)
+
+        return w_sensor, wdot_sensor
+
+    def get_observe_state(self, x_modal: np.ndarray) -> np.ndarray:
+        """Return scaled physical observation for the RL agent."""
+        return self.state_to_obs(x_modal)
+
+    def state_to_obs(self, x: np.ndarray) -> np.ndarray:
+        w_sensor, wdot_sensor = self.modal_to_physical(x)
+        obs = np.concatenate(
+            [w_sensor / self.w_obs_scale, wdot_sensor / self.wdot_obs_scale]
+        )
+        return np.asarray(obs, dtype=np.float64)
+
+    # ------------------------------------------------------------------
+    # Action scaling and dynamics
+    # ------------------------------------------------------------------
+    def _scale_action(self, u: np.ndarray) -> np.ndarray:
+        u = np.asarray(u, dtype=np.float64).reshape(-1)
+        if u.size != self.action_dim:
+            raise ValueError(
+                f"PlatePlant expects action shape ({self.action_dim},), got {u.shape}."
+            )
+        u = np.clip(u, -1.0, 1.0)
         u_phys = self.u_phys_low + 0.5 * (u + 1.0) * (
             self.u_phys_high - self.u_phys_low
         )
-
         return np.asarray(u_phys, dtype=np.float64)
 
     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
-        """
-        State derivative: dx/dt = dynamics(t, x, u).
-
-        The environment supplies normalized action in [-1, 1]^2.
-        This method scales it to physical [omega, ac] before calling f_nonlinear2.
-        """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-
         if x.size != self.state_dim:
             raise ValueError(
-                f"PlatePlant expects state with shape ({self.state_dim},), "
-                f"but received {x.shape}."
+                f"PlatePlant expects state shape ({self.state_dim},), got {x.shape}."
             )
 
         u_phys = self._scale_action(u)
+        self._last_omega = float(u_phys[0])
+        self._last_ap = float(u_phys[1])
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
+        self._last_ae = float(u_phys[2]) if self.control_ae else self.ae_default
 
+        # If ae is not controlled, pass [omega, ap].  The force module then uses
+        # ae_default_mm.  If ae is controlled, pass [omega, ap, ae].
         x_dot = f_nonlinear2.f_nonlinear2(t, x, u_phys)
         x_dot = np.asarray(x_dot, dtype=np.float64).reshape(-1)
 
         if x_dot.size != self.state_dim:
             raise ValueError(
-                f"f_nonlinear2 must return derivative with shape "
-                f"({self.state_dim},), but returned {x_dot.shape}."
+                f"f_nonlinear2_face_milling must return shape ({self.state_dim},), "
+                f"but returned {x_dot.shape}."
             )
 
-        return x_dot
+        if self.dynamics_uncertainty_std > 0.0 and self._rng is not None:
+            x_dot = x_dot.copy()
+            x_dot[1::2] += (
+                self.dynamics_uncertainty_std
+                * self._rng.standard_normal(self.K)
+            )
 
-    def reset(self, rng) -> tuple[np.ndarray, dict[str, Any]]:
-        """
-        Sample initial modal displacement and velocity.
-        """
-        eta0 = rng.uniform(-1e-4, 1e-4, size=self.K)
-        eta_dot0 = rng.uniform(-1e-4, 1e-4, size=self.K)
+        return np.nan_to_num(x_dot, nan=0.0, posinf=1e8, neginf=-1e8)
 
+    # ------------------------------------------------------------------
+    # Reset / termination / spaces
+    # ------------------------------------------------------------------
+    def reset(
+        self,
+        rng: np.random.Generator | None,
+        options: dict[str, Any] | None = None,
+    ) -> tuple[np.ndarray, dict[str, Any]]:
+        options = options or {}
+
+        # 1. Determine the y-location of the milling pass
+        # FIX: Removed trailing spaces in dictionary keys to ensure proper matching
+        if "y0" in options:
+            self.set_milling_line_y(float(options["y0"]))
+        elif "y_cutter" in options:
+            self.set_milling_line_y(float(options["y_cutter"]))
+        elif self.randomize_y0:
+            # Use the passed `rng` for reproducibility, falling back to self._rng if needed
+            randomizer = rng if rng is not None else self._rng
+            if randomizer is not None:
+                y0 = float(randomizer.uniform(self.y0_min, self.y0_max))
+                self.set_milling_line_y(y0)
+
+        # 2. Reset force module history and internal kinematic states
+        f_nonlinear2.reset_state_history()
+        self._last_omega = float(self.omega_min)
+        self._last_ap = float(self.ap_min)
+        self._last_ac = self._last_ap  # compatibility alias for old diagnostics
+        self._last_ae = float(self.ae_default)
+        
+        self._feed_distance_m = 0.0
+        self._spindle_phase_rad = 0.0
+        self._kinematic_step_t0 = 0.0
+        self._kinematic_step_feed0_m = 0.0
+        self._kinematic_step_phase0_rad = 0.0
+        
+        self._sync_accepted_kinematics_to_force_module(0.0, append=True)
+
+        # 3. Initialize modal state
         x0 = np.zeros(self.state_dim, dtype=np.float64)
-        x0[0::2] = eta0
-        x0[1::2] = eta_dot0
+        if self.initial_eta_std > 0.0 and rng is not None:
+            x0[0::2] = rng.normal(0.0, self.initial_eta_std, size=self.K)
+        if self.initial_etad_std > 0.0 and rng is not None:
+            x0[1::2] = rng.normal(0.0, self.initial_etad_std, size=self.K)
 
-        return x0, {}
+        # 4. Return initial state and info dictionary
+        info = {
+            "y_cutter": float(self.y_cutter),
+            "x_start": float(self.L1 - self.x0_cutter),
+            "x_end": 0.1 * self.L1,  # FIX: Updated to match the new 90% termination rule
+            "path_direction": "x=L1 free side -> x=0.1*L1 (90% pass)",
+            "feed_distance_m": float(self._feed_distance_m),
+            "spindle_phase_rad": float(self._spindle_phase_rad),
+            "rho_interpreted_as": self.rho_interpreted_as,
+        }
+        return x0, info
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
-        """
-        Terminate if modal displacement becomes unsafe or state becomes invalid.
-        """
         x = np.asarray(x, dtype=np.float64).reshape(-1)
-        eta = x[0::2]
-
-        invalid_state = not np.all(np.isfinite(x))
-        excessive_displacement = np.any(np.abs(eta) > self.eta_limit)
-
-        terminated = bool(invalid_state or excessive_displacement)
-
         info: dict[str, Any] = {}
 
+        # 1. Catch numerical explosions (NaN/Inf) immediately
+        invalid_state = not np.all(np.isfinite(x))
         if invalid_state:
             info["termination_reason"] = "invalid_state"
+            return True, False, info
 
-        if excessive_displacement:
-            info["termination_reason"] = "excessive_modal_displacement"
+        # 2. Check physical instability based SOLELY on displacement
+        w_sensor, wdot_sensor = self.modal_to_physical(x)
+        if np.any(np.abs(w_sensor) > self.w_limit):
+            info["termination_reason"] = "excessive_sensor_displacement"
+            info["max_displacement_m"] = float(np.max(np.abs(w_sensor)))
+            return True, False, info
+        
+        # Note: Velocity termination removed. Displacement is the true physical 
+        # limit for machining (chip thickness/tool crash). Velocity is implicitly bounded.
 
-        return terminated, False, info
+        # 3. Gather kinematic and force diagnostics
+        cutter_x, cutter_y = f_nonlinear2.cutter_point(t, self._last_omega)
+        info["cutter_x"] = float(cutter_x)
+        info["cutter_y"] = float(cutter_y)
+        info["feed_progress"] = float(1.0 - cutter_x / max(self.L1, 1e-12))
+        info["feed_distance_m"] = float(self._feed_distance_m)
+        info["spindle_phase_rad"] = float(self._spindle_phase_rad)
+        info["omega_rad_s"] = float(self._last_omega)
+        info["omega_rpm"] = float(omega_to_rpm(self._last_omega))
+        info["ap_mm"] = float(self._last_ap)
+        info["ac_mm"] = float(self._last_ap)  # backward-compatible alias
+        info["ae_mm"] = float(self._last_ae)
+
+        force_info = getattr(f_nonlinear2, "last_force_info", None)
+        if force_info is not None:
+            info["F_total_N"] = np.asarray(force_info.F_total_N, dtype=np.float64)
+            info["F_cut_N"] = np.asarray(force_info.F_cut_N, dtype=np.float64)
+            info["mean_chip_mm"] = float(np.mean(force_info.chip_eff_mm))
+            info["max_chip_mm"] = float(np.max(force_info.chip_eff_mm))
+
+        # 4. Terminate at 90% of the pass (x = 0.1 * L1)
+        # This avoids fixture interference and steep mode-shape gradients at x=0.
+        x_termination_threshold = 0.1 * self.L1
+        if cutter_x <= x_termination_threshold:
+            info["pass_completed"] = True
+            info["termination_reason"] = "pass_completed_90percent"
+            info["final_cutter_x"] = float(cutter_x)
+            return True, False, info
+
+        return False, False, info
 
     def get_observation_space(self) -> spaces.Space:
-        """
-        Return Gymnasium observation space.
+        low = np.full(self.obs_dim, -np.inf, dtype=np.float64)
+        high = np.full(self.obs_dim, np.inf, dtype=np.float64)
 
-        Observation:
-            [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
-        """
-        low = np.zeros(self.state_dim, dtype=np.float64)
-        high = np.zeros(self.state_dim, dtype=np.float64)
+        low[: self.n_sensors] = -self.w_limit / self.w_obs_scale
+        high[: self.n_sensors] = self.w_limit / self.w_obs_scale
+        low[self.n_sensors :] = -self.wdot_limit / self.wdot_obs_scale
+        high[self.n_sensors :] = self.wdot_limit / self.wdot_obs_scale
 
-        low[0::2] = -self.eta_obs_limit
-        high[0::2] = self.eta_obs_limit
-
-        low[1::2] = -self.eta_dot_obs_limit
-        high[1::2] = self.eta_dot_obs_limit
-
-        return spaces.Box(
-            low=low,
-            high=high,
-            shape=(self.state_dim,),
-            dtype=np.float64,
-        )
+        return spaces.Box(low=low, high=high, shape=(self.obs_dim,), dtype=np.float64)
 
     def get_action_space(self) -> spaces.Space:
-        """
-        Return normalized Gymnasium action space.
-
-        action[0]: normalized omega command
-        action[1]: normalized ac command
-        """
         return spaces.Box(
             low=-1.0,
             high=1.0,
-            shape=(2,),
+            shape=(self.action_dim,),
             dtype=np.float64,
         )
 
-    def state_to_obs(self, x: np.ndarray) -> np.ndarray:
-        """
-        Map internal state to observation.
+    def physical_action_bounds(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return physical action bounds: [omega, ap] or [omega, ap, ae]."""
+        return self.u_phys_low.copy(), self.u_phys_high.copy()
 
-        Here, observation is equal to the full modal state.
-        """
-        return np.asarray(x, dtype=np.float64).reshape(-1)
+
+__all__ = [
+    "PlatePlant",
+    "rpm_to_omega",
+    "omega_to_rpm",
+    "estimate_pass_duration",
+    "estimate_pass_episode_steps",
+    "estimate_training_episode_steps",
+    "DEFAULT_SENSOR_POINTS",
+]
