@@ -61,6 +61,28 @@ _EXP_DATA = np.array(
 
 _ASPECT_RATIOS = np.array([2.00, 2.50, 3.33, 5.00], dtype=np.float64)
 
+# Square-plate coefficients for the first six x-y-plane modes reported for the
+# AL7075 cantilever-plate reference used by this project:
+# [107.4, 258.8, 654.6, 837.4, 946.0, 1654.2] rad/s.
+#
+# The mapping is zero-based and follows compute_mode_shapes_updated:
+#   W[m][n] = phi_m(clamped-free direction) * psi_n(width/free-free direction)
+# so the first-six reference set is represented by:
+#   (0,0), (0,1), (1,0), (0,2), (1,1), (1,2).
+#
+# These dimensionless coefficients are omega_k /
+# sqrt(D/(rho_areal*L1^4)) for E=71.7e9 Pa, nu=0.33,
+# rho_areal=56.2 kg/m^2, L1=L2=1 m, h=0.02 m.  They prevent invalid
+# extrapolation of the older table, whose aspect-ratio data start at a/b=2.
+_SQUARE_ASPECT_MODE_COEFFS = {
+    (0, 0): 3.4763357259909563,
+    (0, 1): 8.376868598725245,
+    (1, 0): 21.18816919712854,
+    (0, 2): 27.105060934097756,
+    (1, 1): 30.62023840479446,
+    (1, 2): 53.54333864954204,
+}
+
 
 def _validate_positive(name: str, value: float) -> float:
     value = float(value)
@@ -231,17 +253,20 @@ def compute_natural_frequencies(
 
     for m in range(m_max):
         for n in range(n_max):
-            # Keep the original indexing convention:
-            # table column 0 is matched to n, table column 1 is matched to m.
-            mask = (_EXP_DATA[:, 0] == float(n)) & (_EXP_DATA[:, 1] == float(m))
-            idx = np.where(mask)[0]
-
-            if idx.size == 0:
-                coeff = fallback_coefficient
+            if abs(aspect_ratio - 1.0) < 1e-10 and (m, n) in _SQUARE_ASPECT_MODE_COEFFS:
+                coeff = _SQUARE_ASPECT_MODE_COEFFS[(m, n)]
             else:
-                coeff = coeffs[idx[0]]
-                if not np.isfinite(coeff):
+                # Keep the original indexing convention:
+                # table column 0 is matched to n, table column 1 is matched to m.
+                mask = (_EXP_DATA[:, 0] == float(n)) & (_EXP_DATA[:, 1] == float(m))
+                idx = np.where(mask)[0]
+
+                if idx.size == 0:
                     coeff = fallback_coefficient
+                else:
+                    coeff = coeffs[idx[0]]
+                    if not np.isfinite(coeff):
+                        coeff = fallback_coefficient
 
             omega_mn[m, n] = scale * coeff
 
@@ -252,6 +277,7 @@ def compute_natural_frequencies(
             "interpreted_rho_type": interpreted_rho_type,
             "aspect_ratio": aspect_ratio,
             "frequency_scale_rad_s": scale,
+            "uses_square_reference_coefficients": bool(abs(aspect_ratio - 1.0) < 1e-10),
             "units": "rad/s",
         }
         return omega_mn, info

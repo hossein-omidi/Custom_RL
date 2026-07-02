@@ -56,7 +56,7 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 DEFAULT_Y_CUTTER = 0.20
 
 # Spindle speed operating range [rpm]; internal physics uses rad/s.
-RPM_MIN = 400.0
+RPM_MIN = 50.0
 RPM_MAX = 4000.0
 
 # Practical reference speed for episode cap estimation.  This does not change
@@ -144,6 +144,65 @@ def estimate_training_episode_steps(
     )
 
 
+
+
+def _trapz_compat(y, x, *, axis: int):
+    """NumPy-version-safe trapezoidal integration.
+
+    np.trapezoid was introduced in newer NumPy versions.  Many Anaconda
+    Python 3.12 installations still provide only np.trapz.  Keep one helper so
+    the modal-mass calculation works on both versions without changing the
+    theory: M_k = ∫∫ rho_areal W_k^2 dxdy.
+    """
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return trapezoid(y, x=x, axis=axis)
+    return np.trapz(y, x=x, axis=axis)
+
+def compute_modal_mass_vector(
+    W_mn,
+    L1: float,
+    L2: float,
+    rho_areal: float,
+    m_max: int,
+    n_max: int,
+    *,
+    grid_points: int = 151,
+) -> np.ndarray:
+    """Compute true modal masses M_k = ∫∫ rho_areal * W_k(x,y)^2 dxdy.
+
+    The analytical shape functions are close to mass-normalized on [0, 1]^2,
+    so this often returns values close to the total plate mass.  Computing the
+    vector explicitly keeps the modal force projection rigorous and safe if the
+    mode-shape normalization changes later.
+    """
+    L1 = float(L1)
+    L2 = float(L2)
+    rho_areal = float(rho_areal)
+    m_max = int(m_max)
+    n_max = int(n_max)
+    grid_points = max(int(grid_points), 25)
+
+    xs = np.linspace(0.0, L1, grid_points, dtype=np.float64)
+    ys = np.linspace(0.0, L2, grid_points, dtype=np.float64)
+    X, Y = np.meshgrid(xs, ys, indexing="ij")
+
+    masses = np.zeros(m_max * n_max, dtype=np.float64)
+    k = 0
+    for m in range(m_max):
+        for n in range(n_max):
+            W = np.asarray(W_mn[m][n](X, Y), dtype=np.float64)
+            W = np.nan_to_num(W, nan=0.0, posinf=0.0, neginf=0.0)
+            integrand = rho_areal * W * W
+            int_y = _trapz_compat(integrand, ys, axis=1)
+            masses[k] = float(_trapz_compat(int_y, xs, axis=0))
+            k += 1
+
+    masses = np.nan_to_num(masses, nan=0.0, posinf=0.0, neginf=0.0)
+    masses = np.where(masses > 1e-18, masses, 1e-18)
+    return masses
+
+
 class PlatePlant(ODEPlant):
     """Nonlinear flexible-plate plant driven by a face-milling force model.
 
@@ -179,19 +238,19 @@ class PlatePlant(ODEPlant):
         nu: float = 0.33,
         rho: float = 2810.0,
         rho_type: str = "volumetric",
-        m_max: int = 3,
-        n_max: int = 2,
+        m_max: int = 2,
+        n_max: int = 3,
         mode_clamped_axis: str = "x",
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
-        ap_max: float = 1,
+        ap_max: float = 20,
         ae_min: float = 1.0,
         ae_max: float = 50.0,
         ae_default: float = 28.0,
         control_ae: bool = False,
         D_mm: float = 63.0,
-        feed_per_tooth_mm: float = 0.20,
+        feed_per_tooth_mm: float = 0.10,
         gamma_L_deg: float = 45.0,
         gamma_r_deg: float = 5.0,
         gamma_a_deg: float = 5.0,
@@ -413,9 +472,6 @@ class PlatePlant(ODEPlant):
         )
         self.y_traj = np.full_like(self.t_original, self.y_cutter, dtype=np.float64)
 
-        # Modal mass.  Use areal mass rho*h once; do not double count h.
-        self.M_modal = self.L1 * self.L2 * self.rho_areal
-
         # ------------------------------------------------------------------
         # Structural mode shapes, frequencies, nonlinear stiffness
         # ------------------------------------------------------------------
@@ -429,6 +485,21 @@ class PlatePlant(ODEPlant):
         )
         self.W_mn = W_mn
         self.V_mn = V_mn
+
+        # True modal mass vector: M_k = ∫∫ rho_areal * W_k(x,y)^2 dxdy.
+        # For the current normalized analytical shapes this is numerically close
+        # to total plate mass for each mode, but using a vector is the rigorous
+        # modal-coordinate formulation and works for non-normalized shapes too.
+        self.M_modal = compute_modal_mass_vector(
+            W_mn,
+            self.L1,
+            self.L2,
+            self.rho_areal,
+            self.m_max,
+            self.n_max,
+            grid_points=max(int(stiffness_grid_points), 151),
+        )
+        self.total_mass = self.L1 * self.L2 * self.rho_areal
 
         self.Phi = build_mode_shape_matrix(
             W_mn,
@@ -475,9 +546,9 @@ class PlatePlant(ODEPlant):
         # compute_nonlinear_stiffness returns structural cubic coefficients K3_k
         # with force scaling. f_nonlinear2 integrates an acceleration equation,
         # so the cubic term must be mass-normalized exactly like the cutting
-        # force projection Fk = Q_k / M_k. For the current analytical mode
-        # shapes, self.M_modal = ∫∫ rho_areal*W_k^2 dA ≈ L1*L2*rho_areal.
-        lambda_vec = lambda_structural_vec / max(float(self.M_modal), 1e-18)
+        # force projection Fk = Q_k / M_k.
+        modal_mass_safe = np.maximum(np.asarray(self.M_modal, dtype=np.float64), 1e-18)
+        lambda_vec = lambda_structural_vec / modal_mass_safe
         zeta_vec = self.modal_damping_ratio * np.ones(self.K, dtype=np.float64)
 
         self.omega_vec = omega_vec
@@ -872,5 +943,6 @@ __all__ = [
     "estimate_pass_duration",
     "estimate_pass_episode_steps",
     "estimate_training_episode_steps",
+    "compute_modal_mass_vector",
     "DEFAULT_SENSOR_POINTS",
 ]

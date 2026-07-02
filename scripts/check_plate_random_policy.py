@@ -348,9 +348,9 @@ def plot_rollout(
 def main() -> None:
     parser = argparse.ArgumentParser(description="Simple face-milling plate env smoke test.")
     parser.add_argument("--reward", default="dense", choices=["dense", "sparse", "quadratic"])
-    parser.add_argument("--steps", type=int, default=500)
+    parser.add_argument("--steps", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dt", type=float, default=0.001)
+    parser.add_argument("--dt", type=float, default=0.0001)
     parser.add_argument(
         "--max-episode-steps",
         type=int,

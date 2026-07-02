@@ -175,7 +175,7 @@ def rk4_step(
     u: Array,
     dt: float,
     *,
-    history_module: Optional[Any] = "f_nonlinear2_face_milling",
+    history_module: Optional[Any] = None,
     commit_history: bool = True,
 ) -> Array:
     """
