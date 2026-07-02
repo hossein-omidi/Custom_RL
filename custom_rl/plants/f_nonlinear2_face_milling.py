@@ -27,7 +27,12 @@ Implemented face-milling model
 For tooth i:
 
     theta_i = theta_base(t) + theta0 + (i-1)*2*pi/N
-    tau     = 2*pi/(N*omega)
+    For constant spindle speed:
+        tau = 2*pi/(N*omega)
+
+    For variable spindle speed:
+        find t_d from theta_base(t) - theta_base(t_d) = 2*pi/N
+        tau_eff = t - t_d
 
     h_i = ft*sin(theta_i)
         + Delta_xr*sin(theta_i)*cos(gamma_L)
@@ -36,7 +41,7 @@ For tooth i:
 
 where
 
-    Delta_r = r_rel(t) - r_rel(t - tau)
+    Delta_r = r_rel(t) - r_rel(t_d)
     r_rel   = r_cutter_dynamic - r_workpiece_dynamic
 
 For each engaged tooth:
@@ -68,6 +73,8 @@ The old code precomputed a scalar F_normal = sqrt(Fx^2 + Fy^2) from a
 peripheral-milling polynomial model. That is removed here. Face milling is
 computed tooth-by-tooth, gives [Fx, Fy, Fz], and uses the regenerative delay
 inside chip thickness, not as an artificial delay in the structural terms.
+When spindle speed changes, the delayed state is selected by one-tooth phase
+separation rather than by the instantaneous period alone.
 """
 
 from __future__ import annotations
@@ -219,7 +226,12 @@ def _get_state_at_time(t_query: float) -> Optional[np.ndarray]:
             return _state_history[0][1].copy()
         return None
     if idx == len(times):
-        return _state_history[-1][1].copy()
+        # Do not extrapolate a future delayed state from the last accepted state.
+        # If this happens, the RK substep is too large for the current tooth delay
+        # or a proper within-step DDE interpolant is required.
+        if t_query <= times[-1] + 1e-14:
+            return _state_history[-1][1].copy()
+        return None
 
     t1, x1 = _state_history[idx - 1]
     t2, x2 = _state_history[idx]
@@ -348,6 +360,92 @@ def spindle_phase(t: float, omega_rad_s: float) -> float:
     """Return accumulated spindle phase [rad] at time t."""
     _, phase = feed_phase_at_time(t, omega_rad_s)
     return float(phase)
+
+
+def tooth_pitch_phase() -> float:
+    """Return one-tooth pitch angle [rad]."""
+    return 2.0 * np.pi / float(N)
+
+
+def _get_time_at_phase(phase_query: float) -> Optional[float]:
+    """Return the time at which the accepted spindle phase reached phase_query.
+
+    The kinematic history stores unwrapped spindle phase, so the inverse mapping
+    phase -> time is well defined while the spindle speed is positive.
+    """
+    if len(_kinematic_history) == 0:
+        return None
+
+    phase_query = float(phase_query)
+    phases = [entry[2] for entry in _kinematic_history]
+    idx = bisect.bisect_left(phases, phase_query)
+
+    if idx == 0:
+        if abs(phases[0] - phase_query) < _KINEMATIC_TOL:
+            return float(_kinematic_history[0][0])
+        return None
+
+    if idx == len(phases):
+        if phase_query <= phases[-1] + _KINEMATIC_TOL:
+            return float(_kinematic_history[-1][0])
+        return None
+
+    t1, _, phase1 = _kinematic_history[idx - 1]
+    t2, _, phase2 = _kinematic_history[idx]
+    if abs(phase2 - phase1) < _KINEMATIC_TOL:
+        return float(t1)
+
+    a = (phase_query - phase1) / (phase2 - phase1)
+    return float((1.0 - a) * t1 + a * t2)
+
+
+def regenerative_delay_time(t: float, omega_rad_s: float) -> Tuple[Optional[float], float]:
+    """Return (t_delay, tau_eff) for one-tooth regenerative delay.
+
+    For constant spindle speed, this reduces to t_delay = t - 2*pi/(N*omega).
+    For variable spindle speed, the delayed time is defined by one tooth pitch
+    of unwrapped spindle phase:
+
+        phase(t) - phase(t_delay) = 2*pi/N
+
+    If less than one tooth of accepted history exists, t_delay is None and the
+    caller should use zero regenerative displacement.
+    """
+    t = float(t)
+    omega_rad_s = max(float(omega_rad_s), OMEGA_EPS)
+    tau_const = tooth_period(omega_rad_s)
+
+    if not USE_ACCEPTED_PATH_KINEMATICS:
+        return max(t - tau_const, 0.0), tau_const
+
+    phase_now = spindle_phase(t, omega_rad_s)
+    target_phase = phase_now - tooth_pitch_phase()
+
+    if target_phase < -_KINEMATIC_TOL:
+        return None, tau_const
+    target_phase = max(target_phase, 0.0)
+
+    # If the whole delay lies inside the current held-action segment, compute it
+    # directly. The state history may not support this case unless the RK substep
+    # is smaller than the tooth delay; f_nonlinear2 checks that before use.
+    if t >= _kinematic_t0 - _KINEMATIC_TOL and target_phase >= _kinematic_phase0_rad - _KINEMATIC_TOL:
+        t_delay = _kinematic_t0 + max(target_phase - _kinematic_phase0_rad, 0.0) / omega_rad_s
+        t_delay = min(max(t_delay, 0.0), t)
+        return float(t_delay), float(t - t_delay)
+
+    t_delay = _get_time_at_phase(target_phase)
+    if t_delay is None:
+        return None, tau_const
+
+    t_delay = min(max(float(t_delay), 0.0), t)
+    return t_delay, float(t - t_delay)
+
+
+def _latest_state_history_time() -> Optional[float]:
+    """Return the latest accepted modal-history time, if available."""
+    if len(_state_history) == 0:
+        return None
+    return float(_state_history[-1][0])
 
 # ============================================================
 # Debug information from the last force calculation
@@ -660,8 +758,18 @@ def process_damping_matrix(theta_values: np.ndarray, engagement: np.ndarray,
     return B
 
 
-def compute_face_milling_force(t: float, x_modal: np.ndarray, x_delay_modal: np.ndarray,
-                               omega_rad_s: float, ap_mm: float, ae_mm: float):
+def compute_face_milling_force(
+    t: float,
+    x_modal: np.ndarray,
+    x_delay_modal: np.ndarray,
+    omega_rad_s: float,
+    ap_mm: float,
+    ae_mm: float,
+    *,
+    t_delay_s: Optional[float] = None,
+    tau_s: Optional[float] = None,
+    delay_available: bool = True,
+):
     """
     Compute global face-milling force and diagnostic quantities.
 
@@ -676,13 +784,16 @@ def compute_face_milling_force(t: float, x_modal: np.ndarray, x_delay_modal: np.
     ae_mm = max(float(ae_mm), 0.0)
     ft_mm = float(cf)
 
-    tau = tooth_period(omega_rad_s)
+    tau = tooth_period(omega_rad_s) if tau_s is None else max(float(tau_s), 0.0)
     theta_s, theta_e = entry_exit_angles(ae_mm)
 
     xc, yc = cutter_point(t, omega_rad_s)
-    if USE_DELAYED_CUTTER_POSITION_FOR_REGEN:
-        xc_delay, yc_delay = cutter_point(max(t - tau, 0.0), omega_rad_s)
+    if delay_available and USE_DELAYED_CUTTER_POSITION_FOR_REGEN:
+        t_delay = max(t - tau, 0.0) if t_delay_s is None else max(float(t_delay_s), 0.0)
+        xc_delay, yc_delay = cutter_point(t_delay, omega_rad_s)
     else:
+        # Before one-tooth history exists, use zero regenerative displacement:
+        # compare current state with itself at the same cutter location.
         xc_delay, yc_delay = xc, yc
 
     rel_now = relative_displacement_mm(x_modal, xc, yc)
@@ -810,7 +921,8 @@ def f_nonlinear2(t, x, u):
     Modal plate dynamics forced by the face-milling cutting force.
 
     The structural equation is intentionally not delayed. Regeneration appears
-    only inside the chip-thickness term through x(t)-x(t-tau).
+    only inside the chip-thickness term through x(t)-x(t_delay), where t_delay
+    is selected by one-tooth phase separation when accepted kinematics are used.
     """
     _require_initialized()
 
@@ -821,9 +933,22 @@ def f_nonlinear2(t, x, u):
         raise ValueError(f"Expected state shape ({2*K},), got {x.shape}.")
     x = np.nan_to_num(x, nan=0.0, posinf=1e6, neginf=-1e6)
 
-    tau = tooth_period(omega_rad_s)
-    x_delay = _get_state_at_time(float(t) - tau)
-    if x_delay is None:
+    t_delay, tau = regenerative_delay_time(float(t), omega_rad_s)
+    delay_available = t_delay is not None
+    if delay_available:
+        latest_t = _latest_state_history_time()
+        if latest_t is not None and t_delay > latest_t + 1e-12:
+            raise RuntimeError(
+                "Regenerative delay time falls inside the current RK substep. "
+                "Reduce env dt or increase n_substeps so each RK substep is "
+                "smaller than the minimum tooth-passing delay, or use a DDE "
+                "integrator with within-step interpolation."
+            )
+        x_delay = _get_state_at_time(t_delay)
+        if x_delay is None:
+            delay_available = False
+            x_delay = x.copy()
+    else:
         # Before one-tooth history exists, use current state. This gives zero
         # regenerative displacement and keeps the static chip-load force active.
         x_delay = x.copy()
@@ -836,6 +961,9 @@ def f_nonlinear2(t, x, u):
         omega_rad_s=omega_rad_s,
         ap_mm=ap_mm,
         ae_mm=ae_mm,
+        t_delay_s=t_delay,
+        tau_s=tau,
+        delay_available=delay_available,
     )
     last_force_info = info
 

@@ -46,7 +46,7 @@ class ODEControlEnv(gym.Env):
                 float,
             ]
         ] = None,
-        dt: float = 0.02,
+        dt: float = 0.002,
         n_substeps: int = 1,
         max_episode_steps: int = 500,
         process_noise_std: float = 0.0,

@@ -48,7 +48,7 @@ from custom_rl.plants.compute_nonlinear_stiffness_updated import (
 # ---------------------------------------------------------------------------
 DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
     (0.83, 0.20),
-    (0.17, 0.20),
+    (0.83, 0.83),
 )
 
 # The face-milling force module currently supports a straight x-pass with
@@ -56,7 +56,7 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 DEFAULT_Y_CUTTER = 0.20
 
 # Spindle speed operating range [rpm]; internal physics uses rad/s.
-RPM_MIN = 50.0
+RPM_MIN = 400.0
 RPM_MAX = 4000.0
 
 # Practical reference speed for episode cap estimation.  This does not change
@@ -185,13 +185,13 @@ class PlatePlant(ODEPlant):
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
-        ap_max: float = 20
+        ap_max: float = 1,
         ae_min: float = 1.0,
         ae_max: float = 50.0,
-        ae_default: float = 25.0,
+        ae_default: float = 28.0,
         control_ae: bool = False,
-        D_mm: float = 50.0,
-        feed_per_tooth_mm: float = 0.05,
+        D_mm: float = 63.0,
+        feed_per_tooth_mm: float = 0.20,
         gamma_L_deg: float = 45.0,
         gamma_r_deg: float = 5.0,
         gamma_a_deg: float = 5.0,
@@ -215,25 +215,26 @@ class PlatePlant(ODEPlant):
         use_process_damping: bool = False,
         Ksp: float | None = None,
         mu: float = 0.3,
-        VB: float = 0.08,
-        lambda_L_deg: float | None = 45.0,
+        VB: float = 0.0,
+        lambda_L_deg: float | None = None,
         force_projection_mode: str = "z",
         sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
-        w_limit: float = 0.01,
-        w_obs_scale: float = 0.01,
+        w_limit: float = 1.0e-2,
+        w_obs_scale: float = 1.0e-2,
         wdot_limit: float = 10.0,
         wdot_obs_scale: float = 1.0,
-        eta_limit: float = 0.01,
+        eta_limit: float = 1.0e-3,
         y_cutter: float = DEFAULT_Y_CUTTER,
         x0_cutter: float = 0.0,
-        x_pass_end_tol: float = 0.01,
+        x_pass_end_tol: float | None = None,
         dynamics_uncertainty_std: float = 0.0,
         y0_min: float = 0.05,
-        y0_max: float = 0.45,
+        y0_max: float = 0.95,
         randomize_y0: bool = True,
         initial_eta_std: float = 0.0,
         initial_etad_std: float = 0.0,
         stiffness_grid_points: int = 100,
+        modal_damping_ratio: float = 0.02,
     ):
         # ------------------------------------------------------------------
         # Basic structural parameters
@@ -332,7 +333,12 @@ class PlatePlant(ODEPlant):
 
         self.y_cutter = float(y_cutter)
         self.x0_cutter = float(x0_cutter)
-        self.x_pass_end_tol = float(x_pass_end_tol)
+        # The milling pass ends after 90% travel: x = 0.1*L1.  Older code
+        # used the name x_pass_end_tol; keep it as a backward-compatible
+        # absolute end-position override, but default to the theory value.
+        self.x_pass_end_m = 0.1 * self.L1 if x_pass_end_tol is None else float(x_pass_end_tol)
+        self.x_pass_end_m = float(np.clip(self.x_pass_end_m, 0.0, self.L1))
+        self.x_pass_end_tol = self.x_pass_end_m
         self._last_omega = float(self.omega_min)
         self._last_ap = float(self.ap_min)
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
@@ -348,11 +354,21 @@ class PlatePlant(ODEPlant):
         self._kinematic_step_phase0_rad = 0.0
 
         self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
-        self.y0_min = float(y0_min)
-        self.y0_max = float(y0_max)
+        self.y0_min = float(np.clip(y0_min, 0.0, self.L2))
+        self.y0_max = float(np.clip(y0_max, 0.0, self.L2))
+        if self.y0_max <= self.y0_min:
+            raise ValueError(
+                f"y0_max must be larger than y0_min after clipping to [0, L2]; "
+                f"got y0_min={self.y0_min}, y0_max={self.y0_max}."
+            )
         self.randomize_y0 = bool(randomize_y0)
         self.initial_eta_std = float(max(initial_eta_std, 0.0))
         self.initial_etad_std = float(max(initial_etad_std, 0.0))
+        self.modal_damping_ratio = float(modal_damping_ratio)
+        if not np.isfinite(self.modal_damping_ratio) or self.modal_damping_ratio < 0.0:
+            raise ValueError(
+                f"modal_damping_ratio must be finite and non-negative, got {modal_damping_ratio!r}."
+            )
         self._rng: np.random.Generator | None = None
 
         # Explicit regenerative-history module handle.  ODEControlEnv can use
@@ -462,7 +478,7 @@ class PlatePlant(ODEPlant):
         # force projection Fk = Q_k / M_k. For the current analytical mode
         # shapes, self.M_modal = ∫∫ rho_areal*W_k^2 dA ≈ L1*L2*rho_areal.
         lambda_vec = lambda_structural_vec / max(float(self.M_modal), 1e-18)
-        zeta_vec = 0.05 * np.ones(self.K, dtype=np.float64)
+        zeta_vec = self.modal_damping_ratio * np.ones(self.K, dtype=np.float64)
 
         self.omega_vec = omega_vec
         self.lambda_structural_vec = lambda_structural_vec
@@ -758,7 +774,7 @@ class PlatePlant(ODEPlant):
         info = {
             "y_cutter": float(self.y_cutter),
             "x_start": float(self.L1 - self.x0_cutter),
-            "x_end": 0.1 * self.L1,  # FIX: Updated to match the new 90% termination rule
+            "x_end": float(self.x_pass_end_m),
             "path_direction": "x=L1 free side -> x=0.1*L1 (90% pass)",
             "feed_distance_m": float(self._feed_distance_m),
             "spindle_phase_rad": float(self._spindle_phase_rad),
@@ -806,9 +822,9 @@ class PlatePlant(ODEPlant):
             info["mean_chip_mm"] = float(np.mean(force_info.chip_eff_mm))
             info["max_chip_mm"] = float(np.max(force_info.chip_eff_mm))
 
-        # 4. Terminate at 90% of the pass (x = 0.1 * L1)
+        # 4. Terminate at the configured 90% pass end (default x = 0.1 * L1).
         # This avoids fixture interference and steep mode-shape gradients at x=0.
-        x_termination_threshold = 0.1 * self.L1
+        x_termination_threshold = self.x_pass_end_m
         if cutter_x <= x_termination_threshold:
             info["pass_completed"] = True
             info["termination_reason"] = "pass_completed_90percent"
