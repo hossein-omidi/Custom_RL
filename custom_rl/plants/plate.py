@@ -56,8 +56,8 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 DEFAULT_Y_CUTTER = 0.20
 
 # Spindle speed operating range [rpm]; internal physics uses rad/s.
-RPM_MIN = 50.0
-RPM_MAX = 4000.0
+RPM_MIN = 1000
+RPM_MAX = 40000.0
 
 # Practical reference speed for episode cap estimation.  This does not change
 # pass termination; it only avoids extremely long RL rollout caps at very low rpm.
@@ -244,13 +244,13 @@ class PlatePlant(ODEPlant):
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
-        ap_max: float = 20,
+        ap_max: float = 10,
         ae_min: float = 1.0,
         ae_max: float = 50.0,
         ae_default: float = 28.0,
         control_ae: bool = False,
         D_mm: float = 63.0,
-        feed_per_tooth_mm: float = 0.10,
+        feed_per_tooth_mm: float = 0.20,
         gamma_L_deg: float = 45.0,
         gamma_r_deg: float = 5.0,
         gamma_a_deg: float = 5.0,
@@ -278,11 +278,11 @@ class PlatePlant(ODEPlant):
         lambda_L_deg: float | None = None,
         force_projection_mode: str = "z",
         sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
-        w_limit: float = 1.0e-2,
-        w_obs_scale: float = 1.0e-2,
+        w_limit: float = 2.0e-3,
+        w_obs_scale: float = 2.0e-3,
         wdot_limit: float = 10.0,
         wdot_obs_scale: float = 1.0,
-        eta_limit: float = 1.0e-3,
+        eta_limit: float = 1.0e-1,
         y_cutter: float = DEFAULT_Y_CUTTER,
         x0_cutter: float = 0.0,
         x_pass_end_tol: float | None = None,

@@ -1,0 +1,18 @@
+{
+  "steps_recorded": 251,
+  "final_time_s": 0.25100000000000017,
+  "regeneration_diagnostics_available": true,
+  "max_abs_w_sensor_m": 0.04045805440434983,
+  "w_limit_m": 0.04,
+  "max_delta_rel_norm_mm": 26.0861570842601,
+  "max_abs_delta_rel_z_mm": 26.0861570842601,
+  "max_chip_eff_mm": 15.003776727962427,
+  "max_chip_raw_mm": 15.003776727962427,
+  "max_abs_Fz_total_N": 52025.184203551216,
+  "regeneration_active_steps": 248,
+  "first_regeneration_time_s": 0.004,
+  "final_state_history_len": 252,
+  "final_kinematic_history_len": 252,
+  "first_instability_time_s": 0.25100000000000017,
+  "instability_detected_from_w_limit": true
+}

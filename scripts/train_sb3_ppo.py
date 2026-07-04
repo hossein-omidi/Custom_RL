@@ -18,11 +18,37 @@ from custom_rl.plants.plate import RPM_MAX, RPM_MIN
 
 ENV_ID = "CustomODEPlate-v0"
 
+# PPO defaults selected for the current face-milling plate environment.
+# dt = 0.001 s makes gamma=0.99 too myopic; gamma=0.999 gives an
+# approximately 1-second effective discount horizon while keeping PPO stable.
+PPO_LEARNING_RATE = 1e-4
+PPO_N_STEPS = 4096
+PPO_BATCH_SIZE = 512
+PPO_N_EPOCHS = 5
+PPO_GAMMA = 0.9999
+PPO_GAE_LAMBDA = 0.98
+PPO_CLIP_RANGE = 0.15
+PPO_ENT_COEF = 0.0
+PPO_VF_COEF = 0.5
+PPO_MAX_GRAD_NORM = 0.5
+PPO_TARGET_KL = 0.02
+PPO_NET_ARCH = [128, 128]
+
+
+def make_registered_plate_env(**env_kwargs):
+    """Create the registered plate environment inside the active process.
+
+    This makes SubprocVecEnv robust on spawn-based systems such as Windows:
+    each worker process registers the custom env before calling gym.make().
+    """
+    register_envs()
+    return gym.make(ENV_ID, **env_kwargs)
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PPO on CustomODEPlate")
 
-    parser.add_argument("--seeds", nargs="+", type=int, default=[0, 1, 2])
+    parser.add_argument("--seeds", nargs="+", type=int, default=[0])
 
     parser.add_argument(
         "--reward",
@@ -31,7 +57,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=500_000)
+    parser.add_argument("--total-timesteps", type=int, default=2_000_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -39,14 +65,18 @@ def main() -> None:
         "--n-envs",
         type=int,
         default=2,
-        help="Parallel training environments per seed",
+        help=(
+            "Parallel training environments per seed. Use DummyVecEnv only with n_envs=1; "
+            "for n_envs>1 use SubprocVecEnv because the face-milling force "
+            "module stores regenerative history in module-level globals."
+        ),
     )
 
     parser.add_argument(
         "--vec-env",
         choices=["dummy", "subproc"],
-        default="dummy",
-        help="Vectorized env type: 'dummy' or 'subproc'",
+        default="subproc",
+        help="Vectorized env type. DummyVecEnv is safe only with n_envs=1 for this plant.",
     )
 
     parser.add_argument(
@@ -66,20 +96,20 @@ def main() -> None:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=None,
+        default=200000,
         help="Max steps per episode (default: auto from pass duration)",
     )
 
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=5,
-        help="Evaluation episodes per callback (random y0 explores pass lines)",
+        default=1,
+        help="Evaluation episodes per callback. Keep small because one stable pass is long.",
     )
     parser.add_argument(
         "--eval-freq",
         type=int,
-        default=20_000,
+        default=250_000,
         help="Evaluate every N total env steps (higher = less eval overhead)",
     )
 
@@ -120,6 +150,15 @@ def main() -> None:
         f"  plots    -> python scripts/plot_results.py --log-dir {args.log_dir}"
     )
 
+    if args.n_envs <= 0:
+        raise ValueError("--n-envs must be positive.")
+    if args.vec_env == "dummy" and args.n_envs != 1:
+        raise ValueError(
+            "DummyVecEnv with n_envs > 1 is unsafe for this face-milling plant because "
+            "the regenerative force module uses module-level history/global parameters. "
+            "Use --vec-env subproc for parallel training, or keep --n-envs 1."
+        )
+
     vec_env_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
 
     env_kwargs = plate_env_kwargs(
@@ -135,8 +174,14 @@ def main() -> None:
     _probe = gym.make(ENV_ID, **env_kwargs)
     print(f"Max episode steps (cap): {_probe.unwrapped.max_episode_steps}")
     print(
-        "Note: first PPO rollout (~8192 env steps with defaults) can take several "
-        "minutes on CPU before progress logs appear."
+        f"Note: first PPO rollout collects {PPO_N_STEPS * args.n_envs} env steps "
+        "before the first PPO update/progress log; this can take several minutes on CPU."
+    )
+    print(
+        "PPO defaults: "
+        f"lr={PPO_LEARNING_RATE}, n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
+        f"epochs={PPO_N_EPOCHS}, gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
+        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}"
     )
     _probe.close()
 
@@ -147,7 +192,7 @@ def main() -> None:
         save_path = str(Path(args.save_dir) / f"best_{seed}")
 
         env = make_vec_env(
-            env_id=ENV_ID,
+            env_id=make_registered_plate_env,
             n_envs=args.n_envs,
             seed=seed,
             vec_env_cls=vec_env_cls,
@@ -156,7 +201,7 @@ def main() -> None:
         )
 
         eval_env = make_vec_env(
-            env_id=ENV_ID,
+            env_id=make_registered_plate_env,
             n_envs=1,
             seed=seed + 10000,
             vec_env_cls=DummyVecEnv,
@@ -176,14 +221,18 @@ def main() -> None:
             "MlpPolicy",
             env,
             seed=seed,
-            learning_rate=3e-4,
-            n_steps=4096,
-            batch_size=256,
-            n_epochs=10,
-            gamma=0.99,
-            gae_lambda=0.95,
-            clip_range=0.2,
-            policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256])),
+            learning_rate=PPO_LEARNING_RATE,
+            n_steps=PPO_N_STEPS,
+            batch_size=PPO_BATCH_SIZE,
+            n_epochs=PPO_N_EPOCHS,
+            gamma=PPO_GAMMA,
+            gae_lambda=PPO_GAE_LAMBDA,
+            clip_range=PPO_CLIP_RANGE,
+            ent_coef=PPO_ENT_COEF,
+            vf_coef=PPO_VF_COEF,
+            max_grad_norm=PPO_MAX_GRAD_NORM,
+            target_kl=PPO_TARGET_KL,
+            policy_kwargs=dict(net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH)),
             verbose=1,
             device="cpu",
         )

@@ -12,9 +12,9 @@ import numpy as np
 from custom_rl import DEFAULT_LOG_DIR, DEFAULT_PLOT_DIR, DEFAULT_TRAJ_DIR
 from custom_rl.eval.monte_carlo import MC_BAND_STD_MULT
 from custom_rl.eval.pipeline import (
-    actions_are_physical,
     discover_log_seeds,
     discover_trajectory_seeds,
+    physical_action_names,
     primary_episode_record,
 )
 from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm
@@ -254,11 +254,42 @@ def _physical_signals_from_episode(ep: dict) -> np.ndarray:
     return signals
 
 
+def _non_empty_sequence(value) -> bool:
+    """Return True for non-empty saved list/array-like values."""
+    if value is None:
+        return False
+    try:
+        return len(value) > 0
+    except TypeError:
+        return False
+
+
+def _saved_actions_from_episode(ep: dict, metadata: dict) -> tuple[np.ndarray, bool]:
+    """Return actions for plotting and whether they are already physical.
+
+    New eval files save both normalized ``actions`` and ``physical_actions``.
+    Prefer the physical values.  For older files, fall back to normalized
+    actions instead of incorrectly assuming that ``actions`` are physical just
+    because the metadata describes the plant's physical action convention.
+    """
+    record = primary_episode_record(ep)
+
+    physical = record.get("physical_actions", ep.get("physical_actions", []))
+    if _non_empty_sequence(physical):
+        return np.asarray(physical, dtype=np.float64), True
+
+    actions = record.get("actions", ep.get("actions", []))
+    if _non_empty_sequence(actions):
+        return np.asarray(actions, dtype=np.float64), False
+
+    return np.asarray([], dtype=np.float64), False
+
+
 def _collect_trajectory_arrays(
     traj_dir: Path,
     seeds: list[int],
 ) -> tuple[np.ndarray | None, np.ndarray | None, np.ndarray | None, dict]:
-    """Collect physical sensor signals, physical actions, and times into padded arrays."""
+    """Collect physical sensor signals, actions, and times into padded arrays."""
     data = load_trajectories(traj_dir, seeds)
 
     if not data:
@@ -267,25 +298,22 @@ def _collect_trajectory_arrays(
 
     all_trajs = []
     metadata: dict = {}
+    selected_actions_are_physical: bool | None = None
 
     for seed in sorted(data.keys()):
         for ep in data[seed]:
             if not metadata and ep.get("metadata"):
-                metadata = ep["metadata"]
+                metadata = dict(ep["metadata"])
 
             record = primary_episode_record(ep)
             states = _physical_signals_from_episode(ep)
+            actions, action_is_physical = _saved_actions_from_episode(ep, metadata)
 
-            if actions_are_physical(ep, metadata):
-                actions = np.asarray(
-                    record.get("physical_actions", ep.get("physical_actions", [])),
-                    dtype=np.float64,
-                )
-            else:
-                actions = np.asarray(
-                    record.get("actions", ep.get("actions", [])),
-                    dtype=np.float64,
-                )
+            # Do not mix physical and normalized actions in one summary plot.
+            if selected_actions_are_physical is None:
+                selected_actions_are_physical = bool(action_is_physical)
+            elif bool(action_is_physical) != bool(selected_actions_are_physical):
+                continue
 
             times = np.asarray(
                 record.get("times", ep.get("times", np.arange(len(states)))),
@@ -317,10 +345,7 @@ def _collect_trajectory_arrays(
 
     state_dim = all_trajs[0][0].shape[1]
     action_dim = all_trajs[0][1].shape[1]
-    max_t = max(
-        max(states.shape[0], actions.shape[0], times.shape[0])
-        for states, actions, times in all_trajs
-    )
+    max_t = max(states.shape[0] for states, actions, times in all_trajs)
 
     S = np.full((len(all_trajs), max_t, state_dim), np.nan, dtype=np.float64)
     A = np.full((len(all_trajs), max_t, action_dim), np.nan, dtype=np.float64)
@@ -335,18 +360,16 @@ def _collect_trajectory_arrays(
         idx = valid_count
         valid_count += 1
 
-        state_steps = states.shape[0]
-        action_steps = actions.shape[0]
-        time_steps = times.shape[0]
-
-        S[idx, :state_steps, :] = states
-        A[idx, :action_steps, :] = actions
-        T[idx, :time_steps] = times
+        n = min(states.shape[0], actions.shape[0], times.shape[0])
+        S[idx, :n, :] = states[:n]
+        A[idx, :n, :] = actions[:n]
+        T[idx, :n] = times[:n]
 
     if valid_count == 0:
         print("No trajectories with consistent dimensions.")
         return None, None, None, metadata
 
+    metadata["_plot_actions_are_physical"] = bool(selected_actions_are_physical)
     return S[:valid_count], A[:valid_count], T[:valid_count], metadata
 
 
@@ -439,22 +462,56 @@ def plot_state_trajectories(
     print(f"Saved {out_path}")
 
 
+def _physical_action_plot_label(name: str) -> str:
+    """Human-readable axis label for physical action channels."""
+    if name == "omega_rad_s":
+        return "Spindle speed (rpm)"
+    if name == "ap_mm":
+        return "Axial depth of cut ap (mm)"
+    if name == "ae_mm":
+        return "Radial immersion ae (mm)"
+    return name
+
+
+def _normalized_action_plot_label(name: str, dim: int) -> str:
+    """Human-readable axis label for normalized action channels."""
+    if name == "omega_rad_s":
+        return "u_omega (normalized)"
+    if name == "ap_mm":
+        return "u_ap (normalized)"
+    if name == "ae_mm":
+        return "u_ae (normalized)"
+    return f"u_{dim} (normalized)"
+
+
+def _maybe_convert_action_channel_for_plot(
+    values: np.ndarray,
+    *,
+    action_name: str,
+    actions_are_physical: bool,
+) -> np.ndarray:
+    """Convert omega from rad/s to rpm for plotting; leave other channels unchanged."""
+    if actions_are_physical and action_name == "omega_rad_s":
+        return omega_to_rpm(values)
+    return values
+
+
 def plot_action_trajectories(
     A: np.ndarray,
     T: np.ndarray | None,
     metadata: dict,
     out_dir: Path,
 ) -> None:
-    """Plot physical policy actions [omega, ac] with their bounds."""
+    """Plot policy actions with correct face-milling labels and bounds."""
     action_dim = A.shape[2]
     t_grid, x_label = _time_grid(T, A.shape[1])
+    actions_are_physical_for_plot = bool(metadata.get("_plot_actions_are_physical", False))
+    names = physical_action_names(metadata, n_dims=action_dim)
 
-    if action_dim == 2 and metadata.get("physical_actions_are_rad_s_mm", False):
-        action_labels = ["Spindle speed (rpm)", "Depth of cut ac (mm)"]
-    elif action_dim == 2:
-        action_labels = ["u_omega (norm)", "u_ac (norm)"]
+    if actions_are_physical_for_plot:
+        action_labels = [_physical_action_plot_label(name) for name in names]
     else:
-        action_labels = [f"action{idx}" for idx in range(action_dim)]
+        action_labels = [_normalized_action_plot_label(name, idx) for idx, name in enumerate(names)]
 
     physical_low = metadata.get("physical_action_low", None)
     physical_high = metadata.get("physical_action_high", None)
@@ -476,15 +533,13 @@ def plot_action_trajectories(
 
     for dim in range(action_dim):
         ax = axes[dim]
+        action_name = names[dim] if dim < len(names) else f"action_{dim}"
 
-        series = A[:, :, dim].copy()
-        use_rpm = (
-            dim == 0
-            and action_dim >= 1
-            and metadata.get("physical_actions_are_rad_s_mm", False)
+        series = _maybe_convert_action_channel_for_plot(
+            A[:, :, dim].copy(),
+            action_name=action_name,
+            actions_are_physical=actions_are_physical_for_plot,
         )
-        if use_rpm:
-            series = omega_to_rpm(series)
 
         mean_a, std_a, valid = _nan_mean_std(series)
         band = MC_BAND_STD_MULT * std_a
@@ -497,32 +552,166 @@ def plot_action_trajectories(
         )
         ax.plot(t_grid[valid], mean_a[valid], lw=1.5)
 
-        if (
-            physical_low is not None
-            and physical_high is not None
-            and dim < len(physical_low)
-            and dim < len(physical_high)
-        ):
-            low = float(physical_low[dim])
-            high = float(physical_high[dim])
-            if use_rpm:
-                low = float(omega_to_rpm(low))
-                high = float(omega_to_rpm(high))
-            ax.axhline(low, linestyle="--", linewidth=1)
-            ax.axhline(high, linestyle="--", linewidth=1)
+        if actions_are_physical_for_plot:
+            if (
+                physical_low is not None
+                and physical_high is not None
+                and dim < len(physical_low)
+                and dim < len(physical_high)
+            ):
+                low = float(physical_low[dim])
+                high = float(physical_high[dim])
+                if action_name == "omega_rad_s":
+                    low = float(omega_to_rpm(low))
+                    high = float(omega_to_rpm(high))
+                ax.axhline(low, linestyle="--", linewidth=1)
+                ax.axhline(high, linestyle="--", linewidth=1)
+        else:
+            ax.axhline(-1.0, linestyle="--", linewidth=1)
+            ax.axhline(+1.0, linestyle="--", linewidth=1)
 
         ax.set_ylabel(action_labels[dim])
         ax.grid(True, alpha=0.3)
 
     axes[-1].set_xlabel(x_label)
 
-    fig.suptitle(
-        f"Evaluation trajectories: physical control actions "
-        f"(spindle {RPM_MIN:.0f}-{RPM_MAX:.0f} rpm)"
-    )
+    title_mode = "physical control actions" if actions_are_physical_for_plot else "normalized control actions"
+    fig.suptitle(f"Evaluation trajectories: {title_mode} (mean ± {MC_BAND_STD_MULT:.0f}σ)")
     fig.tight_layout()
 
     out_path = out_dir / "trajectory_actions_physical.png"
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+    print(f"Saved {out_path}")
+
+
+PROCESS_PLOT_SPECS = [
+    ("cutter_x", "Cutter x-position (m)"),
+    ("cutter_y", "Milling line y-position (m)"),
+    ("feed_progress", "Feed progress"),
+    ("omega_rpm", "Spindle speed (rpm)"),
+    ("ap_mm", "Axial depth of cut ap (mm)"),
+    ("ae_mm", "Radial immersion ae (mm)"),
+    ("mean_chip_mm", "Mean chip thickness (mm)"),
+    ("max_chip_mm", "Max chip thickness (mm)"),
+]
+
+
+def _process_dict_from_episode(ep: dict) -> dict:
+    record = primary_episode_record(ep)
+    process = record.get("process", ep.get("process", {}))
+    return process if isinstance(process, dict) else {}
+
+
+def _collect_process_arrays(
+    traj_dir: Path,
+    seeds: list[int],
+) -> tuple[np.ndarray | None, np.ndarray | None, list[str], dict]:
+    """Collect process histories saved by eval_policy.py into padded arrays."""
+    data = load_trajectories(traj_dir, seeds)
+    if not data:
+        return None, None, [], {}
+
+    metadata: dict = {}
+    records: list[tuple[dict, np.ndarray]] = []
+    available_keys: set[str] = set()
+
+    for seed in sorted(data.keys()):
+        for ep in data[seed]:
+            if not metadata and ep.get("metadata"):
+                metadata = dict(ep["metadata"])
+            record = primary_episode_record(ep)
+            process = _process_dict_from_episode(ep)
+            if not process:
+                continue
+            times = np.asarray(record.get("times", ep.get("times", [])), dtype=np.float64)
+            if times.size == 0:
+                continue
+            non_empty = {
+                key for key, values in process.items()
+                if _non_empty_sequence(values) and np.asarray(values, dtype=np.float64).size > 0
+            }
+            if non_empty:
+                available_keys.update(non_empty)
+                records.append((process, times))
+
+    keys = [key for key, _label in PROCESS_PLOT_SPECS if key in available_keys]
+    if not records or not keys:
+        return None, None, [], metadata
+
+    max_t = max(min(len(times), max(len(process.get(key, [])) for key in keys)) for process, times in records)
+    P = np.full((len(records), max_t, len(keys)), np.nan, dtype=np.float64)
+    T = np.full((len(records), max_t), np.nan, dtype=np.float64)
+
+    valid_count = 0
+    for process, times in records:
+        n = min(len(times), max_t)
+        if n <= 0:
+            continue
+        idx = valid_count
+        valid_count += 1
+        T[idx, :n] = times[:n]
+        for key_index, key in enumerate(keys):
+            values = np.asarray(process.get(key, []), dtype=np.float64).reshape(-1)
+            m = min(n, values.size)
+            if m > 0:
+                P[idx, :m, key_index] = values[:m]
+
+    if valid_count == 0:
+        return None, None, [], metadata
+
+    return P[:valid_count], T[:valid_count], keys, metadata
+
+
+def plot_process_trajectories(
+    traj_dir: Path,
+    out_dir: Path,
+    seeds: list[int],
+) -> None:
+    """Plot saved face-milling process signals, if present in eval outputs."""
+    P, T, keys, _metadata = _collect_process_arrays(traj_dir, seeds)
+    if P is None or T is None or not keys:
+        print("No process histories found for plotting.")
+        return
+
+    label_lookup = dict(PROCESS_PLOT_SPECS)
+    t_grid, x_label = _time_grid(T, P.shape[1])
+    n_channels = P.shape[2]
+    n_cols = 2
+    n_rows = int(np.ceil(n_channels / n_cols))
+
+    fig, axes = plt.subplots(
+        n_rows,
+        n_cols,
+        figsize=(10, 3.0 * n_rows),
+        sharex=True,
+    )
+    axes = np.asarray(axes).reshape(-1)
+
+    for dim, key in enumerate(keys):
+        ax = axes[dim]
+        mean_p, std_p, valid = _nan_mean_std(P[:, :, dim])
+        band = MC_BAND_STD_MULT * std_p
+
+        ax.fill_between(
+            t_grid[valid],
+            mean_p[valid] - band[valid],
+            mean_p[valid] + band[valid],
+            alpha=0.3,
+        )
+        ax.plot(t_grid[valid], mean_p[valid], lw=1.5)
+        ax.set_ylabel(label_lookup.get(key, key))
+        ax.grid(True, alpha=0.3)
+
+    for ax in axes[n_channels:]:
+        ax.axis("off")
+
+    axes[min(n_channels - 1, len(axes) - 1)].set_xlabel(x_label)
+    fig.suptitle(f"Evaluation trajectories: face-milling process signals (mean ± {MC_BAND_STD_MULT:.0f}σ)")
+    fig.tight_layout()
+
+    out_path = out_dir / "trajectory_process_signals.png"
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
 
@@ -552,6 +741,7 @@ def plot_trajectory_summary(
 
     plot_state_trajectories(S, T, metadata, out_dir)
     plot_action_trajectories(A, T, metadata, out_dir)
+    plot_process_trajectories(traj_dir, out_dir, available)
 
 
 def _resolve_plot_seeds(

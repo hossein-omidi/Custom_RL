@@ -18,6 +18,7 @@ It checks that:
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 from custom_rl import DEFAULT_PLOT_DIR, register_envs
+from custom_rl.plants import f_nonlinear2_face_milling as fm
 from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm, rpm_to_omega
 
 ENV_ID = "CustomODEPlate-v0"
@@ -117,6 +119,102 @@ def _as_2d_or_none(values: list[np.ndarray]) -> np.ndarray | None:
     return np.asarray(values, dtype=np.float64)
 
 
+def _finite_or_nan(value: Any) -> float:
+    """Convert scalar-like values to finite float, otherwise NaN."""
+    try:
+        out = float(value)
+    except Exception:
+        return float("nan")
+    return out if np.isfinite(out) else float("nan")
+
+
+def _last_force_diagnostics() -> dict[str, Any]:
+    """Return one compact regenerative-force diagnostic snapshot.
+
+    The face-milling force module computes the regenerative chip thickness from
+    the delayed state x(t-tau). These diagnostics are the direct evidence that
+    the delayed path is active: after one tooth period, delta_rel_mm should be
+    nonzero whenever the plate has nonzero vibration.
+    """
+    fi = fm.get_last_force_info() if hasattr(fm, "get_last_force_info") else None
+
+    state_hist = getattr(fm, "_state_history", [])
+    kin_hist = getattr(fm, "_kinematic_history", [])
+
+    out: dict[str, Any] = {
+        "state_history_len": int(len(state_hist)) if isinstance(state_hist, list) else 0,
+        "kinematic_history_len": int(len(kin_hist)) if isinstance(kin_hist, list) else 0,
+        "tau_s": float("nan"),
+        "omega_rpm": float("nan"),
+        "ap_mm": float("nan"),
+        "ae_mm": float("nan"),
+        "engaged_teeth": 0,
+        "delta_rel_x_mm": float("nan"),
+        "delta_rel_y_mm": float("nan"),
+        "delta_rel_z_mm": float("nan"),
+        "delta_rel_norm_mm": float("nan"),
+        "rel_now_z_mm": float("nan"),
+        "rel_delay_z_mm": float("nan"),
+        "max_chip_raw_mm": float("nan"),
+        "max_chip_eff_mm": float("nan"),
+        "mean_chip_eff_mm": float("nan"),
+        "Fz_total_N": float("nan"),
+        "F_total_norm_N": float("nan"),
+    }
+
+    if fi is None:
+        return out
+
+    delta_rel = np.asarray(getattr(fi, "delta_rel_mm", np.full(3, np.nan)), dtype=np.float64).reshape(-1)
+    rel_now = np.asarray(getattr(fi, "rel_now_mm", np.full(3, np.nan)), dtype=np.float64).reshape(-1)
+    rel_delay = np.asarray(getattr(fi, "rel_delay_mm", np.full(3, np.nan)), dtype=np.float64).reshape(-1)
+    chip_raw = np.asarray(getattr(fi, "chip_raw_mm", []), dtype=np.float64).reshape(-1)
+    chip_eff = np.asarray(getattr(fi, "chip_eff_mm", []), dtype=np.float64).reshape(-1)
+    engagement = np.asarray(getattr(fi, "engagement", []), dtype=bool).reshape(-1)
+    F_total = np.asarray(getattr(fi, "F_total_N", np.full(3, np.nan)), dtype=np.float64).reshape(-1)
+
+    if delta_rel.size >= 3:
+        out["delta_rel_x_mm"] = _finite_or_nan(delta_rel[0])
+        out["delta_rel_y_mm"] = _finite_or_nan(delta_rel[1])
+        out["delta_rel_z_mm"] = _finite_or_nan(delta_rel[2])
+        out["delta_rel_norm_mm"] = _finite_or_nan(np.linalg.norm(delta_rel[:3]))
+    if rel_now.size >= 3:
+        out["rel_now_z_mm"] = _finite_or_nan(rel_now[2])
+    if rel_delay.size >= 3:
+        out["rel_delay_z_mm"] = _finite_or_nan(rel_delay[2])
+    if chip_raw.size:
+        out["max_chip_raw_mm"] = _finite_or_nan(np.max(chip_raw))
+    if chip_eff.size:
+        out["max_chip_eff_mm"] = _finite_or_nan(np.max(chip_eff))
+        out["mean_chip_eff_mm"] = _finite_or_nan(np.mean(chip_eff))
+    if F_total.size >= 3:
+        out["Fz_total_N"] = _finite_or_nan(F_total[2])
+        out["F_total_norm_N"] = _finite_or_nan(np.linalg.norm(F_total[:3]))
+
+    out["tau_s"] = _finite_or_nan(getattr(fi, "tau", np.nan))
+    out["omega_rpm"] = _finite_or_nan(getattr(fi, "n_rpm", np.nan))
+    out["ap_mm"] = _finite_or_nan(getattr(fi, "ap_mm", np.nan))
+    out["ae_mm"] = _finite_or_nan(getattr(fi, "ae_mm", np.nan))
+    out["engaged_teeth"] = int(np.count_nonzero(engagement))
+    return out
+
+
+def _diag_series(diags: list[dict[str, Any]], key: str) -> np.ndarray:
+    return np.asarray([_finite_or_nan(d.get(key, np.nan)) for d in diags], dtype=np.float64)
+
+
+def _json_safe(value: Any) -> Any:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, dict):
+        return {str(k): _json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe(v) for v in value]
+    return value
+
+
 def run_rollout(
     env: gym.Env,
     max_steps: int,
@@ -140,6 +238,7 @@ def run_rollout(
     terminated_flags: list[bool] = []
     truncated_flags: list[bool] = []
     reward_terms_hist: list[dict[str, Any]] = []
+    force_diagnostics_hist: list[dict[str, Any]] = []
 
     print("Reset info:", info)
 
@@ -167,6 +266,10 @@ def run_rollout(
         if "reward_terms" in info:
             reward_terms_hist.append(dict(info["reward_terms"]))
 
+        diag = _last_force_diagnostics()
+        diag["t_env_s"] = float(info.get("t", times[-1] if times else np.nan))
+        force_diagnostics_hist.append(diag)
+
         if terminated or truncated:
             print(f"Episode ended at step {step + 1}.")
             print("  terminated:", terminated)
@@ -191,7 +294,140 @@ def run_rollout(
         "terminated_flags": np.asarray(terminated_flags, dtype=bool),
         "truncated_flags": np.asarray(truncated_flags, dtype=bool),
         "reward_terms": reward_terms_hist,
+        "force_diagnostics": force_diagnostics_hist,
     }
+
+
+def plot_regeneration_diagnostics(
+    rollout: dict[str, np.ndarray | list[dict[str, Any]] | None],
+    *,
+    plant: Any,
+    out_dir: Path,
+    title_suffix: str,
+) -> dict[str, Any]:
+    """Save plots and JSON summary proving delay/regeneration activity."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    times = np.asarray(rollout["times"], dtype=np.float64)
+    w_sensor = rollout.get("w_sensor")
+    diags_raw = rollout.get("force_diagnostics")
+    diags = diags_raw if isinstance(diags_raw, list) else []
+
+    summary: dict[str, Any] = {
+        "steps_recorded": int(times.size),
+        "final_time_s": float(times[-1]) if times.size else float("nan"),
+        "regeneration_diagnostics_available": bool(len(diags) > 0),
+    }
+
+    if times.size == 0 or not diags:
+        with open(out_dir / "pretrain_regeneration_summary.json", "w", encoding="utf-8") as f:
+            json.dump(_json_safe(summary), f, indent=2)
+        return summary
+
+    n = min(times.size, len(diags))
+    times = times[:n]
+    diags = diags[:n]
+
+    tau = _diag_series(diags, "tau_s")
+    delta_x = _diag_series(diags, "delta_rel_x_mm")
+    delta_y = _diag_series(diags, "delta_rel_y_mm")
+    delta_z = _diag_series(diags, "delta_rel_z_mm")
+    delta_norm = _diag_series(diags, "delta_rel_norm_mm")
+    max_chip_eff = _diag_series(diags, "max_chip_eff_mm")
+    max_chip_raw = _diag_series(diags, "max_chip_raw_mm")
+    Fz = _diag_series(diags, "Fz_total_N")
+    engaged = _diag_series(diags, "engaged_teeth")
+    state_hist_len = _diag_series(diags, "state_history_len")
+    kin_hist_len = _diag_series(diags, "kinematic_history_len")
+
+    max_abs_w = np.full(n, np.nan, dtype=np.float64)
+    if isinstance(w_sensor, np.ndarray) and w_sensor.size > 0:
+        w_arr = np.asarray(w_sensor, dtype=np.float64)[:n]
+        if w_arr.ndim == 2 and w_arr.shape[0] > 0:
+            max_abs_w[: w_arr.shape[0]] = np.max(np.abs(w_arr), axis=1)
+
+    finite_delta = np.isfinite(delta_norm)
+    finite_tau = np.isfinite(tau)
+    # A practical proof that regenerative displacement was actually evaluated:
+    # after one tooth period, the current-minus-delayed relative displacement is nonzero.
+    regen_active = finite_delta & finite_tau & (times >= tau) & (delta_norm > 1e-12)
+    first_regen_time = float(times[np.argmax(regen_active)]) if np.any(regen_active) else float("nan")
+
+    w_limit = getattr(plant, "w_limit", None)
+    unstable_idx = None
+    if w_limit is not None and np.isfinite(w_limit) and np.any(np.isfinite(max_abs_w)):
+        idxs = np.where(max_abs_w > float(w_limit))[0]
+        unstable_idx = int(idxs[0]) if idxs.size else None
+
+    summary.update({
+        "max_abs_w_sensor_m": _finite_or_nan(np.nanmax(max_abs_w)) if np.any(np.isfinite(max_abs_w)) else float("nan"),
+        "w_limit_m": _finite_or_nan(w_limit),
+        "max_delta_rel_norm_mm": _finite_or_nan(np.nanmax(delta_norm)) if np.any(np.isfinite(delta_norm)) else float("nan"),
+        "max_abs_delta_rel_z_mm": _finite_or_nan(np.nanmax(np.abs(delta_z))) if np.any(np.isfinite(delta_z)) else float("nan"),
+        "max_chip_eff_mm": _finite_or_nan(np.nanmax(max_chip_eff)) if np.any(np.isfinite(max_chip_eff)) else float("nan"),
+        "max_chip_raw_mm": _finite_or_nan(np.nanmax(max_chip_raw)) if np.any(np.isfinite(max_chip_raw)) else float("nan"),
+        "max_abs_Fz_total_N": _finite_or_nan(np.nanmax(np.abs(Fz))) if np.any(np.isfinite(Fz)) else float("nan"),
+        "regeneration_active_steps": int(np.count_nonzero(regen_active)),
+        "first_regeneration_time_s": first_regen_time,
+        "final_state_history_len": int(state_hist_len[-1]) if state_hist_len.size and np.isfinite(state_hist_len[-1]) else 0,
+        "final_kinematic_history_len": int(kin_hist_len[-1]) if kin_hist_len.size and np.isfinite(kin_hist_len[-1]) else 0,
+        "first_instability_time_s": float(times[unstable_idx]) if unstable_idx is not None else float("nan"),
+        "instability_detected_from_w_limit": bool(unstable_idx is not None),
+    })
+
+    fig, axes = plt.subplots(5, 1, figsize=(10, 13), sharex=True)
+
+    axes[0].plot(times, max_abs_w, lw=1.4, label="max |w_sensor|")
+    if w_limit is not None and np.isfinite(w_limit):
+        axes[0].axhline(float(w_limit), linestyle="--", linewidth=1.0, label="w_limit")
+    axes[0].set_ylabel("max |w| (m)")
+    axes[0].legend(loc="best")
+    axes[0].grid(True, alpha=0.3)
+
+    axes[1].plot(times, delta_x, lw=1.0, label="Δrel x")
+    axes[1].plot(times, delta_y, lw=1.0, label="Δrel y")
+    axes[1].plot(times, delta_z, lw=1.2, label="Δrel z")
+    axes[1].plot(times, delta_norm, lw=1.2, label="||Δrel||")
+    axes[1].set_ylabel("regen disp. (mm)")
+    axes[1].legend(loc="best", ncol=2)
+    axes[1].grid(True, alpha=0.3)
+
+    axes[2].plot(times, max_chip_raw, lw=1.2, label="max raw chip h")
+    axes[2].plot(times, max_chip_eff, lw=1.2, label="max effective chip h_eff")
+    axes[2].set_ylabel("chip (mm)")
+    axes[2].legend(loc="best")
+    axes[2].grid(True, alpha=0.3)
+
+    axes[3].plot(times, Fz, lw=1.2, label="Fz total")
+    axes[3].set_ylabel("Fz (N)")
+    axes[3].legend(loc="best")
+    axes[3].grid(True, alpha=0.3)
+
+    axes[4].plot(times, tau, lw=1.2, label="tooth delay τ")
+    axes[4].plot(times, engaged, lw=1.0, label="engaged teeth")
+    axes[4].plot(times, state_hist_len, lw=1.0, label="state history length")
+    axes[4].plot(times, kin_hist_len, lw=1.0, label="kinematic history length")
+    axes[4].set_xlabel("Time (s)")
+    axes[4].set_ylabel("diagnostics")
+    axes[4].legend(loc="best", ncol=2)
+    axes[4].grid(True, alpha=0.3)
+
+    if np.isfinite(first_regen_time):
+        for ax in axes:
+            ax.axvline(first_regen_time, linestyle=":", linewidth=1.0)
+    if unstable_idx is not None:
+        for ax in axes:
+            ax.axvline(times[unstable_idx], linestyle="--", linewidth=1.0)
+
+    fig.suptitle(f"Regenerative-delay diagnostics ({title_suffix})")
+    fig.tight_layout()
+    fig.savefig(out_dir / "pretrain_regeneration_diagnostics.png", dpi=150)
+    plt.close(fig)
+
+    with open(out_dir / "pretrain_regeneration_summary.json", "w", encoding="utf-8") as f:
+        json.dump(_json_safe(summary), f, indent=2)
+
+    return summary
 
 
 def plot_rollout(
@@ -372,10 +608,11 @@ def plot_rollout(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Simple face-milling plate env smoke test.")
-    parser.add_argument("--reward", default="dense", choices=["dense", "sparse", "quadratic"])
-    parser.add_argument("--steps", type=int, default=5000)
+    parser.add_argument("--reward", default="dense", choices=["dense", "productive", "sparse", "quadratic"])
+    parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dt", type=float, default=0.0001)
+    parser.add_argument("--dt", type=float, default=0.001, help="RK4 integration substep [s].")
+    parser.add_argument("--n-substeps", type=int, default=1, help="Number of RK4 substeps per environment/control step.")
     parser.add_argument(
         "--max-episode-steps",
         type=int,
@@ -402,6 +639,19 @@ def main() -> None:
         help="Sample milling line y0 on each reset.",
     )
     parser.add_argument("--y0", type=float, default=None, help="Fixed milling line y0 [m].")
+    parser.add_argument("--rpm-min", type=float, default=None, help="Override plant minimum spindle speed [rpm].")
+    parser.add_argument("--rpm-max", type=float, default=None, help="Override plant maximum spindle speed [rpm].")
+    parser.add_argument("--ap-min", type=float, default=None, help="Override plant minimum axial depth [mm].")
+    parser.add_argument("--ap-max", type=float, default=None, help="Override plant maximum axial depth [mm].")
+    parser.add_argument("--ae-default", type=float, default=None, help="Override default radial immersion ae [mm].")
+    parser.add_argument("--feed-per-tooth-mm", type=float, default=None, help="Override feed per tooth [mm/tooth].")
+    parser.add_argument("--w-limit", type=float, default=None, help="Override physical displacement termination limit [m].")
+    parser.add_argument("--w-obs-scale", type=float, default=None, help="Override observation displacement scale [m].")
+    parser.add_argument("--wdot-limit", type=float, default=None, help="Override velocity observation/diagnostic limit [m/s].")
+    parser.add_argument("--wdot-obs-scale", type=float, default=None, help="Override velocity observation scale [m/s].")
+    parser.add_argument("--modal-damping-ratio", type=float, default=None, help="Override modal damping ratio.")
+    parser.add_argument("--initial-eta-std", type=float, default=0.0, help="Random initial modal displacement std [m]. Useful to excite regeneration.")
+    parser.add_argument("--initial-etad-std", type=float, default=0.0, help="Random initial modal velocity std [m/s].")
     args = parser.parse_args()
 
     register_envs()
@@ -409,13 +659,35 @@ def main() -> None:
     env_kwargs: dict[str, Any] = {
         "reward_id": args.reward,
         "dt": args.dt,
-        "n_substeps": 1,
+        "n_substeps": args.n_substeps,
         "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
         "randomize_y0": args.randomize_y0,
         "control_ae": args.control_ae,
     }
+    optional_env_overrides = {
+        "omega_min": None if args.rpm_min is None else float(rpm_to_omega(args.rpm_min)),
+        "omega_max": None if args.rpm_max is None else float(rpm_to_omega(args.rpm_max)),
+        "ap_min": args.ap_min,
+        "ap_max": args.ap_max,
+        "ae_default": args.ae_default,
+        "feed_per_tooth_mm": args.feed_per_tooth_mm,
+        "w_limit": args.w_limit,
+        "w_obs_scale": args.w_obs_scale,
+        "wdot_limit": args.wdot_limit,
+        "wdot_obs_scale": args.wdot_obs_scale,
+        "modal_damping_ratio": args.modal_damping_ratio,
+        "initial_eta_std": args.initial_eta_std,
+        "initial_etad_std": args.initial_etad_std,
+    }
+    for key, value in optional_env_overrides.items():
+        if value is not None:
+            env_kwargs[key] = value
+
     if args.max_episode_steps > 0:
         env_kwargs["max_episode_steps"] = args.max_episode_steps
+
+    if args.n_substeps <= 0:
+        raise ValueError("--n-substeps must be positive.")
 
     env = gym.make(ENV_ID, **env_kwargs)
     plant = env.unwrapped.plant
@@ -439,9 +711,22 @@ def main() -> None:
     print("Observation space:", env.observation_space)
     print("Action space:", env.action_space)
     print(
-        f"Spindle speed range: {RPM_MIN:.0f} - {RPM_MAX:.0f} rpm "
+        f"Spindle speed range: {omega_to_rpm(plant.omega_min):.0f} - "
+        f"{omega_to_rpm(plant.omega_max):.0f} rpm "
         f"({plant.omega_min:.2f} - {plant.omega_max:.2f} rad/s)"
     )
+    print(
+        f"Integrator: RK4 dt={args.dt:g} s, n_substeps={args.n_substeps}, "
+        f"environment/control step={args.dt * args.n_substeps:g} s"
+    )
+    tau_min = 2.0 * np.pi / (max(int(getattr(plant, "N", 1)), 1) * max(float(plant.omega_max), 1e-12))
+    print(f"Minimum one-tooth regenerative delay at omega_max: {tau_min:.6g} s")
+    if args.dt >= tau_min:
+        print(
+            "WARNING: dt is not smaller than the minimum tooth delay. "
+            "High-rpm regenerative checks may fail or be invalid. "
+            f"Use dt <= {0.25 * tau_min:.3g} s for a safer check."
+        )
     ap_min, ap_max = _depth_bounds_from_plant(plant)
     print(f"Axial depth ap range: {ap_min:.4g} - {ap_max:.4g} mm")
     if action_low.size >= 3:
@@ -463,13 +748,23 @@ def main() -> None:
         print("Fixed normalized action:", fixed_action)
 
     reset_options = {"y0": args.y0} if args.y0 is not None else None
-    rollout = run_rollout(
-        env,
-        max_steps=args.steps,
-        seed=args.seed,
-        fixed_action=fixed_action,
-        reset_options=reset_options,
-    )
+    try:
+        rollout = run_rollout(
+            env,
+            max_steps=args.steps,
+            seed=args.seed,
+            fixed_action=fixed_action,
+            reset_options=reset_options,
+        )
+    except RuntimeError as exc:
+        if "Regenerative delay time falls inside the current RK substep" in str(exc):
+            print("\nRegenerative-delay resolution error detected.")
+            print("This is not a random failure: the tooth delay is smaller than your RK4 dt.")
+            print(f"Current dt: {args.dt:g} s")
+            print(f"Suggested dt for this plant upper speed: <= {0.25 * tau_min:.3g} s")
+            print("Example for high-speed checks: --dt 0.0001 --n-substeps 10")
+        env.close()
+        raise
 
     observations = np.asarray(rollout["observations"], dtype=np.float64)
     rewards = np.asarray(rollout["rewards"], dtype=np.float64)
@@ -487,12 +782,25 @@ def main() -> None:
         if fixed_action is not None and u_phys_applied is not None
         else "random policy"
     )
-    plot_rollout(rollout, plant=plant, out_dir=Path(args.out_dir), title_suffix=title_suffix)
+    out_dir = Path(args.out_dir)
+    plot_rollout(rollout, plant=plant, out_dir=out_dir, title_suffix=title_suffix)
+    regen_summary = plot_regeneration_diagnostics(
+        rollout,
+        plant=plant,
+        out_dir=out_dir,
+        title_suffix=title_suffix,
+    )
 
     env.close()
 
     print("Rollout test finished successfully.")
     print("Total reward:", float(np.sum(rewards)))
+    print("Regeneration diagnostic summary:")
+    print("  active steps:", regen_summary.get("regeneration_active_steps"))
+    print("  first regeneration time [s]:", regen_summary.get("first_regeneration_time_s"))
+    print("  max ||delta_rel|| [mm]:", regen_summary.get("max_delta_rel_norm_mm"))
+    print("  max |w_sensor| [m]:", regen_summary.get("max_abs_w_sensor_m"))
+    print("  instability detected by w_limit:", regen_summary.get("instability_detected_from_w_limit"))
     if rollout["reward_terms"]:
         print("Last-step reward terms:", rollout["reward_terms"][-1])
 

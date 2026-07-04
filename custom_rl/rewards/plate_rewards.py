@@ -18,13 +18,13 @@ Default face-milling plant action:
 Optional if the plant was created with control_ae=True:
     u = [u_omega, u_ap, u_ae] in [-1, 1]^3
 
-The reward still relies on physical displacement/velocity signals provided in
-``info``:
+The reward relies strictly on physical displacement/velocity signals provided
+in ``info``:
     info["w_sensor"], info["wdot_sensor"]
 
-If those keys are absent, the module falls back to the old modal-state behavior
-for backward compatibility.  For the updated face-milling plant, it is better to
-include w_sensor and wdot_sensor in the step info whenever possible.
+By default, missing physical sensor signals are treated as a wiring error.  This
+prevents silent use of modal coordinates as if they were physical sensor
+responses.
 """
 
 from __future__ import annotations
@@ -53,18 +53,20 @@ def _physical_vibration_cost(
     wdot_scale: float,
     w_clip: float | None = None,
     wdot_clip: float | None = None,
+    require_physical_info: bool = True,
 ) -> tuple[float, float, str]:
     """
     Return (displacement_cost, velocity_cost, source).
 
-    Preferred source:
+    Required source by default:
         info["w_sensor"], info["wdot_sensor"]
 
-    Backward-compatible fallback:
+    Optional fallback, only when require_physical_info=False:
         x_next modal coordinates [eta, eta_dot]
 
-    The fallback is kept only to avoid breaking old environments.  The updated
-    face-milling plant should ideally pass physical sensor signals in info.
+    For this face-milling project, keep require_physical_info=True so the reward
+    remains synchronized with observation and termination, both of which are
+    based on physical sensor displacement/velocity.
     """
     x_next = np.asarray(x_next, dtype=np.float64).reshape(-1)
 
@@ -72,8 +74,13 @@ def _physical_vibration_cost(
         w_sensor = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
         wdot_sensor = np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1)
         source = "physical_info"
+    elif require_physical_info:
+        raise KeyError(
+            "Reward requires physical sensor signals info['w_sensor'] and "
+            "info['wdot_sensor']; refusing modal-state fallback."
+        )
     else:
-        # Backward compatibility with older plant/reward wiring.
+        # Legacy-only fallback. Do not use for the current face-milling plant.
         w_sensor = x_next[0::2]
         wdot_sensor = x_next[1::2]
         source = "modal_fallback"
@@ -104,12 +111,12 @@ class DenseProductivePlateReward:
     The second physical action is axial depth of cut:
         ap [mm]
 
-    For the default 2D action, productivity is proportional to a normalized
-    spindle-speed score times a normalized axial-depth score:
+    For the default 2D action, productivity is a normalized material-removal
+    proxy proportional to spindle speed and axial depth:
         productivity_score = omega_score * ap_score
 
     If a 3D action is used, the third action is radial immersion/depth ae [mm],
-    and productivity can include ae as a material-removal-rate proxy:
+    and productivity can include ae in the same material-removal proxy:
         productivity_score = omega_score * ap_score * ae_score
     """
 
@@ -120,10 +127,10 @@ class DenseProductivePlateReward:
         action_weight: float = 0.0,
         productivity_weight: float = 10.0,
         negative_ap_weight: float = 2.0,
-        omega_cost_weight: float = 2.0,
+        omega_cost_weight: float = 3.0,
         ap_action_weight: float = 0.0,
-        w_scale: float = 1e-3,
-        wdot_scale: float = 1e-2,
+        w_scale: float = 1e-4,
+        wdot_scale: float = 1.0,
         omega_min: float = OMEGA_MIN_RAD_S,
         omega_max: float = OMEGA_MAX_RAD_S,
         ap_min: float = 0.0,
@@ -138,6 +145,7 @@ class DenseProductivePlateReward:
         pass_completion_bonus: float = 500.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
+        require_physical_info: bool = True,
         # Backward-compatible aliases for old configs.
         ac_min: float | None = None,
         ac_max: float | None = None,
@@ -181,8 +189,11 @@ class DenseProductivePlateReward:
 
         self.w_scale = float(w_scale)
         self.wdot_scale = float(wdot_scale)
-        self.w_clip = self.w_scale if w_clip is None else float(w_clip)
-        self.wdot_clip = self.wdot_scale if wdot_clip is None else float(wdot_clip)
+        # Do not clip vibration costs by default.  Clipping at the scale value
+        # hides the difference between moderate chatter and severe chatter.
+        self.w_clip = None if w_clip is None else float(w_clip)
+        self.wdot_clip = None if wdot_clip is None else float(wdot_clip)
+        self.require_physical_info = bool(require_physical_info)
 
         self.omega_min = float(omega_min)
         self.omega_max = float(omega_max)
@@ -258,6 +269,7 @@ class DenseProductivePlateReward:
             self.wdot_scale,
             w_clip=self.w_clip,
             wdot_clip=self.wdot_clip,
+            require_physical_info=self.require_physical_info,
         )
         if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
             return -float(self.termination_penalty)
@@ -267,7 +279,10 @@ class DenseProductivePlateReward:
         omega_score = (omega - self.omega_min) / (self.omega_max - self.omega_min)
         omega_score = float(np.clip(omega_score, 0.0, 1.0))
 
-        ap_score = max(ap, 0.0) / self.ap_productive_target
+        # Normalized MRR proxy: for fixed feed/tooth and fixed cutter diameter,
+        # face-milling material removal is proportional to omega * ap * ae.
+        # Use the full admissible ap range instead of saturating at a target.
+        ap_score = (ap - self.ap_min) / max(self.ap_max - self.ap_min, 1e-12)
         ap_score = float(np.clip(ap_score, 0.0, 1.0))
 
         if has_ae_action and self.include_ae_in_productivity:
@@ -276,8 +291,8 @@ class DenseProductivePlateReward:
         else:
             ae_score = 1.0
 
-        # MRR proxy for face milling.  With fixed ae, this reduces to the old
-        # omega*depth productivity structure.
+        # Normalized MRR proxy for face milling. With fixed ae, this reduces
+        # to the omega*ap tradeoff.
         productivity_score = omega_score * ap_score * ae_score
         productivity_term = self.productivity_weight * productivity_score
 
@@ -305,6 +320,8 @@ class DenseProductivePlateReward:
             "vibration_w_cost": float(w_cost),
             "vibration_wdot_cost": float(wdot_cost),
             "vibration_signal_source": signal_source,
+            "w_scale_m": float(self.w_scale),
+            "wdot_scale_m_s": float(self.wdot_scale),
             "productivity": float(productivity_term),
             "omega_cost": float(omega_cost),
             "negative_ap_cost": float(self.negative_ap_weight * negative_ap_cost),
@@ -336,13 +353,14 @@ class DenseQuadraticPlateReward:
         w_weight: float = 1.0,
         wdot_weight: float = 0.1,
         action_weight: float = 0.01,
-        w_scale: float = 1e-3,
-        wdot_scale: float = 1e-2,
+        w_scale: float = 1e-4,
+        wdot_scale: float = 1.0,
         alive_bonus: float = 0.0,
         termination_penalty: float = 100.0,
         pass_completion_bonus: float = 500.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
+        require_physical_info: bool = True,
         eta_weight: float | None = None,
         eta_dot_weight: float | None = None,
         eta_scale: float | None = None,
@@ -363,8 +381,9 @@ class DenseQuadraticPlateReward:
         self.action_weight = float(action_weight)
         self.w_scale = float(w_scale)
         self.wdot_scale = float(wdot_scale)
-        self.w_clip = self.w_scale if w_clip is None else float(w_clip)
-        self.wdot_clip = self.wdot_scale if wdot_clip is None else float(wdot_clip)
+        self.w_clip = None if w_clip is None else float(w_clip)
+        self.wdot_clip = None if wdot_clip is None else float(wdot_clip)
+        self.require_physical_info = bool(require_physical_info)
         self.alive_bonus = float(alive_bonus)
         self.termination_penalty = float(termination_penalty)
         self.pass_completion_bonus = float(pass_completion_bonus)
@@ -395,6 +414,7 @@ class DenseQuadraticPlateReward:
             self.wdot_scale,
             w_clip=self.w_clip,
             wdot_clip=self.wdot_clip,
+            require_physical_info=self.require_physical_info,
         )
         if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
             return -float(self.termination_penalty)
@@ -406,6 +426,8 @@ class DenseQuadraticPlateReward:
             "vibration_w_cost": float(w_cost),
             "vibration_wdot_cost": float(wdot_cost),
             "vibration_signal_source": signal_source,
+            "w_scale_m": float(self.w_scale),
+            "wdot_scale_m_s": float(self.wdot_scale),
             "action_cost": float(self.action_weight * action_cost),
         }
 

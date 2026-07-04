@@ -22,6 +22,21 @@ DEFAULT_MODEL_DIR = "models/ppo_plate"
 DEFAULT_TRAJ_DIR = "eval_trajectories"
 DEFAULT_PLOT_DIR = "plots"
 
+# Default environment/face-milling parameters used by registration/factory.
+# Keep these in one place so Gym registration and direct make_plate_env() calls
+# remain consistent.
+DEFAULT_ENV_DT = 0.001
+DEFAULT_FEED_PER_TOOTH_MM = 0.20
+
+# Reward scaling for the current flexible AL7075 face-milling task.
+# Displacement scale is a vibration-quality target, not the crash/termination limit.
+# Velocity scale follows the plant observation scale and keeps velocity secondary
+# to displacement while still penalizing high-frequency chatter.
+DEFAULT_REWARD_W_SCALE = 1.0e-4       # 0.1 mm; matches PlatePlant.w_obs_scale
+DEFAULT_REWARD_WDOT_SCALE = 1.0       # 1 m/s
+DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 10.0
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 3.0
+
 
 def _translate_legacy_depth_kwargs(kwargs: dict[str, Any]) -> None:
     """Map old peripheral name ac_* to face-milling axial depth ap_* for plant."""
@@ -63,7 +78,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     reward_id = kwargs.pop("reward_id", "dense")
 
-    dt = kwargs.pop("dt", 0.002)
+    dt = kwargs.pop("dt", DEFAULT_ENV_DT)
     n_substeps = kwargs.pop("n_substeps", 1)
     max_episode_steps = kwargs.pop("max_episode_steps", None)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
@@ -155,6 +170,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "wdot_scale",
         "w_clip",
         "wdot_clip",
+        "require_physical_info",
         "eta_scale",
         "eta_dot_scale",
         "alive_bonus",
@@ -174,6 +190,10 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     plant_kwargs = {k: v for k, v in kwargs.items() if k in plant_keys}
     reward_kwargs = {k: v for k, v in kwargs.items() if k in reward_keys}
+
+    # Factory-level default for the current AL7075 face-milling setup.
+    # User-supplied feed_per_tooth_mm still overrides this.
+    plant_kwargs.setdefault("feed_per_tooth_mm", DEFAULT_FEED_PER_TOOTH_MM)
 
     unknown_keys = sorted(set(kwargs) - plant_keys - reward_keys)
     if unknown_keys:
@@ -211,10 +231,15 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     reward_kwargs.setdefault("ae_max", plant.ae_max)
     reward_kwargs.setdefault("ae_default", plant.ae_default)
 
-    reward_kwargs.setdefault("w_scale", plant.w_limit)
-    reward_kwargs.setdefault("wdot_scale", plant.wdot_limit)
-    reward_kwargs.setdefault("w_clip", plant.w_limit)
-    reward_kwargs.setdefault("wdot_clip", plant.wdot_limit)
+    # Reward vibration scales are stricter than the plant termination limits.
+    # Do not set default clipping here; DenseProductivePlateReward leaves
+    # vibration costs unclipped unless the user explicitly supplies w_clip/wdot_clip.
+    reward_kwargs.setdefault("w_scale", DEFAULT_REWARD_W_SCALE)
+    reward_kwargs.setdefault("wdot_scale", DEFAULT_REWARD_WDOT_SCALE)
+    reward_kwargs.setdefault("productivity_weight", DEFAULT_REWARD_PRODUCTIVITY_WEIGHT)
+    reward_kwargs.setdefault("omega_cost_weight", DEFAULT_REWARD_OMEGA_COST_WEIGHT)
+    # Strict by default: reward must use physical sensor signals supplied in info.
+    reward_kwargs.setdefault("require_physical_info", True)
 
     reward_fn = get_plate_reward(reward_id, **reward_kwargs)
 
@@ -232,23 +257,24 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
 
 def register_envs() -> None:
-    """Register custom RL environment with Gymnasium."""
-    env_id = "CustomODEPlate-v0"
+    """Register custom RL environment with Gymnasium.
 
-    default_max_steps = estimate_training_episode_steps(
-        L1=1.0,
-        feed_per_tooth_mm=0.10,
-        n_teeth=4,
-        step_dt=0.002,
-    )
+    Do not set Gymnasium's external ``max_episode_steps`` here.
+    ``make_plate_env`` computes the episode limit from the actual constructed
+    plant parameters, including feed_per_tooth_mm, dt, and n_substeps, and then
+    passes that limit into ODEControlEnv. This avoids a stale TimeLimit wrapper
+    if the user overrides feed or dt in gym.make(...).
+    """
+    env_id = "CustomODEPlate-v0"
 
     if env_id not in gym.envs.registry:
         gym.register(
             id=env_id,
             entry_point="custom_rl.envs.registration:make_plate_env",
-            max_episode_steps=default_max_steps,
             kwargs={
                 "reward_id": "dense",
+                "dt": DEFAULT_ENV_DT,
+                "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
                 "omega_min": OMEGA_MIN_RAD_S,
                 "omega_max": OMEGA_MAX_RAD_S,
             },
