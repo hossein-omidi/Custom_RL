@@ -6,11 +6,15 @@ The current environment uses a nonlinear modal plate vibration plant for milling
 
 ```text
 Environment ID: CustomODEPlate-v0
-Plant: PlatePlant
-State: [eta1, eta1_dot, eta2, eta2_dot, ..., etaK, etaK_dot]
-Action: normalized PPO action [u_omega, u_ac] in [-1, 1]^2
-Physical action: [omega, ac]
-Integrator: fixed-step RK4
+Plant: PlatePlant (face-milling on a cantilever flexible plate)
+Internal state (modal, not observed directly): [eta1, eta1_dot, ..., etaK, etaK_dot]
+Observation (physical, via modal->physical sensor projection):
+  [w_sensor/w_obs_scale, wdot_sensor/wdot_obs_scale, cutter_x/L1, cutter_y/L2]
+Action: normalized PPO action [u_omega, u_ap] in [-1, 1]^2
+  (optionally [u_omega, u_ap, u_ae] if control_ae=True)
+Physical action: [omega_rad_s, ap_mm] (axial depth of cut ap; radial
+  immersion ae is a fixed process parameter unless control_ae=True)
+Integrator: fixed-step RK4 with a regenerative-delay history buffer
 RL algorithm: PPO actor-critic from Stable-Baselines3
 ```
 
@@ -40,10 +44,10 @@ obs, info = env.reset(seed=42)
 ## Verify environment with random policy
 
 ```bash
-python scripts/check_plate_random_policy.py
+python scripts/check_plate_random_policy_new.py
 ```
 
-This checks environment registration, reset, step, observation/action dimensions, reward calculation, and RK4 integration.
+This checks environment registration, reset, step, observation/action dimensions, reward calculation, and RK4 integration (including the regenerative-delay history buffer).
 
 ## Fast PPO training check
 
@@ -140,7 +144,7 @@ python scripts/eval_policy.py \
   --max-episode-steps 3000
 ```
 
-The evaluation script saves states, normalized actions, physical actions `[omega, ac]`, rewards, and time values.
+The evaluation script saves observations, normalized actions, physical actions `[omega_rad_s, ap_mm]`, rewards, reward-term decomposition, physical sensor signals, cutting-force diagnostics, and time values.
 
 ## Plot training and evaluation results
 
@@ -217,33 +221,73 @@ python scripts/plot_results.py \
   --seeds 0
 ```
 
+## Generate publication-style figures
+
+After training and evaluating a policy (trajectory JSON must exist first):
+
+```bash
+python scripts/plot_paper_figures.py \
+  --log-dir logs/ppo_plate \
+  --traj-dir eval_trajectories \
+  --out-dir plots/paper
+```
+
+Produces the learning curve, closed-loop control/vibration time series, actuator heatmaps across runs, the (rpm, ap) operating-density map, the vibration field over pass progress, an evaluation summary (return distribution and pass-completion rate), a dense reward-term decomposition, cutting-force trajectories, and a vibration-robustness-vs-pass-line (y=a) figure.
+
+## Stability lobe diagram (no-control, RL-independent)
+
+```bash
+python scripts/stability_lobe_new.py --rpm-min 1000 --rpm-max 40000 --ap-min 0 --ap-max 18
+```
+
+Sweeps spindle speed and axial depth of cut with no controller to trace the no-control stability boundary; supports 2D/3D and stochastic (Monte Carlo) variants and different milling pass lines. Independent of the RL training pipeline.
+
+## Validate the stochastic/uncertainty setup
+
+```bash
+python scripts/validate_stochastic_setup.py
+```
+
+Sanity-checks deterministic vs. stochastic rollouts, reward-term decomposition, and milling pass-line (y0) randomization.
+
 ## Main files
 
 ```text
 custom_rl/envs/
-  ode_control_env.py       Generic Gymnasium ODE environment
-  registration.py          Registers CustomODEPlate-v0
+  ode_control_env.py               Generic Gymnasium ODE environment
+  registration.py                  Registers CustomODEPlate-v0 (single source of
+                                    truth for plant/reward defaults)
 
 custom_rl/plants/
-  base.py                  ODEPlant interface
-  plate.py                 Milling/plate vibration plant
-  f_nonlinear2.py          Nonlinear modal-force dynamics
-  compute_mode_shapes.py
-  compute_natural_frequencies.py
-  compute_nonlinear_stiffness.py
+  base.py                          ODEPlant interface
+  plate.py                         Face-milling flexible-plate plant (modal ODE,
+                                    modal->physical sensor projection, termination)
+  f_nonlinear2_face_milling.py     Nonlinear modal face-milling force dynamics
+                                    with regenerative-delay history
+  compute_mode_shapes_updated.py
+  compute_natural_frequencies_updated.py
+  compute_nonlinear_stiffness_updated.py
 
 custom_rl/rewards/
-  base.py                  Reward protocol
-  plate_rewards.py         Dense/productive/quadratic/sparse rewards
+  base.py                          Reward protocol
+  plate_rewards.py                 Dense/productive/quadratic/sparse rewards
 
 custom_rl/integration/
-  rk4.py                   Fixed-step RK4 integrator
+  rk4.py                           History-aware fixed-step RK4 integrator
+
+custom_rl/eval/
+  pipeline.py                      Shared env-kwargs/metadata helpers for
+                                    train/eval/plot scripts
+  monte_carlo.py                   Monte Carlo rollout aggregation/plotting
 
 scripts/
-  check_plate_random_policy.py
-  train_sb3_ppo.py
-  eval_policy.py
-  plot_results.py
+  check_plate_random_policy_new.py Environment smoke test with random/fixed policy
+  train_sb3_ppo.py                 Multi-seed PPO training
+  eval_policy.py                   Policy evaluation and trajectory export
+  plot_results.py                  Basic training/trajectory plots
+  plot_paper_figures.py            Publication-quality figures (see above)
+  stability_lobe_new.py            No-control stability lobe diagram (2D/3D/MC)
+  validate_stochastic_setup.py     Stochastic-plant sanity checks
 ```
 
 ## Default output directories

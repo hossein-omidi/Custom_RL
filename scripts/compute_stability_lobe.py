@@ -67,6 +67,10 @@ from typing import Any, Iterable
 
 import gymnasium as gym
 import matplotlib.pyplot as plt
+
+# Plant termination reason strings that indicate the milling pass completed
+# without triggering an instability/safety-margin termination.
+PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 import numpy as np
 from mpl_toolkits.mplot3d import Axes3D  # noqa: F401  (registers 3D projection)
 
@@ -393,7 +397,7 @@ def run_fixed_action_trial(
         rms_growth_ratio=growth_ratio,
         terminated=bool(terminated),
         truncated=bool(truncated),
-        pass_completed=(termination_reason == "pass_completed"),
+        pass_completed=(termination_reason in PASS_COMPLETED_REASONS),
         termination_reason=termination_reason,
     )
 

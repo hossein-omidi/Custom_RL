@@ -214,7 +214,11 @@ def plant_plot_metadata(env) -> dict[str, Any]:
         "mode_clamped_axis": str(getattr(plant, "mode_clamped_axis", "x")),
         "clamped_side": "x=0",
         "free_side": "x=L1",
-        "path_direction": "x=L1 free side -> x=0 clamped side",
+        "x_pass_end_m": _safe_float(getattr(plant, "x_pass_end_m", np.nan)),
+        "path_direction": (
+            f"x=L1 free side -> x={_safe_float(getattr(plant, 'x_pass_end_m', np.nan)):.4g} "
+            "(90% pass, clamped side is x=0)"
+        ),
         "L1_m": _safe_float(getattr(plant, "L1", np.nan)),
         "L2_m": _safe_float(getattr(plant, "L2", np.nan)),
         "h_m": _safe_float(getattr(plant, "h", np.nan)),

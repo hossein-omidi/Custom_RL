@@ -71,6 +71,10 @@ PROCESS_KEYS = (
     "mean_chip_mm",
     "max_chip_mm",
     "max_abs_w_m",
+    "Fx_N",
+    "Fy_N",
+    "Fz_N",
+    "F_mag_N",
 )
 
 
@@ -232,6 +236,14 @@ def _process_snapshot(info: dict[str, Any], env: gym.Env) -> dict[str, float]:
     if "w_sensor" in info:
         w_sensor = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
         process["max_abs_w_m"] = float(np.max(np.abs(w_sensor))) if w_sensor.size else float("nan")
+
+    if "F_total_N" in info:
+        f_total = np.asarray(info["F_total_N"], dtype=np.float64).reshape(-1)
+        if f_total.size >= 3:
+            process["Fx_N"] = _safe_float(f_total[0])
+            process["Fy_N"] = _safe_float(f_total[1])
+            process["Fz_N"] = _safe_float(f_total[2])
+            process["F_mag_N"] = _safe_float(float(np.linalg.norm(f_total)))
 
     return {key: _safe_float(process.get(key, np.nan)) for key in PROCESS_KEYS}
 

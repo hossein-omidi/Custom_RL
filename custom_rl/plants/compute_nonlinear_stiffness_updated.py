@@ -34,9 +34,16 @@ ModeFunction = Callable[[np.ndarray, np.ndarray], np.ndarray]
 
 
 def _trapezoid(values: np.ndarray, grid: np.ndarray, axis: int) -> np.ndarray:
-    """Compatibility wrapper for NumPy trapezoidal integration."""
-    trapz = getattr(np, "trapezoid", np.trapz)
-    return trapz(values, grid, axis=axis)
+    """Compatibility wrapper for NumPy trapezoidal integration.
+
+    ``np.trapezoid`` (new name) is used when available; ``np.trapz`` (the
+    legacy alias) is only referenced as a fallback so this does not crash on
+    NumPy versions where ``np.trapz`` has been removed.
+    """
+    trapezoid = getattr(np, "trapezoid", None)
+    if trapezoid is not None:
+        return trapezoid(values, grid, axis=axis)
+    return np.trapz(values, grid, axis=axis)
 
 
 def _validate_positive_scalar(name: str, value: float) -> float:

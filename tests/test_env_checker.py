@@ -10,9 +10,14 @@ from gymnasium.utils.env_checker import check_env
 from custom_rl import register_envs
 
 ENV_ID = "CustomODEPlate-v0"
+# dt=1e-4 with n_substeps=10 gives the same 1e-3 s control step as dt=1e-3,
+# n_substeps=1, but keeps the RK4 substep below the minimum one-tooth
+# regenerative delay at omega_max (tau_min ~= 3.75e-4 s for N=4, 40000 rpm).
+# dt=1e-3 alone violates that invariant and check_env's random high-speed
+# actions then raise RuntimeError inside f_nonlinear2.
 ENV_KWARGS = {
-    "dt": 0.001,
-    "n_substeps": 1,
+    "dt": 0.0001,
+    "n_substeps": 10,
     "max_episode_steps": 500,
     "randomize_y0": False,
     "dynamics_uncertainty_std": 0.0,

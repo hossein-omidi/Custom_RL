@@ -115,11 +115,11 @@ def check_reward_terms() -> None:
         "vibration_wdot_cost",
         "productivity",
         "omega_cost",
-        "ac_action_cost",
+        "ap_action_cost",
     ):
         assert key in terms, f"missing {key}"
     assert terms["omega_cost"] > 0.0
-    assert terms["ac_action_cost"] == 0.0
+    assert terms["ap_action_cost"] == 0.0
     print("[ok] reward decomposition includes vibration, productivity, omega cost")
 
 
@@ -137,7 +137,7 @@ def check_y0_randomization() -> None:
     y0_values = []
     for seed in range(20):
         _, info = env.reset(seed=seed)
-        y0_values.append(info["y0"])
+        y0_values.append(info["y_cutter"])
     assert len(set(round(y, 4) for y in y0_values)) > 1
     env.close()
     print("[ok] y0 randomization explores different start lines")

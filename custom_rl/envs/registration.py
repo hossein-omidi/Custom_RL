@@ -56,9 +56,17 @@ DEFAULT_ENV_MODAL_DAMPING_RATIO = 0.02
 # only when the measured physical vibration remains controlled.
 DEFAULT_REWARD_W_SCALE = 7.5e-4          # softer dense vibration cost; hard limit remains 1 mm
 DEFAULT_REWARD_WDOT_SCALE = 1.0          # 1 m/s velocity scale
+DEFAULT_REWARD_W_WEIGHT = 0.6
 DEFAULT_REWARD_WDOT_WEIGHT = 0.02
-DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 20.0
-DEFAULT_REWARD_OMEGA_COST_WEIGHT = 1.0
+# productivity_weight/omega_cost_weight/w_weight were rebalanced from
+# (20.0, 1.0, 1.0) after numerical verification showed the dense per-step
+# reward was negative even at a safe, non-chattering operating point (the
+# vibration cost dominated the productivity term everywhere). The values
+# below keep dense reward close to neutral at a safe operating point and
+# mildly positive near the edge of the stable envelope, while still growing
+# quadratically as vibration approaches the termination limit.
+DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 30.0
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 0.3
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
 DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
 DEFAULT_REWARD_PASS_COMPLETION_BONUS = 10000.0
@@ -295,6 +303,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     # vibration costs unclipped unless the user explicitly supplies w_clip/wdot_clip.
     reward_kwargs.setdefault("w_scale", DEFAULT_REWARD_W_SCALE)
     reward_kwargs.setdefault("wdot_scale", DEFAULT_REWARD_WDOT_SCALE)
+    reward_kwargs.setdefault("w_weight", DEFAULT_REWARD_W_WEIGHT)
     reward_kwargs.setdefault("wdot_weight", DEFAULT_REWARD_WDOT_WEIGHT)
     reward_kwargs.setdefault("productivity_weight", DEFAULT_REWARD_PRODUCTIVITY_WEIGHT)
     reward_kwargs.setdefault("omega_cost_weight", DEFAULT_REWARD_OMEGA_COST_WEIGHT)

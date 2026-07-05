@@ -1,15 +1,19 @@
 """Publication-quality figures from training logs and eval_policy.py trajectories.
 
 Reads only generated artifacts (SB3 monitor CSV, evaluations.npz, trajectory JSON).
-Does not modify training or evaluation scripts.
+Does not modify training or evaluation scripts. Run eval_policy.py first so
+trajectory JSON exists before generating fig02-fig09.
 
 Figures (paper-oriented, no duplicates of casual plot_results.py views):
   fig01  Training return vs environment steps (+ eval checkpoints)
   fig02  Closed-loop control: spindle speed, depth of cut, peak vibration
   fig03  Actuator trajectories across evaluation runs (normalized pass time)
-  fig04  Operating map: joint density of (rpm, a_c) with marginals
+  fig04  Operating map: joint density of (rpm, a_p) with marginals
   fig05  Vibration field: sensor location vs normalized pass progress
   fig06  Evaluation summary: return distribution and pass completion by seed
+  fig07  Reward decomposition vs normalized pass progress (mean +/- std)
+  fig08  Cutting force vs normalized pass progress (mean +/- std)
+  fig09  Vibration robustness vs milling pass line y=a across episodes
 """
 
 from __future__ import annotations
@@ -35,6 +39,13 @@ from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm
 
 PAPER_OUT_DIR = Path(DEFAULT_PLOT_DIR) / "paper"
 
+# Plant termination reason strings that indicate the milling pass completed
+# without triggering an instability/safety-margin termination. eval_policy.py
+# already resolves "pass_completed" against this same set and saves the
+# resulting bool, so this is only needed as a fallback for older trajectory
+# JSON that predates that field.
+PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
+
 # Journal-style palette (colorblind-friendly).
 C_PRIMARY = "#1F4E79"
 C_ACCENT = "#C44E52"
@@ -55,14 +66,16 @@ VIB_CMAP = LinearSegmentedColormap.from_list(
 class EpisodeData:
     seed: int
     episode: int
-    y0: float | None
+    y_line_m: float | None
     return_: float
     termination_reason: str | None
     pass_completed: bool
     times: np.ndarray
     rpm: np.ndarray
-    ac: np.ndarray
+    ap: np.ndarray
     w_sensor: np.ndarray | None  # (T, n_sensors)
+    reward_terms: list[dict] | None
+    force_N: np.ndarray | None  # (T, 4): Fx, Fy, Fz, |F|
     metadata: dict
 
 
@@ -215,8 +228,8 @@ def load_episodes(traj_dir: Path, seeds: list[int]) -> list[EpisodeData]:
             physical_actions = physical_actions[:n]
 
             rpm = omega_to_rpm(physical_actions[:, 0]) if physical_actions.shape[1] >= 1 else None
-            ac = physical_actions[:, 1] if physical_actions.shape[1] >= 2 else None
-            if rpm is None or ac is None:
+            ap = physical_actions[:, 1] if physical_actions.shape[1] >= 2 else None
+            if rpm is None or ap is None:
                 continue
 
             w_hist = record.get("w_sensor") or ep.get("w_sensor")
@@ -227,25 +240,44 @@ def load_episodes(traj_dir: Path, seeds: list[int]) -> list[EpisodeData]:
                     w_arr = w_arr.reshape(-1, 1)
                 w_sensor = w_arr[:n]
 
+            reward_terms_hist = record.get("reward_terms") or ep.get("reward_terms")
+            reward_terms = reward_terms_hist[:n] if reward_terms_hist else None
+
+            process = record.get("process") or ep.get("process") or {}
+            force_N = None
+            if all(k in process for k in ("Fx_N", "Fy_N", "Fz_N")):
+                fx = np.asarray(process["Fx_N"], dtype=np.float64)
+                fy = np.asarray(process["Fy_N"], dtype=np.float64)
+                fz = np.asarray(process["Fz_N"], dtype=np.float64)
+                fmag = np.asarray(
+                    process.get("F_mag_N", np.sqrt(fx**2 + fy**2 + fz**2)),
+                    dtype=np.float64,
+                )
+                m = min(n, fx.size, fy.size, fz.size, fmag.size)
+                if m > 0:
+                    force_N = np.stack([fx[:m], fy[:m], fz[:m], fmag[:m]], axis=1)
+
             reason = record.get("termination_reason") or ep.get("termination_reason")
             pass_completed = bool(
-                reason == "pass_completed"
-                or record.get("pass_completed")
+                record.get("pass_completed")
                 or ep.get("pass_completed")
+                or reason in PASS_COMPLETED_REASONS
             )
 
             episodes.append(
                 EpisodeData(
                     seed=int(ep.get("seed", seed)),
                     episode=int(ep.get("episode", 0)),
-                    y0=record.get("y0", ep.get("y0")),
+                    y_line_m=record.get("y_line_m", ep.get("y_line_m")),
                     return_=float(record.get("return", ep.get("return", np.nan))),
                     termination_reason=reason,
                     pass_completed=pass_completed,
                     times=times,
                     rpm=rpm,
-                    ac=ac,
+                    ap=ap,
                     w_sensor=w_sensor,
+                    reward_terms=reward_terms,
+                    force_N=force_N,
                     metadata=metadata,
                 )
             )
@@ -298,9 +330,9 @@ def resample_unit_interval(
 
 
 def _run_label(ep: EpisodeData) -> str:
-    y0_mm = ep.y0 * 1e3 if ep.y0 is not None else float("nan")
-    if np.isfinite(y0_mm):
-        return f"s{ep.seed} ep{ep.episode}\n$y_0$={y0_mm:.0f} mm"
+    y_mm = ep.y_line_m * 1e3 if ep.y_line_m is not None else float("nan")
+    if np.isfinite(y_mm):
+        return f"s{ep.seed} ep{ep.episode}\n$y$={y_mm:.0f} mm"
     return f"s{ep.seed} ep{ep.episode}"
 
 
@@ -411,14 +443,14 @@ def figure_closed_loop_response(
     max_t = max(len(ep.times) for ep in episodes)
     T = np.full((len(episodes), max_t), np.nan, dtype=np.float64)
     rpm_series = np.full((len(episodes), max_t), np.nan, dtype=np.float64)
-    ac_series = np.full((len(episodes), max_t), np.nan, dtype=np.float64)
+    ap_series = np.full((len(episodes), max_t), np.nan, dtype=np.float64)
     peak_w_um = np.full((len(episodes), max_t), np.nan, dtype=np.float64)
 
     for i, ep in enumerate(episodes):
         n = len(ep.times)
         T[i, :n] = ep.times
         rpm_series[i, :n] = ep.rpm
-        ac_series[i, :n] = ep.ac
+        ap_series[i, :n] = ep.ap
         if ep.w_sensor is not None and ep.w_sensor.size:
             peak_w_um[i, :n] = np.max(np.abs(ep.w_sensor), axis=1) * 1e6
 
@@ -427,7 +459,7 @@ def figure_closed_loop_response(
     fig, axes = plt.subplots(3, 1, figsize=(3.5, 5.4), sharex=True)
     panels = [
         (rpm_series, "Spindle speed (rpm)", None),
-        (ac_series, r"Axial depth of cut $a_c$ (mm)", None),
+        (ap_series, r"Axial depth of cut $a_p$ (mm)", None),
         (peak_w_um, r"Peak $|w|$ across sensors ($\mu$m)", w_limit),
     ]
 
@@ -483,7 +515,7 @@ def figure_action_run_heatmap(
     # Sort by seed then episode for readable row order.
     episodes = sorted(episodes, key=lambda e: (e.seed, e.episode))
     rpm_mat = np.vstack([resample_unit_interval(ep.times, ep.rpm, n_bins) for ep in episodes])
-    ac_mat = np.vstack([resample_unit_interval(ep.times, ep.ac, n_bins) for ep in episodes])
+    ap_mat = np.vstack([resample_unit_interval(ep.times, ep.ap, n_bins) for ep in episodes])
 
     progress = np.linspace(0.0, 1.0, n_bins)
     labels = [_run_label(ep) for ep in episodes]
@@ -492,8 +524,8 @@ def figure_action_run_heatmap(
 
     for ax, mat, title, cbar_label in zip(
         axes,
-        (rpm_mat, ac_mat),
-        ("Spindle speed (rpm)", r"Depth of cut $a_c$ (mm)"),
+        (rpm_mat, ap_mat),
+        ("Spindle speed (rpm)", r"Axial depth of cut $a_p$ (mm)"),
         ("rpm", "mm"),
     ):
         im = ax.imshow(
@@ -535,11 +567,12 @@ def figure_operating_map(
 
     metadata = episodes[0].metadata
     rpm_all = np.concatenate([ep.rpm for ep in episodes])
-    ac_all = np.concatenate([ep.ac for ep in episodes])
+    ap_all = np.concatenate([ep.ap for ep in episodes])
 
     rpm_lo = float(metadata.get("rpm_min", RPM_MIN))
     rpm_hi = float(metadata.get("rpm_max", RPM_MAX))
-    ac_lo, ac_hi = 0.0, float(metadata.get("physical_action_high", [0, 20.0])[1])
+    ap_lo = float(metadata.get("ap_min_mm", 0.0))
+    ap_hi = float(metadata.get("ap_max_mm", 20.0))
 
     fig = plt.figure(figsize=(3.6, 3.6))
     gs = gridspec.GridSpec(2, 2, width_ratios=[4, 1], height_ratios=[1, 4], hspace=0.05, wspace=0.05)
@@ -550,9 +583,9 @@ def figure_operating_map(
 
     h, xedges, yedges = np.histogram2d(
         rpm_all,
-        ac_all,
+        ap_all,
         bins=[48, 36],
-        range=[[rpm_lo, rpm_hi], [ac_lo, ac_hi]],
+        range=[[rpm_lo, rpm_hi], [ap_lo, ap_hi]],
         density=True,
     )
     h = h.T
@@ -565,15 +598,15 @@ def figure_operating_map(
         rasterized=True,
     )
     ax_main.set_xlabel("Spindle speed (rpm)")
-    ax_main.set_ylabel(r"Depth of cut $a_c$ (mm)")
+    ax_main.set_ylabel(r"Axial depth of cut $a_p$ (mm)")
     ax_main.set_xlim(rpm_lo, rpm_hi)
-    ax_main.set_ylim(ac_lo, ac_hi)
+    ax_main.set_ylim(ap_lo, ap_hi)
 
     ax_top.hist(rpm_all, bins=48, range=(rpm_lo, rpm_hi), color=C_PRIMARY, alpha=0.85, density=True)
     ax_right.hist(
-        ac_all,
+        ap_all,
         bins=36,
-        range=(ac_lo, ac_hi),
+        range=(ap_lo, ap_hi),
         orientation="horizontal",
         color=C_PRIMARY,
         alpha=0.85,
@@ -747,6 +780,193 @@ def figure_eval_summary(
     plt.close(fig)
 
 
+# ---------------------------------------------------------------------------
+# Figure 7 — reward decomposition vs pass progress
+# ---------------------------------------------------------------------------
+
+REWARD_TERM_SPECS = (
+    ("productivity", "Productivity", C_PRIMARY),
+    ("vibration_w_cost", "Displacement cost", C_ACCENT),
+    ("vibration_wdot_cost", "Velocity cost", "#55A868"),
+    ("omega_cost", "Spindle-speed cost", "#8172B2"),
+)
+
+
+def figure_reward_decomposition(
+    episodes: list[EpisodeData],
+    out_dir: Path,
+    *,
+    n_bins: int,
+    formats: tuple[str, ...],
+) -> None:
+    episodes_with_terms = [ep for ep in episodes if ep.reward_terms]
+    if not episodes_with_terms:
+        print("Skip fig07: no reward_terms in trajectories (re-run eval_policy.py)")
+        return
+
+    progress = np.linspace(0.0, 1.0, n_bins)
+    fig, ax = plt.subplots(figsize=(4.2, 2.8))
+
+    for key, label, color in REWARD_TERM_SPECS:
+        series = []
+        for ep in episodes_with_terms:
+            values = np.array(
+                [float(step.get(key, np.nan)) for step in ep.reward_terms],
+                dtype=np.float64,
+            )
+            if values.size == 0:
+                continue
+            series.append(resample_unit_interval(ep.times, values, n_bins))
+        if not series:
+            continue
+        mat = np.vstack(series)
+        mean_y, std_y, valid = _nan_mean_std(mat)
+        band = MC_BAND_STD_MULT * std_y
+        ax.plot(progress[valid], mean_y[valid], color=color, lw=1.3, label=label)
+        ax.fill_between(
+            progress[valid],
+            mean_y[valid] - band[valid],
+            mean_y[valid] + band[valid],
+            color=color,
+            alpha=0.15,
+            linewidth=0,
+        )
+
+    ax.axhline(0.0, color="black", lw=0.6, alpha=0.4)
+    ax.set_xlabel("Normalized pass progress")
+    ax.set_ylabel("Reward term value")
+    ax.set_title("Dense reward decomposition")
+    ax.grid(True, alpha=C_GRID[3], color=C_GRID[:3])
+    ax.legend(loc="best", fontsize=7, framealpha=0.9)
+    fig.tight_layout()
+    _save_figure(fig, out_dir, "fig07_reward_decomposition", formats)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Figure 8 — cutting force vs pass progress
+# ---------------------------------------------------------------------------
+
+
+def figure_cutting_force(
+    episodes: list[EpisodeData],
+    out_dir: Path,
+    *,
+    n_bins: int,
+    formats: tuple[str, ...],
+) -> None:
+    episodes_with_force = [ep for ep in episodes if ep.force_N is not None and ep.force_N.size]
+    if not episodes_with_force:
+        print("Skip fig08: no force data in trajectories (re-run eval_policy.py)")
+        return
+
+    progress = np.linspace(0.0, 1.0, n_bins)
+    fig, axes = plt.subplots(1, 2, figsize=(6.8, 2.8), sharex=True)
+
+    specs = [
+        (2, r"Axial cutting force $F_z$ (N)", axes[0]),
+        (3, r"Resultant force $|F|$ (N)", axes[1]),
+    ]
+    for col, ylabel, ax in specs:
+        series = [
+            resample_unit_interval(ep.times, ep.force_N[:, col], n_bins)
+            for ep in episodes_with_force
+        ]
+        mat = np.vstack(series)
+        mean_y, std_y, valid = _nan_mean_std(mat)
+        band = MC_BAND_STD_MULT * std_y
+        ax.fill_between(
+            progress[valid],
+            mean_y[valid] - band[valid],
+            mean_y[valid] + band[valid],
+            color=C_FILL,
+            alpha=0.22,
+            linewidth=0,
+        )
+        ax.plot(progress[valid], mean_y[valid], color=C_PRIMARY, lw=1.3)
+        ax.set_xlabel("Normalized pass progress")
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=C_GRID[3], color=C_GRID[:3])
+
+    fig.suptitle("Face-milling cutting force across evaluation rollouts", y=1.02, fontsize=9)
+    fig.tight_layout()
+    _save_figure(fig, out_dir, "fig08_cutting_force", formats)
+    plt.close(fig)
+
+
+# ---------------------------------------------------------------------------
+# Figure 9 — vibration robustness across milling pass lines y=a
+# ---------------------------------------------------------------------------
+
+
+def figure_pass_line_robustness(
+    episodes: list[EpisodeData],
+    out_dir: Path,
+    *,
+    formats: tuple[str, ...],
+) -> None:
+    episodes_with_y = [
+        ep for ep in episodes if ep.y_line_m is not None and ep.w_sensor is not None and ep.w_sensor.size
+    ]
+    if not episodes_with_y:
+        print("Skip fig09: no y_line_m/w_sensor data in trajectories")
+        return
+
+    y_mm = np.array([float(ep.y_line_m) * 1e3 for ep in episodes_with_y])
+    peak_w_um = np.array(
+        [float(np.max(np.abs(ep.w_sensor))) * 1e6 for ep in episodes_with_y]
+    )
+    completed = np.array([bool(ep.pass_completed) for ep in episodes_with_y])
+
+    fig, ax = plt.subplots(figsize=(4.2, 2.8))
+    ax.scatter(
+        y_mm[completed],
+        peak_w_um[completed],
+        s=18,
+        c=C_PRIMARY,
+        alpha=0.75,
+        label="Pass completed",
+        edgecolors="white",
+        linewidths=0.3,
+    )
+    ax.scatter(
+        y_mm[~completed],
+        peak_w_um[~completed],
+        s=18,
+        c=C_ACCENT,
+        alpha=0.75,
+        label="Terminated early",
+        marker="x",
+    )
+
+    if y_mm.size >= 3:
+        order = np.argsort(y_mm)
+        n_bins = max(min(10, y_mm.size // 2), 2)
+        edges = np.linspace(y_mm.min(), y_mm.max(), n_bins + 1)
+        centers, means = [], []
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            mask = (y_mm >= lo) & (y_mm <= hi)
+            if np.any(mask):
+                centers.append(0.5 * (lo + hi))
+                means.append(np.mean(peak_w_um[mask]))
+        if centers:
+            ax.plot(centers, means, color="black", lw=1.2, ls="--", alpha=0.6, label="Binned mean")
+
+    metadata = episodes_with_y[0].metadata
+    w_limit = metadata.get("w_limit")
+    if w_limit is not None and np.isfinite(w_limit):
+        ax.axhline(float(w_limit) * 1e6, color=C_ACCENT, ls=":", lw=1.0, alpha=0.8)
+
+    ax.set_xlabel("Milling pass line $y=a$ (mm)")
+    ax.set_ylabel(r"Peak $|w|$ across sensors ($\mu$m)")
+    ax.set_title("Vibration robustness across pass lines")
+    ax.grid(True, alpha=C_GRID[3], color=C_GRID[:3])
+    ax.legend(loc="best", fontsize=7, framealpha=0.9)
+    fig.tight_layout()
+    _save_figure(fig, out_dir, "fig09_pass_line_robustness", formats)
+    plt.close(fig)
+
+
 def write_metrics_summary(episodes: list[EpisodeData], out_dir: Path) -> None:
     if not episodes:
         print("Skip metrics summary: no trajectory episodes")
@@ -818,7 +1038,7 @@ def main() -> None:
     parser.add_argument(
         "--figures",
         default="all",
-        help="Comma-separated figure ids: 1,2,3,4,5,6 or 'all'",
+        help="Comma-separated figure ids: 1..9 or 'all'",
     )
 
     args = parser.parse_args()
@@ -830,7 +1050,7 @@ def main() -> None:
     formats = tuple(f.strip().lstrip(".") for f in args.formats.split(",") if f.strip())
 
     if args.figures.strip().lower() == "all":
-        figure_ids = {1, 2, 3, 4, 5, 6}
+        figure_ids = {1, 2, 3, 4, 5, 6, 7, 8, 9}
     else:
         figure_ids = {int(x.strip()) for x in args.figures.split(",") if x.strip()}
 
@@ -845,7 +1065,7 @@ def main() -> None:
     if episodes:
         print(f"Loaded {len(episodes)} evaluation episode(s) from trajectory JSON")
     else:
-        print("Warning: no trajectory JSON found — fig02–fig06 will be skipped")
+        print("Warning: no trajectory JSON found — fig02-fig09 will be skipped. Run eval_policy.py first.")
 
     if 1 in figure_ids:
         figure_learning_curve(log_dir, seeds, out_dir, smooth=args.smooth, formats=formats)
@@ -859,6 +1079,12 @@ def main() -> None:
         figure_vibration_field(episodes, out_dir, n_bins=args.time_bins, formats=formats)
     if 6 in figure_ids:
         figure_eval_summary(episodes, out_dir, formats=formats)
+    if 7 in figure_ids:
+        figure_reward_decomposition(episodes, out_dir, n_bins=args.time_bins, formats=formats)
+    if 8 in figure_ids:
+        figure_cutting_force(episodes, out_dir, n_bins=args.time_bins, formats=formats)
+    if 9 in figure_ids:
+        figure_pass_line_robustness(episodes, out_dir, formats=formats)
 
     write_metrics_summary(episodes, out_dir)
 

@@ -9,7 +9,6 @@ env = gym.make(
     "CustomODEPlate-v0",
     reward_id="productive",
     max_episode_steps=10,
-    dt=0.001,
 )
 
 obs, info = env.reset(seed=0)
@@ -18,7 +17,7 @@ print("obs shape:", obs.shape)
 print("obs:", obs)
 print("info keys:", sorted(info.keys()))
 
-assert obs.shape == (4,)
+assert obs.shape == env.observation_space.shape
 assert np.all(np.isfinite(obs))
 assert "x_modal" in info
 assert "w_sensor" in info
@@ -28,7 +27,7 @@ for _ in range(5):
     action = env.action_space.sample()
     obs, reward, terminated, truncated, info = env.step(action)
 
-    assert obs.shape == (4,)
+    assert obs.shape == env.observation_space.shape
     assert np.all(np.isfinite(obs))
     assert np.isfinite(reward)
     assert "x_modal" in info

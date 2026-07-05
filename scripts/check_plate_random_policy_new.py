@@ -617,8 +617,12 @@ def main() -> None:
     parser.add_argument("--reward", default="dense", choices=["dense", "productive", "sparse", "quadratic"])
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--dt", type=float, default=0.001, help="RK4 integration substep [s].")
-    parser.add_argument("--n-substeps", type=int, default=1, help="Number of RK4 substeps per environment/control step.")
+    # Defaults match the train/eval convention (1e-4 s substep x 10 = 1 ms
+    # control step). This keeps the RK4 substep below the minimum one-tooth
+    # regenerative delay at omega_max by default, so a random policy sampling
+    # high spindle speed does not crash with a regenerative-delay RuntimeError.
+    parser.add_argument("--dt", type=float, default=0.0001, help="RK4 integration substep [s].")
+    parser.add_argument("--n-substeps", type=int, default=10, help="Number of RK4 substeps per environment/control step.")
     parser.add_argument(
         "--max-episode-steps",
         type=int,
