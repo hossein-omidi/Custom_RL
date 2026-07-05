@@ -43,11 +43,20 @@ from custom_rl.eval.pipeline import (
     plant_plot_metadata,
     resolve_ppo_model_path,
 )
-from custom_rl.plants.plate import RPM_MAX, RPM_MIN
+from custom_rl.plants.plate import omega_to_rpm
 
 
 ENV_ID = "CustomODEPlate-v0"
 PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
+
+# Standalone evaluation defaults must match the uploaded training script.
+# Training uses RK4 dt=1e-4 with 10 RK4 substeps per environment/control step,
+# giving a 1 ms control interval while still resolving the 40000-rpm tooth delay.
+EVAL_DEFAULT_DT = 1.0e-4
+EVAL_DEFAULT_N_SUBSTEPS = 10
+EVAL_DEFAULT_MAX_EPISODE_STEPS = 50000
+EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.0
+EVAL_DEFAULT_RANDOMIZE_Y0 = True
 
 PROCESS_KEYS = (
     "omega_rad_s",
@@ -174,6 +183,12 @@ def _resolve_seeds(model_dir: Path, seeds: list[int] | None) -> list[int]:
     if seeds:
         return list(seeds)
     return discover_model_seeds(model_dir)
+
+
+def make_registered_plate_env(**env_kwargs: Any) -> gym.Env:
+    """Create the registered plate environment using the same workflow as training."""
+    register_envs()
+    return gym.make(ENV_ID, **env_kwargs)
 
 
 def _episode_y_line(env: gym.Env, args: argparse.Namespace, *, seed: int, episode: int) -> float | None:
@@ -318,8 +333,8 @@ def main() -> int:
     parser.add_argument("--n-episodes", type=int, default=2)
     parser.add_argument("--out-dir", default=DEFAULT_TRAJ_DIR)
 
-    parser.add_argument("--dt", type=float, default=0.001, help="Must match training dt")
-    parser.add_argument("--n-substeps", type=int, default=1)
+    parser.add_argument("--dt", type=float, default=EVAL_DEFAULT_DT, help="Must match training RK4 substep [s]")
+    parser.add_argument("--n-substeps", type=int, default=EVAL_DEFAULT_N_SUBSTEPS)
 
     parser.add_argument(
         "--reward",
@@ -330,8 +345,8 @@ def main() -> int:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=None,
-        help="Max steps per episode (default: auto from pass duration)",
+        default=EVAL_DEFAULT_MAX_EPISODE_STEPS,
+        help="Max environment/control steps per episode; default matches train_sb3_ppo.py",
     )
     parser.add_argument(
         "--n-mc",
@@ -342,20 +357,20 @@ def main() -> int:
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
-        default=0.01,
-        help="Gaussian disturbance on modal accelerations [0=deterministic]",
+        default=EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD,
+        help="Gaussian disturbance on modal accelerations [0=deterministic]; default matches training",
     )
     parser.add_argument(
         "--randomize-y0",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=EVAL_DEFAULT_RANDOMIZE_Y0,
         help="Sample milling line y0 on reset unless --y0/--y-position is supplied",
     )
     parser.add_argument(
         "--y0",
         type=float,
-        default=0.4,
-        help="Evaluate all episodes on one fixed milling line y=a [m]",
+        default=None,
+        help="Evaluate all episodes on one fixed milling line y=a [m]. Default None matches randomized training.",
     )
     parser.add_argument(
         "--y-position",
@@ -393,8 +408,6 @@ def main() -> int:
 
     print(f"Model directory : {model_dir}")
     print(f"Trajectory output: {out_dir}")
-    print(f"Spindle range   : {RPM_MIN:.0f}-{RPM_MAX:.0f} rpm")
-
     if not model_dir.is_dir():
         print(f"Error: model directory does not exist: {model_dir}")
         return 1
@@ -440,10 +453,36 @@ def main() -> int:
             randomize_y0=args.randomize_y0,
         )
 
-        env = gym.make(ENV_ID, **env_kwargs)
+        env = make_registered_plate_env(**env_kwargs)
 
         max_steps = int(args.max_episode_steps or env.unwrapped.max_episode_steps)
         metadata = _get_metadata(env, max_steps, args.reward)
+
+        plant = env.unwrapped.plant
+        tau_min = 2.0 * np.pi / (max(int(getattr(plant, "N", 1)), 1) * max(float(plant.omega_max), 1e-12))
+        if float(args.dt) >= tau_min:
+            env.close()
+            raise ValueError(
+                f"RK4 dt={args.dt:g} s is not smaller than the minimum regenerative "
+                f"tooth delay tau_min={tau_min:g} s at omega_max={omega_to_rpm(plant.omega_max):.0f} rpm. "
+                "Use --dt 0.0001 --n-substeps 10 for the current 40000-rpm setup."
+            )
+
+        control_dt = float(args.dt) * int(args.n_substeps)
+        metadata["eval_dt"] = float(args.dt)
+        metadata["eval_n_substeps"] = int(args.n_substeps)
+        metadata["eval_control_step_s"] = float(control_dt)
+        metadata["eval_dynamics_uncertainty_std"] = float(args.dynamics_uncertainty_std)
+        metadata["eval_randomize_y0"] = bool(args.randomize_y0)
+        metadata["eval_tau_min_s"] = float(tau_min)
+
+        print(
+            f"Eval env seed {seed}: rpm={omega_to_rpm(plant.omega_min):.0f}-"
+            f"{omega_to_rpm(plant.omega_max):.0f}, dt={args.dt:g}, "
+            f"n_substeps={args.n_substeps}, control_step={control_dt:g}, "
+            f"max_steps={max_steps}, randomize_y0={args.randomize_y0}, "
+            f"w_limit={plant.w_limit:g} m"
+        )
         metadata["eval_n_episodes"] = int(args.n_episodes)
         metadata["eval_n_mc"] = int(args.n_mc)
         metadata["eval_y0_fixed_m"] = None if args.y0 is None else float(args.y0)

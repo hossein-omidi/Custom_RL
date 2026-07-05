@@ -10,8 +10,7 @@ from custom_rl.envs.ode_control_env import ODEControlEnv
 from custom_rl.plants.plate import (
     PlatePlant,
     estimate_training_episode_steps,
-    OMEGA_MAX_RAD_S,
-    OMEGA_MIN_RAD_S,
+    rpm_to_omega,
 )
 from custom_rl.rewards.plate_rewards import get_plate_reward
 
@@ -25,17 +24,55 @@ DEFAULT_PLOT_DIR = "plots"
 # Default environment/face-milling parameters used by registration/factory.
 # Keep these in one place so Gym registration and direct make_plate_env() calls
 # remain consistent.
-DEFAULT_ENV_DT = 0.001
+DEFAULT_ENV_DT = 0.0001
+DEFAULT_ENV_N_SUBSTEPS = 10
 DEFAULT_FEED_PER_TOOTH_MM = 0.20
 
+# Default process settings shared by training, evaluation, and checker scripts.
+# For first-stage high-speed chatter-suppression training, keep the admissible
+# spindle range at 4000--40000 rpm.  This avoids very long low-speed episodes
+# while preserving the high-speed regime where early regenerative chatter can
+# appear.  Override these explicitly for low-speed lobe studies.
+DEFAULT_ENV_RPM_MIN = 1000.0
+DEFAULT_ENV_RPM_MAX = 40000.0
+DEFAULT_ENV_OMEGA_MIN = float(rpm_to_omega(DEFAULT_ENV_RPM_MIN))
+DEFAULT_ENV_OMEGA_MAX = float(rpm_to_omega(DEFAULT_ENV_RPM_MAX))
+DEFAULT_ENV_AP_MIN_MM = 0.0
+DEFAULT_ENV_AP_MAX_MM = 18
+DEFAULT_ENV_AE_DEFAULT_MM = 28.0
+DEFAULT_ENV_W_LIMIT = 1.0e-3
+DEFAULT_ENV_W_OBS_SCALE = 5.0e-4
+DEFAULT_ENV_WDOT_LIMIT = 10.0
+DEFAULT_ENV_WDOT_OBS_SCALE = 0.5
+DEFAULT_ENV_RANDOMIZE_Y0 = True
+DEFAULT_ENV_Y_CUTTER = 0.20
+DEFAULT_ENV_INITIAL_ETA_STD = 1.0e-7
+DEFAULT_ENV_INITIAL_ETAD_STD = 0.0
+DEFAULT_ENV_MODAL_DAMPING_RATIO = 0.02
+
 # Reward scaling for the current flexible AL7075 face-milling task.
-# Displacement scale is a vibration-quality target, not the crash/termination limit.
-# Velocity scale follows the plant observation scale and keeps velocity secondary
-# to displacement while still penalizing high-frequency chatter.
-DEFAULT_REWARD_W_SCALE = 1.0e-4       # 0.1 mm; matches PlatePlant.w_obs_scale
-DEFAULT_REWARD_WDOT_SCALE = 1.0       # 1 m/s
-DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 10.0
-DEFAULT_REWARD_OMEGA_COST_WEIGHT = 3.0
+# The hard displacement limit is 1 mm.  The dense productivity term is
+# multiplied by a smooth vibration gate, so high material removal is rewarded
+# only when the measured physical vibration remains controlled.
+DEFAULT_REWARD_W_SCALE = 7.5e-4          # softer dense vibration cost; hard limit remains 1 mm
+DEFAULT_REWARD_WDOT_SCALE = 1.0          # 1 m/s velocity scale
+DEFAULT_REWARD_WDOT_WEIGHT = 0.02
+DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 20.0
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 1.0
+DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
+DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
+DEFAULT_REWARD_PASS_COMPLETION_BONUS = 10000.0
+DEFAULT_REWARD_FAILURE_PROGRESS_PENALTY_WEIGHT = 1.0
+
+# Generalized safety-gated productivity:
+#   G = 1 / (1 + (w_rms/w_gate)^2 + beta*(wdot_rms/wdot_gate)^2)
+#   productivity = productivity_weight * normalized_MRR * G
+DEFAULT_REWARD_PRODUCTIVITY_GATE_ENABLED = True
+DEFAULT_REWARD_PRODUCTIVITY_W_GATE = 5.0e-4
+DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE = 1.0
+DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE_WEIGHT = 0.05
+DEFAULT_REWARD_PRODUCTIVITY_GATE_POWER = 2.0
+DEFAULT_REWARD_PRODUCTIVITY_GATE_MIN = 0.0
 
 
 def _translate_legacy_depth_kwargs(kwargs: dict[str, Any]) -> None:
@@ -79,7 +116,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     reward_id = kwargs.pop("reward_id", "dense")
 
     dt = kwargs.pop("dt", DEFAULT_ENV_DT)
-    n_substeps = kwargs.pop("n_substeps", 1)
+    n_substeps = kwargs.pop("n_substeps", DEFAULT_ENV_N_SUBSTEPS)
     max_episode_steps = kwargs.pop("max_episode_steps", None)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
     obs_noise_std = kwargs.pop("obs_noise_std", 0.0)
@@ -166,6 +203,12 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "ap_action_weight",
         "ac_action_weight",
         "include_ae_in_productivity",
+        "productivity_gate_enabled",
+        "productivity_w_gate",
+        "productivity_wdot_gate",
+        "productivity_wdot_gate_weight",
+        "productivity_gate_power",
+        "productivity_gate_min",
         "w_scale",
         "wdot_scale",
         "w_clip",
@@ -175,7 +218,9 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "eta_dot_scale",
         "alive_bonus",
         "termination_penalty",
+        "truncation_penalty",
         "pass_completion_bonus",
+        "failure_progress_penalty_weight",
         # Reward action bounds
         "omega_min",
         "omega_max",
@@ -191,9 +236,23 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     plant_kwargs = {k: v for k, v in kwargs.items() if k in plant_keys}
     reward_kwargs = {k: v for k, v in kwargs.items() if k in reward_keys}
 
-    # Factory-level default for the current AL7075 face-milling setup.
-    # User-supplied feed_per_tooth_mm still overrides this.
+    # Factory-level defaults for the current AL7075 face-milling setup.
+    # User-supplied kwargs still override every value here.
+    plant_kwargs.setdefault("omega_min", DEFAULT_ENV_OMEGA_MIN)
+    plant_kwargs.setdefault("omega_max", DEFAULT_ENV_OMEGA_MAX)
+    plant_kwargs.setdefault("ap_min", DEFAULT_ENV_AP_MIN_MM)
+    plant_kwargs.setdefault("ap_max", DEFAULT_ENV_AP_MAX_MM)
+    plant_kwargs.setdefault("ae_default", DEFAULT_ENV_AE_DEFAULT_MM)
     plant_kwargs.setdefault("feed_per_tooth_mm", DEFAULT_FEED_PER_TOOTH_MM)
+    plant_kwargs.setdefault("w_limit", DEFAULT_ENV_W_LIMIT)
+    plant_kwargs.setdefault("w_obs_scale", DEFAULT_ENV_W_OBS_SCALE)
+    plant_kwargs.setdefault("wdot_limit", DEFAULT_ENV_WDOT_LIMIT)
+    plant_kwargs.setdefault("wdot_obs_scale", DEFAULT_ENV_WDOT_OBS_SCALE)
+    plant_kwargs.setdefault("randomize_y0", DEFAULT_ENV_RANDOMIZE_Y0)
+    plant_kwargs.setdefault("y_cutter", DEFAULT_ENV_Y_CUTTER)
+    plant_kwargs.setdefault("initial_eta_std", DEFAULT_ENV_INITIAL_ETA_STD)
+    plant_kwargs.setdefault("initial_etad_std", DEFAULT_ENV_INITIAL_ETAD_STD)
+    plant_kwargs.setdefault("modal_damping_ratio", DEFAULT_ENV_MODAL_DAMPING_RATIO)
 
     unknown_keys = sorted(set(kwargs) - plant_keys - reward_keys)
     if unknown_keys:
@@ -236,8 +295,25 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     # vibration costs unclipped unless the user explicitly supplies w_clip/wdot_clip.
     reward_kwargs.setdefault("w_scale", DEFAULT_REWARD_W_SCALE)
     reward_kwargs.setdefault("wdot_scale", DEFAULT_REWARD_WDOT_SCALE)
+    reward_kwargs.setdefault("wdot_weight", DEFAULT_REWARD_WDOT_WEIGHT)
     reward_kwargs.setdefault("productivity_weight", DEFAULT_REWARD_PRODUCTIVITY_WEIGHT)
     reward_kwargs.setdefault("omega_cost_weight", DEFAULT_REWARD_OMEGA_COST_WEIGHT)
+    reward_kwargs.setdefault("productivity_gate_enabled", DEFAULT_REWARD_PRODUCTIVITY_GATE_ENABLED)
+    reward_kwargs.setdefault("productivity_w_gate", DEFAULT_REWARD_PRODUCTIVITY_W_GATE)
+    reward_kwargs.setdefault("productivity_wdot_gate", DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE)
+    reward_kwargs.setdefault(
+        "productivity_wdot_gate_weight",
+        DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE_WEIGHT,
+    )
+    reward_kwargs.setdefault("productivity_gate_power", DEFAULT_REWARD_PRODUCTIVITY_GATE_POWER)
+    reward_kwargs.setdefault("productivity_gate_min", DEFAULT_REWARD_PRODUCTIVITY_GATE_MIN)
+    reward_kwargs.setdefault("termination_penalty", DEFAULT_REWARD_TERMINATION_PENALTY)
+    reward_kwargs.setdefault("truncation_penalty", DEFAULT_REWARD_TRUNCATION_PENALTY)
+    reward_kwargs.setdefault("pass_completion_bonus", DEFAULT_REWARD_PASS_COMPLETION_BONUS)
+    reward_kwargs.setdefault(
+        "failure_progress_penalty_weight",
+        DEFAULT_REWARD_FAILURE_PROGRESS_PENALTY_WEIGHT,
+    )
     # Strict by default: reward must use physical sensor signals supplied in info.
     reward_kwargs.setdefault("require_physical_info", True)
 
@@ -274,8 +350,21 @@ def register_envs() -> None:
             kwargs={
                 "reward_id": "dense",
                 "dt": DEFAULT_ENV_DT,
+                "n_substeps": DEFAULT_ENV_N_SUBSTEPS,
+                "omega_min": DEFAULT_ENV_OMEGA_MIN,
+                "omega_max": DEFAULT_ENV_OMEGA_MAX,
+                "ap_min": DEFAULT_ENV_AP_MIN_MM,
+                "ap_max": DEFAULT_ENV_AP_MAX_MM,
+                "ae_default": DEFAULT_ENV_AE_DEFAULT_MM,
                 "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
-                "omega_min": OMEGA_MIN_RAD_S,
-                "omega_max": OMEGA_MAX_RAD_S,
+                "w_limit": DEFAULT_ENV_W_LIMIT,
+                "w_obs_scale": DEFAULT_ENV_W_OBS_SCALE,
+                "wdot_limit": DEFAULT_ENV_WDOT_LIMIT,
+                "wdot_obs_scale": DEFAULT_ENV_WDOT_OBS_SCALE,
+                "randomize_y0": DEFAULT_ENV_RANDOMIZE_Y0,
+                "y_cutter": DEFAULT_ENV_Y_CUTTER,
+                "initial_eta_std": DEFAULT_ENV_INITIAL_ETA_STD,
+                "initial_etad_std": DEFAULT_ENV_INITIAL_ETAD_STD,
+                "modal_damping_ratio": DEFAULT_ENV_MODAL_DAMPING_RATIO,
             },
         )

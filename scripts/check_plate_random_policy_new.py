@@ -33,6 +33,12 @@ from custom_rl.plants.plate import RPM_MAX, RPM_MIN, omega_to_rpm, rpm_to_omega
 ENV_ID = "CustomODEPlate-v0"
 
 
+def make_registered_plate_env(**env_kwargs: Any) -> gym.Env:
+    """Create the registered plate environment using the same workflow as training."""
+    register_envs()
+    return gym.make(ENV_ID, **env_kwargs)
+
+
 def _depth_bounds_from_plant(plant: Any) -> tuple[float, float]:
     """Return axial-depth bounds using new ap names, with old ac fallback."""
     ap_min = getattr(plant, "ap_min", getattr(plant, "ac_min", 0.0))
@@ -635,8 +641,8 @@ def main() -> None:
     parser.add_argument(
         "--randomize-y0",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Sample milling line y0 on each reset.",
+        default=None,
+        help="Sample milling line y0 on each reset (default: registration setting).",
     )
     parser.add_argument("--y0", type=float, default=None, help="Fixed milling line y0 [m].")
     parser.add_argument("--rpm-min", type=float, default=None, help="Override plant minimum spindle speed [rpm].")
@@ -650,8 +656,8 @@ def main() -> None:
     parser.add_argument("--wdot-limit", type=float, default=None, help="Override velocity observation/diagnostic limit [m/s].")
     parser.add_argument("--wdot-obs-scale", type=float, default=None, help="Override velocity observation scale [m/s].")
     parser.add_argument("--modal-damping-ratio", type=float, default=None, help="Override modal damping ratio.")
-    parser.add_argument("--initial-eta-std", type=float, default=0.0, help="Random initial modal displacement std [m]. Useful to excite regeneration.")
-    parser.add_argument("--initial-etad-std", type=float, default=0.0, help="Random initial modal velocity std [m/s].")
+    parser.add_argument("--initial-eta-std", type=float, default=None, help="Random initial modal displacement std [m] (default: registration setting).")
+    parser.add_argument("--initial-etad-std", type=float, default=None, help="Random initial modal velocity std [m/s] (default: registration setting).")
     args = parser.parse_args()
 
     register_envs()
@@ -661,9 +667,10 @@ def main() -> None:
         "dt": args.dt,
         "n_substeps": args.n_substeps,
         "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
-        "randomize_y0": args.randomize_y0,
         "control_ae": args.control_ae,
     }
+    if args.randomize_y0 is not None:
+        env_kwargs["randomize_y0"] = args.randomize_y0
     optional_env_overrides = {
         "omega_min": None if args.rpm_min is None else float(rpm_to_omega(args.rpm_min)),
         "omega_max": None if args.rpm_max is None else float(rpm_to_omega(args.rpm_max)),
@@ -689,7 +696,7 @@ def main() -> None:
     if args.n_substeps <= 0:
         raise ValueError("--n-substeps must be positive.")
 
-    env = gym.make(ENV_ID, **env_kwargs)
+    env = make_registered_plate_env(**env_kwargs)
     plant = env.unwrapped.plant
     action_low, action_high = _physical_action_bounds(plant)
 

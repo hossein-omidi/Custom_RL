@@ -13,7 +13,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import DEFAULT_LOG_DIR, DEFAULT_MODEL_DIR, register_envs
 from custom_rl.eval.pipeline import plate_env_kwargs
-from custom_rl.plants.plate import RPM_MAX, RPM_MIN
+from custom_rl.plants.plate import omega_to_rpm
 
 
 ENV_ID = "CustomODEPlate-v0"
@@ -57,7 +57,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=2_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=600_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -82,22 +82,22 @@ def main() -> None:
     parser.add_argument(
         "--dt",
         type=float,
-        default=0.001,
-        help="ODE integration step size [s]",
+        default=1.0e-4,
+        help="RK4 integration substep [s]",
     )
 
     parser.add_argument(
         "--n-substeps",
         type=int,
-        default=1,
-        help="RK4 substeps per env step",
+        default=10,
+        help="RK4 substeps per environment/control step",
     )
 
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=200000,
-        help="Max steps per episode (default: auto from pass duration)",
+        default=25000,
+        help="Max environment/control steps per episode",
     )
 
     parser.add_argument(
@@ -109,14 +109,14 @@ def main() -> None:
     parser.add_argument(
         "--eval-freq",
         type=int,
-        default=250_000,
+        default=25_000,
         help="Evaluate every N total env steps (higher = less eval overhead)",
     )
 
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
-        default=0.0,
+        default=0.00,
         help="Modal acceleration disturbance std [0=off, e.g. 0.01 for stochastic plant]",
     )
     parser.add_argument(
@@ -133,10 +133,6 @@ def main() -> None:
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.save_dir).mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"Spindle speed range: {RPM_MIN:.0f} - {RPM_MAX:.0f} rpm "
-        f"(physics uses rad/s internally)"
-    )
     print(
         f"Stochastic plant: uncertainty_std={args.dynamics_uncertainty_std}, "
         f"randomize_y0={args.randomize_y0}"
@@ -172,6 +168,32 @@ def main() -> None:
 
     # Show practical episode cap (pass completion usually ends sooner).
     _probe = gym.make(ENV_ID, **env_kwargs)
+    probe_plant = _probe.unwrapped.plant
+    control_dt = float(args.dt) * int(args.n_substeps)
+    print(
+        f"Spindle speed range: {omega_to_rpm(probe_plant.omega_min):.0f} - "
+        f"{omega_to_rpm(probe_plant.omega_max):.0f} rpm "
+        f"({probe_plant.omega_min:.2f} - {probe_plant.omega_max:.2f} rad/s)"
+    )
+    print(
+        f"Integrator: RK4 dt={args.dt:g} s, n_substeps={args.n_substeps}, "
+        f"control step={control_dt:g} s"
+    )
+    print(
+        f"Displacement limit/scale: w_limit={probe_plant.w_limit:g} m, "
+        f"w_obs_scale={probe_plant.w_obs_scale:g} m"
+    )
+    print(
+        f"Action bounds: ap={probe_plant.ap_min:g}-{probe_plant.ap_max:g} mm, "
+        f"ae_default={probe_plant.ae_default:g} mm"
+    )
+    tau_min = 2.0 * 3.141592653589793 / (max(int(probe_plant.N), 1) * max(float(probe_plant.omega_max), 1e-12))
+    print(f"Minimum one-tooth regenerative delay at omega_max: {tau_min:.6g} s")
+    if args.dt >= tau_min:
+        raise ValueError(
+            f"RK4 dt={args.dt:g} s is not smaller than the minimum regenerative "
+            f"tooth delay {tau_min:.6g} s. Reduce --dt or lower omega_max."
+        )
     print(f"Max episode steps (cap): {_probe.unwrapped.max_episode_steps}")
     print(
         f"Note: first PPO rollout collects {PPO_N_STEPS * args.n_envs} env steps "

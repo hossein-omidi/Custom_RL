@@ -3,7 +3,10 @@
 This file is a minimal update of the previous plate reward module.  The reward
 logic remains intentionally simple:
 
-    reward = productivity - vibration cost - action/speed regularization
+    reward = vibration-gated productivity - vibration cost - action/speed regularization
+
+with generalized terminal penalties. The dense productivity term is safety-gated:
+productive cutting is rewarded only when the physical vibration level is controlled
 
 The important consistency change is naming and scaling: the second action is now
 interpreted as axial depth of cut ``ap`` [mm], not the old peripheral-milling
@@ -54,9 +57,9 @@ def _physical_vibration_cost(
     w_clip: float | None = None,
     wdot_clip: float | None = None,
     require_physical_info: bool = True,
-) -> tuple[float, float, str]:
+) -> tuple[float, float, str, float, float]:
     """
-    Return (displacement_cost, velocity_cost, source).
+    Return (displacement_cost, velocity_cost, source, w_rms, wdot_rms).
 
     Required source by default:
         info["w_sensor"], info["wdot_sensor"]
@@ -86,7 +89,7 @@ def _physical_vibration_cost(
         source = "modal_fallback"
 
     if not (np.all(np.isfinite(w_sensor)) and np.all(np.isfinite(wdot_sensor))):
-        return float("inf"), float("inf"), source
+        return float("inf"), float("inf"), source, float("inf"), float("inf")
 
     w_scale = max(float(w_scale), 1e-12)
     wdot_scale = max(float(wdot_scale), 1e-12)
@@ -96,13 +99,129 @@ def _physical_vibration_cost(
     if wdot_clip is not None:
         wdot_sensor = np.clip(wdot_sensor, -float(wdot_clip), float(wdot_clip))
 
+    w_rms = float(np.sqrt(np.mean(w_sensor**2)))
+    wdot_rms = float(np.sqrt(np.mean(wdot_sensor**2)))
+
     w_norm = w_sensor / w_scale
     wdot_norm = wdot_sensor / wdot_scale
 
     w_cost = float(np.mean(w_norm**2))
     wdot_cost = float(np.mean(wdot_norm**2))
 
-    return float(w_weight) * w_cost, float(wdot_weight) * wdot_cost, source
+    return float(w_weight) * w_cost, float(wdot_weight) * wdot_cost, source, w_rms, wdot_rms
+
+
+def _productivity_vibration_gate(
+    *,
+    w_rms: float,
+    wdot_rms: float,
+    enabled: bool,
+    w_gate: float,
+    wdot_gate: float,
+    wdot_gate_weight: float,
+    power: float,
+    gate_min: float,
+) -> float:
+    """Return a smooth safety gate in [gate_min, 1].
+
+    The gate is generalized and state-based, not stage-based:
+
+        G = 1 / (1 + (w_rms/w_gate)^q + beta*(wdot_rms/wdot_gate)^q)
+
+    Thus material-removal productivity is rewarded strongly only while the
+    measured physical vibration is controlled.  The gate never changes the hard
+    plant termination limit; it only prevents dense productivity reward from
+    encouraging cutting while chatter is already developing.
+    """
+    if not enabled:
+        return 1.0
+
+    w_gate = max(float(w_gate), 1e-12)
+    wdot_gate = max(float(wdot_gate), 1e-12)
+    power = max(float(power), 1.0)
+    beta = max(float(wdot_gate_weight), 0.0)
+    gate_min = float(np.clip(gate_min, 0.0, 1.0))
+
+    if not (np.isfinite(w_rms) and np.isfinite(wdot_rms)):
+        return gate_min
+
+    displacement_term = (abs(float(w_rms)) / w_gate) ** power
+    velocity_term = beta * (abs(float(wdot_rms)) / wdot_gate) ** power
+    gate = 1.0 / (1.0 + displacement_term + velocity_term)
+    return float(np.clip(gate, gate_min, 1.0))
+
+
+def _safe_progress(info: dict[str, Any]) -> float:
+    """Return clipped machining progress in [0, 1].
+
+    The plant reports feed_progress = 0 at the beginning of the pass and
+    approximately 0.9 at the configured 90% pass-completion point.  If the
+    value is missing, treat the terminal event as an early failure.
+    """
+    try:
+        progress = float(info.get("feed_progress", 0.0))
+    except Exception:
+        progress = 0.0
+    if not np.isfinite(progress):
+        progress = 0.0
+    return float(np.clip(progress, 0.0, 1.0))
+
+
+def _pass_completed(info: dict[str, Any]) -> bool:
+    """Return True for all pass-completion reason strings used by the plant."""
+    reason = str(info.get("termination_reason", ""))
+    return bool(info.get("pass_completed") or reason in {"pass_completed", "pass_completed_90percent"})
+
+
+def _terminal_adjustment(
+    *,
+    terminated: bool,
+    truncated: bool,
+    info: dict[str, Any],
+    termination_penalty: float,
+    truncation_penalty: float,
+    pass_completion_bonus: float,
+    failure_progress_penalty_weight: float,
+) -> tuple[float, dict[str, float | str]]:
+    """Return terminal reward adjustment and diagnostics.
+
+    The terminal penalty is weighted by continuous feed progress, not by
+    manually defined machining stages. This avoids rewarding immediate failure
+    while keeping the reward generalized over the whole line pass.
+    """
+    if not (terminated or truncated):
+        return 0.0, {
+            "terminal_adjustment": 0.0,
+            "terminal_bonus": 0.0,
+            "terminal_penalty": 0.0,
+            "terminal_progress": _safe_progress(info),
+            "terminal_status": "running",
+        }
+
+    progress = _safe_progress(info)
+    if _pass_completed(info):
+        bonus = float(pass_completion_bonus)
+        return bonus, {
+            "terminal_adjustment": bonus,
+            "terminal_bonus": bonus,
+            "terminal_penalty": 0.0,
+            "terminal_progress": progress,
+            "terminal_status": "pass_completed",
+        }
+
+    base_penalty = float(termination_penalty if terminated else truncation_penalty)
+    multiplier = 1.0 + float(failure_progress_penalty_weight) * (1.0 - progress)
+    multiplier = max(multiplier, 1.0)
+    penalty = base_penalty * multiplier
+    status = "terminated_failure" if terminated else "truncated_failure"
+    return -penalty, {
+        "terminal_adjustment": -penalty,
+        "terminal_bonus": 0.0,
+        "terminal_penalty": penalty,
+        "terminal_progress": progress,
+        "terminal_failure_multiplier": multiplier,
+        "terminal_status": status,
+    }
 
 
 class DenseProductivePlateReward:
@@ -113,11 +232,13 @@ class DenseProductivePlateReward:
 
     For the default 2D action, productivity is a normalized material-removal
     proxy proportional to spindle speed and axial depth:
-        productivity_score = omega_score * ap_score
+        raw_productivity_score = omega_score * ap_score
+        productivity_score = raw_productivity_score * vibration_gate
 
     If a 3D action is used, the third action is radial immersion/depth ae [mm],
     and productivity can include ae in the same material-removal proxy:
-        productivity_score = omega_score * ap_score * ae_score
+        raw_productivity_score = omega_score * ap_score * ae_score
+        productivity_score = raw_productivity_score * vibration_gate
     """
 
     def __init__(
@@ -140,9 +261,17 @@ class DenseProductivePlateReward:
         ae_max: float = 50.0,
         ae_default: float = 25.0,
         include_ae_in_productivity: bool = True,
+        productivity_gate_enabled: bool = True,
+        productivity_w_gate: float | None = None,
+        productivity_wdot_gate: float | None = None,
+        productivity_wdot_gate_weight: float = 0.05,
+        productivity_gate_power: float = 2.0,
+        productivity_gate_min: float = 0.0,
         alive_bonus: float = 0.0,
-        termination_penalty: float = 100.0,
-        pass_completion_bonus: float = 500.0,
+        termination_penalty: float = 500.0,
+        pass_completion_bonus: float = 2000.0,
+        truncation_penalty: float | None = None,
+        failure_progress_penalty_weight: float = 1.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
         require_physical_info: bool = True,
@@ -206,9 +335,20 @@ class DenseProductivePlateReward:
         self.ae_default = float(ae_default)
         self.include_ae_in_productivity = bool(include_ae_in_productivity)
 
+        self.productivity_gate_enabled = bool(productivity_gate_enabled)
+        self.productivity_w_gate = float(self.w_scale if productivity_w_gate is None else productivity_w_gate)
+        self.productivity_wdot_gate = float(self.wdot_scale if productivity_wdot_gate is None else productivity_wdot_gate)
+        self.productivity_wdot_gate_weight = float(productivity_wdot_gate_weight)
+        self.productivity_gate_power = float(productivity_gate_power)
+        self.productivity_gate_min = float(productivity_gate_min)
+
         self.alive_bonus = float(alive_bonus)
         self.termination_penalty = float(termination_penalty)
         self.pass_completion_bonus = float(pass_completion_bonus)
+        self.truncation_penalty = (
+            float(termination_penalty) if truncation_penalty is None else float(truncation_penalty)
+        )
+        self.failure_progress_penalty_weight = float(failure_progress_penalty_weight)
         self.last_reward_terms: dict[str, float | str] = {}
 
         if self.omega_max <= self.omega_min:
@@ -219,6 +359,14 @@ class DenseProductivePlateReward:
             raise ValueError("ap_productive_target must be positive.")
         if self.ae_max <= self.ae_min:
             raise ValueError("ae_max must be greater than ae_min.")
+        if self.productivity_w_gate <= 0.0:
+            raise ValueError("productivity_w_gate must be positive.")
+        if self.productivity_wdot_gate <= 0.0:
+            raise ValueError("productivity_wdot_gate must be positive.")
+        if self.productivity_gate_power < 1.0:
+            raise ValueError("productivity_gate_power must be >= 1.")
+        if not (0.0 <= self.productivity_gate_min <= 1.0):
+            raise ValueError("productivity_gate_min must be in [0, 1].")
 
     def _scale_action(self, u: np.ndarray) -> tuple[float, float, float, bool]:
         """Scale normalized action to physical [omega, ap, ae]."""
@@ -260,7 +408,7 @@ class DenseProductivePlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        w_cost, wdot_cost, signal_source = _physical_vibration_cost(
+        w_cost, wdot_cost, signal_source, w_rms, wdot_rms = _physical_vibration_cost(
             info,
             x_next,
             self.w_weight,
@@ -292,8 +440,22 @@ class DenseProductivePlateReward:
             ae_score = 1.0
 
         # Normalized MRR proxy for face milling. With fixed ae, this reduces
-        # to the omega*ap tradeoff.
-        productivity_score = omega_score * ap_score * ae_score
+        # to the omega*ap tradeoff.  The dense productivity term is then gated
+        # by the measured physical vibration, so high MRR is rewarded only when
+        # chatter is controlled.  This is a continuous state-based gate, not a
+        # staged early/late-process rule.
+        raw_productivity_score = omega_score * ap_score * ae_score
+        productivity_gate = _productivity_vibration_gate(
+            w_rms=w_rms,
+            wdot_rms=wdot_rms,
+            enabled=self.productivity_gate_enabled,
+            w_gate=self.productivity_w_gate,
+            wdot_gate=self.productivity_wdot_gate,
+            wdot_gate_weight=self.productivity_wdot_gate_weight,
+            power=self.productivity_gate_power,
+            gate_min=self.productivity_gate_min,
+        )
+        productivity_score = raw_productivity_score * productivity_gate
         productivity_term = self.productivity_weight * productivity_score
 
         omega_cost = self.omega_cost_weight * (omega_score**2)
@@ -316,12 +478,30 @@ class DenseProductivePlateReward:
             - self.action_weight * action_cost
         )
 
+        terminal_adjustment, terminal_terms = _terminal_adjustment(
+            terminated=bool(terminated),
+            truncated=bool(truncated),
+            info=info,
+            termination_penalty=self.termination_penalty,
+            truncation_penalty=self.truncation_penalty,
+            pass_completion_bonus=self.pass_completion_bonus,
+            failure_progress_penalty_weight=self.failure_progress_penalty_weight,
+        )
+        reward += terminal_adjustment
+
         self.last_reward_terms = {
             "vibration_w_cost": float(w_cost),
             "vibration_wdot_cost": float(wdot_cost),
             "vibration_signal_source": signal_source,
             "w_scale_m": float(self.w_scale),
             "wdot_scale_m_s": float(self.wdot_scale),
+            "w_rms_m": float(w_rms),
+            "wdot_rms_m_s": float(wdot_rms),
+            "raw_productivity_score": float(raw_productivity_score),
+            "productivity_gate": float(productivity_gate),
+            "productivity_score": float(productivity_score),
+            "productivity_w_gate_m": float(self.productivity_w_gate),
+            "productivity_wdot_gate_m_s": float(self.productivity_wdot_gate),
             "productivity": float(productivity_term),
             "omega_cost": float(omega_cost),
             "negative_ap_cost": float(self.negative_ap_weight * negative_ap_cost),
@@ -330,14 +510,8 @@ class DenseProductivePlateReward:
             "omega_rad_s": float(omega),
             "ap_mm": float(ap),
             "ae_mm": float(ae),
+            **terminal_terms,
         }
-
-        if terminated:
-            reason = str(info.get("termination_reason", ""))
-            if reason == "pass_completed" or info.get("pass_completed"):
-                reward += self.pass_completion_bonus
-            else:
-                reward -= self.termination_penalty
 
         if not np.isfinite(reward):
             reward = -float(self.termination_penalty)
@@ -356,8 +530,10 @@ class DenseQuadraticPlateReward:
         w_scale: float = 1e-4,
         wdot_scale: float = 1.0,
         alive_bonus: float = 0.0,
-        termination_penalty: float = 100.0,
-        pass_completion_bonus: float = 500.0,
+        termination_penalty: float = 500.0,
+        pass_completion_bonus: float = 2000.0,
+        truncation_penalty: float | None = None,
+        failure_progress_penalty_weight: float = 1.0,
         w_clip: float | None = None,
         wdot_clip: float | None = None,
         require_physical_info: bool = True,
@@ -387,6 +563,10 @@ class DenseQuadraticPlateReward:
         self.alive_bonus = float(alive_bonus)
         self.termination_penalty = float(termination_penalty)
         self.pass_completion_bonus = float(pass_completion_bonus)
+        self.truncation_penalty = (
+            float(termination_penalty) if truncation_penalty is None else float(truncation_penalty)
+        )
+        self.failure_progress_penalty_weight = float(failure_progress_penalty_weight)
         self.last_reward_terms: dict[str, float | str] = {}
 
     def __call__(
@@ -405,7 +585,7 @@ class DenseQuadraticPlateReward:
         if not np.all(np.isfinite(x_next)):
             return -float(self.termination_penalty)
 
-        w_cost, wdot_cost, signal_source = _physical_vibration_cost(
+        w_cost, wdot_cost, signal_source, w_rms, wdot_rms = _physical_vibration_cost(
             info,
             x_next,
             self.w_weight,
@@ -422,21 +602,28 @@ class DenseQuadraticPlateReward:
         action_cost = float(np.sum(np.clip(u, -1.0, 1.0) ** 2))
         reward = self.alive_bonus - w_cost - wdot_cost - self.action_weight * action_cost
 
+        terminal_adjustment, terminal_terms = _terminal_adjustment(
+            terminated=bool(terminated),
+            truncated=bool(truncated),
+            info=info,
+            termination_penalty=self.termination_penalty,
+            truncation_penalty=self.truncation_penalty,
+            pass_completion_bonus=self.pass_completion_bonus,
+            failure_progress_penalty_weight=self.failure_progress_penalty_weight,
+        )
+        reward += terminal_adjustment
+
         self.last_reward_terms = {
             "vibration_w_cost": float(w_cost),
             "vibration_wdot_cost": float(wdot_cost),
             "vibration_signal_source": signal_source,
             "w_scale_m": float(self.w_scale),
             "wdot_scale_m_s": float(self.wdot_scale),
+            "w_rms_m": float(w_rms),
+            "wdot_rms_m_s": float(wdot_rms),
             "action_cost": float(self.action_weight * action_cost),
+            **terminal_terms,
         }
-
-        if terminated:
-            reason = str(info.get("termination_reason", ""))
-            if reason == "pass_completed" or info.get("pass_completed"):
-                reward += self.pass_completion_bonus
-            else:
-                reward -= self.termination_penalty
 
         if not np.isfinite(reward):
             reward = -float(self.termination_penalty)

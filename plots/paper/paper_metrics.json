@@ -1,9 +1,9 @@
 {
   "seeds": {
     "0": {
-      "n_episodes": 10,
-      "mean_return": 90750.52223291792,
-      "std_return": 37.48538049691596,
+      "n_episodes": 2,
+      "mean_return": 11745.342915851857,
+      "std_return": 60.7897740677472,
       "pass_completion_rate": 1.0
     },
     "1": {
@@ -20,9 +20,9 @@
     }
   },
   "aggregate": {
-    "n_episodes": 30,
-    "mean_return": 30233.54479927658,
-    "std_return": 42791.979596998804,
-    "pass_completion_rate": 0.3333333333333333
+    "n_episodes": 22,
+    "mean_return": 1045.082158219178,
+    "std_return": 3383.9244646610746,
+    "pass_completion_rate": 0.09090909090909091
   }
 }
