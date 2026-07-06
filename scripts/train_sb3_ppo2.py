@@ -33,6 +33,23 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.03
 PPO_NET_ARCH = [256, 256]
+PPO_LOG_STD_INIT = -1.0
+
+# Safe-start bias for the action network output layer.  Normalized actions
+# live in [-1, 1]; bias toward low ap (≈0.5 mm out of 0-18 mm) so the
+# untrained policy defaults to the stable region instead of mid-range.
+PPO_ACTION_BIAS_INIT = [0.0, -0.9]
+
+
+def _init_action_bias(model: "PPO") -> None:
+    """Overwrite the action-net output bias so the untrained policy starts safe."""
+    import torch
+
+    bias = torch.tensor(PPO_ACTION_BIAS_INIT, dtype=torch.float32)
+    action_net = model.policy.action_net
+    if hasattr(action_net, "bias") and action_net.bias is not None:
+        with torch.no_grad():
+            action_net.bias.copy_(bias[: action_net.bias.numel()])
 
 
 def make_registered_plate_env(**env_kwargs):
@@ -57,7 +74,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=600_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -103,7 +120,7 @@ def main() -> None:
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=1,
+        default=2,
         help="Evaluation episodes per callback. Keep small because one stable pass is long.",
     )
     parser.add_argument(
@@ -116,7 +133,7 @@ def main() -> None:
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Modal acceleration disturbance std [0=off, e.g. 0.01 for stochastic plant]",
     )
     parser.add_argument(
@@ -203,7 +220,8 @@ def main() -> None:
         "PPO defaults: "
         f"lr={PPO_LEARNING_RATE}, n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
         f"epochs={PPO_N_EPOCHS}, gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
-        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}"
+        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}, "
+        f"log_std_init={PPO_LOG_STD_INIT}, action_bias={PPO_ACTION_BIAS_INIT}"
     )
     _probe.close()
 
@@ -254,10 +272,15 @@ def main() -> None:
             vf_coef=PPO_VF_COEF,
             max_grad_norm=PPO_MAX_GRAD_NORM,
             target_kl=PPO_TARGET_KL,
-            policy_kwargs=dict(net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH)),
+            policy_kwargs=dict(
+                net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH),
+                log_std_init=PPO_LOG_STD_INIT,
+            ),
             verbose=1,
             device="cpu",
         )
+
+        _init_action_bias(model)
 
         model.learn(
             total_timesteps=args.total_timesteps,

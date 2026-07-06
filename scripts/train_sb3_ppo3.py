@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
@@ -33,6 +34,40 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.03
 PPO_NET_ARCH = [256, 256]
+PPO_LOG_STD_INIT = -1.0
+
+# Fraction of the physical ap range used as the safe-start target.
+# 0.05 means 5% of (ap_max - ap_min) above ap_min.
+SAFE_AP_FRACTION = 0.05
+
+
+def _compute_safe_action_bias(plant) -> list[float]:
+    """Derive a normalized-action bias from the plant's actual bounds so the
+    untrained policy defaults to a safe operating point (low ap, mid omega)."""
+    ap_range = float(plant.ap_max - plant.ap_min)
+    if ap_range > 0:
+        safe_ap = float(plant.ap_min) + SAFE_AP_FRACTION * ap_range
+        u_ap = 2.0 * (safe_ap - float(plant.ap_min)) / ap_range - 1.0
+    else:
+        u_ap = 0.0
+
+    bias = [0.0, float(np.clip(u_ap, -1.0, 1.0))]
+
+    if int(getattr(plant, "action_dim", 2)) > 2:
+        bias.append(0.0)
+
+    return bias
+
+
+def _init_action_bias(model: PPO, bias: list[float]) -> None:
+    """Set the action-net output bias so the untrained policy defaults to safe ap."""
+    import torch
+
+    action_net = model.policy.action_net
+    if hasattr(action_net, "bias") and action_net.bias is not None:
+        n = min(len(bias), action_net.bias.numel())
+        with torch.no_grad():
+            action_net.bias[:n] = torch.tensor(bias[:n], dtype=torch.float32)
 
 
 def make_registered_plate_env(**env_kwargs):
@@ -57,7 +92,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=600_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -103,7 +138,7 @@ def main() -> None:
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=1,
+        default=2,
         help="Evaluation episodes per callback. Keep small because one stable pass is long.",
     )
     parser.add_argument(
@@ -116,7 +151,7 @@ def main() -> None:
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Modal acceleration disturbance std [0=off, e.g. 0.01 for stochastic plant]",
     )
     parser.add_argument(
@@ -194,6 +229,10 @@ def main() -> None:
             f"RK4 dt={args.dt:g} s is not smaller than the minimum regenerative "
             f"tooth delay {tau_min:.6g} s. Reduce --dt or lower omega_max."
         )
+
+    safe_bias = _compute_safe_action_bias(probe_plant)
+    print(f"Safe-start action bias (normalized): {safe_bias}")
+
     print(f"Max episode steps (cap): {_probe.unwrapped.max_episode_steps}")
     print(
         f"Note: first PPO rollout collects {PPO_N_STEPS * args.n_envs} env steps "
@@ -203,7 +242,8 @@ def main() -> None:
         "PPO defaults: "
         f"lr={PPO_LEARNING_RATE}, n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
         f"epochs={PPO_N_EPOCHS}, gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
-        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}"
+        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}, "
+        f"log_std_init={PPO_LOG_STD_INIT}"
     )
     _probe.close()
 
@@ -254,10 +294,15 @@ def main() -> None:
             vf_coef=PPO_VF_COEF,
             max_grad_norm=PPO_MAX_GRAD_NORM,
             target_kl=PPO_TARGET_KL,
-            policy_kwargs=dict(net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH)),
+            policy_kwargs=dict(
+                net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH),
+                log_std_init=PPO_LOG_STD_INIT,
+            ),
             verbose=1,
             device="cpu",
         )
+
+        _init_action_bias(model, safe_bias)
 
         model.learn(
             total_timesteps=args.total_timesteps,
