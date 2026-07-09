@@ -15,6 +15,16 @@ The classification follows the environment's own pass logic:
 
 No reward is used for classification.
 
+This is an *amplitude-threshold* stability boundary: a trial is called stable
+when the physical sensor displacement stays below the plant limit w_limit for
+the whole pass.  For the nonlinear regenerative plant this is the practical
+engineering boundary (surface finish / tool safety are amplitude-driven).  Note
+it is not identical to a strict asymptotic/Hopf stability boundary: a nonlinear
+chatter limit cycle that saturates below w_limit would be classified stable.
+For a stricter chatter test one would add a once-per-tooth (Poincare) periodicity
+metric; the amplitude criterion is used here deliberately for its direct physical
+meaning and its consistency with the RL environment's own termination logic.
+
 Outputs / modes
 ---------------
 1) 2D lobe:
@@ -350,7 +360,17 @@ def find_max_stable_ap(
     x_start_m: float | None = None,
     line_y_m: float | None = None,
 ) -> tuple[float, TrialMetrics, TrialMetrics | None]:
-    """Binary search for the largest stable axial depth of cut ap."""
+    """Binary search for the largest stable axial depth of cut ap.
+
+    All trials in one search use a single fixed ``seed`` so that every axial
+    depth ap is evaluated under the *same* initial condition (the registered
+    plant applies a small initial modal perturbation, initial_eta_std, whose
+    value depends on the reset seed).  Holding the seed constant makes the
+    deterministic boundary reproducible and keeps the bisection monotone in ap
+    (the only varying quantity is ap, not the initial state).  Stochastic
+    variation is injected one level up in find_max_stable_ap_mc, which calls
+    this routine with a distinct seed per Monte-Carlo replicate.
+    """
     ap_lo = float(ap_min)
     ap_hi = float(ap_max)
 
@@ -371,7 +391,7 @@ def find_max_stable_ap(
         omega_rad_s=omega_rad_s,
         ap_mm=ap_hi,
         max_steps=max_steps,
-        seed=seed + 1,
+        seed=seed,
         x_start_m=x_start_m,
         line_y_m=line_y_m,
     )
@@ -391,7 +411,7 @@ def find_max_stable_ap(
             omega_rad_s=omega_rad_s,
             ap_mm=ap_mid,
             max_steps=max_steps,
-            seed=seed + int(round(ap_mid * 10_000.0)),
+            seed=seed,
             x_start_m=x_start_m,
             line_y_m=line_y_m,
         )
@@ -1052,7 +1072,25 @@ def _make_env(args: argparse.Namespace, *, stochastic: bool = False) -> gym.Env:
         if value is not None:
             env_kwargs[key] = value
 
-    return gym.make(ENV_ID, **env_kwargs)
+    env = gym.make(ENV_ID, **env_kwargs)
+
+    # Robustness guard: the regenerative force needs at least a few RK4 substeps
+    # per tooth period.  The swept range tops out at rpm_max, whose one-tooth
+    # delay is tau = 60 / (rpm_max * N).  Warn if the control step dt*n_substeps
+    # is not comfortably below tau, since a too-coarse step corrupts the delayed
+    # (regenerative) state and can misclassify stability.
+    plant = env.unwrapped.plant
+    n_teeth = max(int(getattr(plant, "N", 1)), 1)
+    tau_min = 60.0 / (max(float(args.rpm_max), 1e-9) * n_teeth)
+    control_dt = float(args.dt) * int(args.n_substeps)
+    if control_dt >= tau_min:
+        print(
+            f"Warning: control step dt*n_substeps={control_dt:g} s is not smaller "
+            f"than the one-tooth delay tau={tau_min:g} s at rpm_max={args.rpm_max:g} "
+            f"(N={n_teeth}). Reduce --dt or --rpm-max, or raise --n-substeps, so the "
+            "regenerative delay is resolved."
+        )
+    return env
 
 
 def parse_args() -> argparse.Namespace:

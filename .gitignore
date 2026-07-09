@@ -1,6 +1,3 @@
-cd ~/projects/Custom_RL
-
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -23,10 +20,14 @@ env/
 *.swp
 *.swo
 
-# Training outputs (regeneratable)
+# Training / evaluation / control outputs (regeneratable)
 logs/
 models/
 eval_trajectories/
+mpc_trajectories/
+mpc_trajectories_finish/
+plots/**/*.png
+plots/**/*.pdf
 plots/*.png
 plots/*.pdf
 
@@ -41,4 +42,3 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
-EOF

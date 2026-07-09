@@ -234,6 +234,92 @@ python scripts/plot_paper_figures.py \
 
 Produces the learning curve, closed-loop control/vibration time series, actuator heatmaps across runs, the (rpm, ap) operating-density map, the vibration field over pass progress, an evaluation summary (return distribution and pass-completion rate), a dense reward-term decomposition, cutting-force trajectories, and a vibration-robustness-vs-pass-line (y=a) figure.
 
+## Model Predictive Control (MPC) — independent verification of the RL policy
+
+`scripts/mpc_face_milling.py` adds a second, physics-based controller so the PPO
+actor–critic policy can be independently verified against a model-based optimal
+controller on the **same** plant and the **same** dense reward. It is completely
+independent of the RL training code: it connects an MPC policy in place of PPO to
+the existing Gymnasium environment.
+
+### Optimal control problem (online, CasADi + IPOPT)
+
+At every control instant the controller solves a finite-horizon nonlinear OCP by
+**direct multiple shooting**. With modal state `z = [eta; eta_dot]`, measured
+plate response `w = Phi @ eta`, horizon `Np`, and step `Ts`:
+
+```text
+minimize   sum_k  L(z_{k+1}, u_k)            (dense-reward stage cost)
+              + rho * sum_k slack_k          (safe-region softening)
+              + terminal cost + control-rate penalties
+
+subject to (EQUALITY constraints)
+  (E1)  z_{k+1} = F_RK4(z_k, u_k, w_z(t_k - tau))   discretised modal EOM
+  (E2)  w_k     = Phi @ eta_k                       measurement / mode-shape map
+  (E3)  z_0     = z_meas                            initial condition each sample
+
+subject to (INEQUALITY constraints / bounds)
+  omega_min <= omega_k <= omega_max
+  ap_min    <= ap_k    <= ap_max        (first mode; ap fixed in second mode)
+  |w_k| <= w_limit + slack_k,  slack_k >= 0         safe machining region
+```
+
+The internal prediction model is the **zeroth-order period-averaged (Altintas–
+Budak) regenerative face-milling model** derived from — and numerically verified
+against — `custom_rl/plants/f_nonlinear2_face_milling.py`. It keeps the full
+regenerative chatter mechanism `w_z(t) - w_z(t-tau)` with `tau = 2*pi/(N*omega)`,
+so stability depends on spindle speed exactly as in the plant. The objective is
+the project's own `DenseProductivePlateReward` reconstructed symbolically with the
+environment's exact weights, so the MPC maximises the very quantity the PPO return
+measures. Because gradient NLP cannot jump between stability lobes, each solve is
+globally seeded by a spindle-speed pre-screen (an enumeration of the same discrete
+model), and the regenerative delay is frozen at the pre-screen speed to keep the
+NLP well conditioned.
+
+### First-mode (roughing) control — decision `[omega, ap]`
+
+```bash
+python scripts/mpc_face_milling.py \
+  --env-id CustomODEPlate-v0 \
+  --seeds 0 --n-episodes 1 --y0 0.2 \
+  --max-steps 900 --out-dir mpc_trajectories
+```
+
+### Second-mode (finishing) control — decision `[omega]`, `ap` fixed
+
+```bash
+python scripts/mpc_face_milling.py \
+  --env-id CustomODEPlateFinish-v0 \
+  --seeds 0 --n-episodes 1 --y0 0.2 --ap 0.5 \
+  --max-steps 600 --out-dir mpc_trajectories_finish
+```
+
+Key options: `--horizon` (Np), `--control-hold` (env steps per MPC decision /
+zero-order hold; the MPC step is `Ts = control_hold * dt * n_substeps`),
+`--terminal-weight`, `--slack-weight`, `--prescreen-n-omega`, `--prescreen-n-ap`,
+`--max-iter`, `--hessian`, and `--feedback {state,observer}`. MPC trajectories are
+saved in the **same JSON schema** as `eval_policy.py`, so all downstream tooling
+works unchanged. The MPC runs slower than RL inference (an NLP is solved per step),
+so `--max-steps` caps the closed-loop length for a representative segment.
+
+### Compare MPC against the trained RL policy
+
+```bash
+# 1) evaluate the trained RL policy on the same milling line
+python scripts/eval_policy.py --env-id CustomODEPlate-v0 --seeds 0 \
+  --reward dense --n-episodes 1 --max-episode-steps 900 --y0 0.2 \
+  --model-dir models/ppo_plate --out-dir eval_trajectories
+
+# 2) run the MPC on the same milling line (see above), then overlay both
+python scripts/compare_mpc_rl.py \
+  --rl-dir eval_trajectories --mpc-dir mpc_trajectories --out-dir plots/mpc_vs_rl
+```
+
+`compare_mpc_rl.py` overlays plate displacement `max|w(t)|` (with the safety
+limit), spindle speed, axial depth `ap`, axial force `Fz`, cumulative reward, and
+feed progress for each matched episode, plus a summary bar chart (return, `max|w|`,
+pass completion, feed progress) and a printed table.
+
 ## Stability lobe diagram (no-control, RL-independent)
 
 ```bash
@@ -284,10 +370,19 @@ scripts/
   check_plate_random_policy_new.py Environment smoke test with random/fixed policy
   train_sb3_ppo.py                 Multi-seed PPO training
   eval_policy.py                   Policy evaluation and trajectory export
+  mpc_face_milling.py              CasADi NMPC chatter-suppression controller
+                                    (first- and second-mode) + closed-loop runner
+  compare_mpc_rl.py                Overlay MPC vs RL trajectories and summaries
   plot_results.py                  Basic training/trajectory plots
   plot_paper_figures.py            Publication-quality figures (see above)
   stability_lobe_new.py            No-control stability lobe diagram (2D/3D/MC)
   validate_stochastic_setup.py     Stochastic-plant sanity checks
+```
+
+The MPC controller requires CasADi:
+
+```bash
+pip install casadi
 ```
 
 ## Default output directories
@@ -296,5 +391,8 @@ scripts/
 logs/ppo_plate/                 training monitor logs
 models/ppo_plate/               saved PPO models
 eval_trajectories/              evaluation trajectory JSON files
+mpc_trajectories/               MPC closed-loop trajectory JSON files
+mpc_trajectories_finish/        MPC second-mode (finishing) trajectories
 plots/                          generated plots
+plots/mpc_vs_rl/                MPC vs RL comparison figures
 ```

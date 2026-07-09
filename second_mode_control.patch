@@ -1,0 +1,494 @@
+diff --git a/custom_rl/envs/registration.py b/custom_rl/envs/registration.py
+index b227de1..0d21bea 100644
+--- a/custom_rl/envs/registration.py
++++ b/custom_rl/envs/registration.py
+@@ -157,6 +157,9 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
+         "ae_max",
+         "ae_default",
+         "control_ae",
++        "control_ap",
++        "randomize_ap",
++        "ap_fixed",
+         # Face-milling force parameters
+         "D_mm",
+         "feed_per_tooth_mm",
+@@ -342,7 +345,20 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
+ 
+ 
+ def register_envs() -> None:
+-    """Register custom RL environment with Gymnasium.
++    """Register the custom face-milling RL environments with Gymnasium.
++
++    Two environment ids share the same plant, reward, and physics and differ
++    only in the RL action space:
++
++    ``CustomODEPlate-v0`` (first-mode / roughing control)
++        Action = [omega, ap].  Both spindle speed and axial depth of cut are
++        controlled to maximize material removal while suppressing chatter.
++
++    ``CustomODEPlateFinish-v0`` (second-mode / finishing control)
++        Action = [omega] only.  Axial depth of cut ap is a fixed process
++        parameter, randomized per episode over [ap_min, ap_max] exactly like the
++        milling line y0.  Spindle speed alone is modulated to suppress chatter at
++        a constant depth, for a uniform finishing pass.
+ 
+     Do not set Gymnasium's external ``max_episode_steps`` here.
+     ``make_plate_env`` computes the episode limit from the actual constructed
+@@ -350,30 +366,40 @@ def register_envs() -> None:
+     passes that limit into ODEControlEnv. This avoids a stale TimeLimit wrapper
+     if the user overrides feed or dt in gym.make(...).
+     """
+-    env_id = "CustomODEPlate-v0"
++    common_kwargs = {
++        "reward_id": "dense",
++        "dt": DEFAULT_ENV_DT,
++        "n_substeps": DEFAULT_ENV_N_SUBSTEPS,
++        "omega_min": DEFAULT_ENV_OMEGA_MIN,
++        "omega_max": DEFAULT_ENV_OMEGA_MAX,
++        "ap_min": DEFAULT_ENV_AP_MIN_MM,
++        "ap_max": DEFAULT_ENV_AP_MAX_MM,
++        "ae_default": DEFAULT_ENV_AE_DEFAULT_MM,
++        "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
++        "w_limit": DEFAULT_ENV_W_LIMIT,
++        "w_obs_scale": DEFAULT_ENV_W_OBS_SCALE,
++        "wdot_limit": DEFAULT_ENV_WDOT_LIMIT,
++        "wdot_obs_scale": DEFAULT_ENV_WDOT_OBS_SCALE,
++        "randomize_y0": DEFAULT_ENV_RANDOMIZE_Y0,
++        "y_cutter": DEFAULT_ENV_Y_CUTTER,
++        "initial_eta_std": DEFAULT_ENV_INITIAL_ETA_STD,
++        "initial_etad_std": DEFAULT_ENV_INITIAL_ETAD_STD,
++        "modal_damping_ratio": DEFAULT_ENV_MODAL_DAMPING_RATIO,
++    }
++
++    # First-mode / roughing control: action = [omega, ap].
++    if "CustomODEPlate-v0" not in gym.envs.registry:
++        gym.register(
++            id="CustomODEPlate-v0",
++            entry_point="custom_rl.envs.registration:make_plate_env",
++            kwargs={**common_kwargs, "control_ap": True},
++        )
+ 
+-    if env_id not in gym.envs.registry:
++    # Second-mode / finishing control: action = [omega]; ap fixed per episode
++    # and randomized over [ap_min, ap_max] like the milling line y0.
++    if "CustomODEPlateFinish-v0" not in gym.envs.registry:
+         gym.register(
+-            id=env_id,
++            id="CustomODEPlateFinish-v0",
+             entry_point="custom_rl.envs.registration:make_plate_env",
+-            kwargs={
+-                "reward_id": "dense",
+-                "dt": DEFAULT_ENV_DT,
+-                "n_substeps": DEFAULT_ENV_N_SUBSTEPS,
+-                "omega_min": DEFAULT_ENV_OMEGA_MIN,
+-                "omega_max": DEFAULT_ENV_OMEGA_MAX,
+-                "ap_min": DEFAULT_ENV_AP_MIN_MM,
+-                "ap_max": DEFAULT_ENV_AP_MAX_MM,
+-                "ae_default": DEFAULT_ENV_AE_DEFAULT_MM,
+-                "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
+-                "w_limit": DEFAULT_ENV_W_LIMIT,
+-                "w_obs_scale": DEFAULT_ENV_W_OBS_SCALE,
+-                "wdot_limit": DEFAULT_ENV_WDOT_LIMIT,
+-                "wdot_obs_scale": DEFAULT_ENV_WDOT_OBS_SCALE,
+-                "randomize_y0": DEFAULT_ENV_RANDOMIZE_Y0,
+-                "y_cutter": DEFAULT_ENV_Y_CUTTER,
+-                "initial_eta_std": DEFAULT_ENV_INITIAL_ETA_STD,
+-                "initial_etad_std": DEFAULT_ENV_INITIAL_ETAD_STD,
+-                "modal_damping_ratio": DEFAULT_ENV_MODAL_DAMPING_RATIO,
+-            },
++            kwargs={**common_kwargs, "control_ap": False, "randomize_ap": True},
+         )
+diff --git a/custom_rl/eval/pipeline.py b/custom_rl/eval/pipeline.py
+index 11862d9..288fc4d 100644
+--- a/custom_rl/eval/pipeline.py
++++ b/custom_rl/eval/pipeline.py
+@@ -180,9 +180,11 @@ def plant_plot_metadata(env) -> dict[str, Any]:
+     ae_default = _safe_float(getattr(plant, "ae_default", np.nan))
+     ae_ratio = _ae_over_d(ae_default, d_mm)
+ 
++    env_id = getattr(getattr(env, "spec", None), "id", None) or "CustomODEPlate-v0"
++
+     metadata: dict[str, Any] = {
+         # Environment/time configuration
+-        "env_id": "CustomODEPlate-v0",
++        "env_id": str(env_id),
+         "dt": float(base_env.dt),
+         "n_substeps": int(base_env.n_substeps),
+         "step_dt": float(base_env._step_dt),
+@@ -299,6 +301,14 @@ def plant_plot_metadata(env) -> dict[str, Any]:
+         metadata["ap_min_mm"] = _safe_float(plant.ap_min)
+         metadata["ap_max_mm"] = _safe_float(plant.ap_max)
+ 
++    # Control-mode convention: ap is an RL action (first-mode / roughing) or a
++    # fixed per-episode process parameter (second-mode / finishing).
++    control_ap = _safe_bool(getattr(plant, "control_ap", True), True)
++    metadata["control_ap"] = control_ap
++    metadata["randomize_ap"] = _safe_bool(getattr(plant, "randomize_ap", False))
++    metadata["control_mode"] = "roughing_omega_ap" if control_ap else "finishing_omega_only"
++    metadata["rl_action_dim"] = int(getattr(plant, "action_dim", len(action_names)))
++
+     return metadata
+ 
+ 
+diff --git a/custom_rl/plants/plate.py b/custom_rl/plants/plate.py
+index 045e721..02245ae 100644
+--- a/custom_rl/plants/plate.py
++++ b/custom_rl/plants/plate.py
+@@ -249,6 +249,9 @@ class PlatePlant(ODEPlant):
+         ae_max: float = 50.0,
+         ae_default: float = 28.0,
+         control_ae: bool = False,
++        control_ap: bool = True,
++        randomize_ap: bool = False,
++        ap_fixed: float | None = None,
+         D_mm: float = 63.0,
+         feed_per_tooth_mm: float = 0.20,
+         gamma_L_deg: float = 45.0,
+@@ -345,6 +348,20 @@ class PlatePlant(ODEPlant):
+         self.ae_default = float(np.clip(ae_default, self.ae_min, self.ae_max))
+         self.control_ae = bool(control_ae)
+ 
++        # Second-mode / finishing control: when control_ap is False, axial depth
++        # of cut ap is NOT an RL action.  It is a fixed process parameter held
++        # constant within an episode.  Like the milling line y0, it can be
++        # randomized between episodes (randomize_ap) over [ap_min, ap_max], or
++        # held at a single constant value ap_fixed.
++        self.control_ap = bool(control_ap)
++        self.randomize_ap = bool(randomize_ap)
++        if ap_fixed is not None:
++            self._ap_fixed = float(np.clip(ap_fixed, self.ap_min, self.ap_max))
++        else:
++            self._ap_fixed = 0.5 * (self.ap_min + self.ap_max)
++        # Current per-episode axial depth used when ap is a fixed parameter.
++        self._episode_ap = float(self._ap_fixed)
++
+         self.D_mm = float(D_mm)
+         self.feed_per_tooth_mm = float(feed_per_tooth_mm)
+         self.cf = self.feed_per_tooth_mm  # compatibility alias: cf = ft [mm/tooth]
+@@ -437,7 +454,10 @@ class PlatePlant(ODEPlant):
+         self.force_module = f_nonlinear2
+         self.face_milling_force_module = f_nonlinear2
+ 
+-        # Normalized action bounds.  Default action is [omega, ap].
++        # Full physical action bounds [omega, ap] or [omega, ap, ae].  These are
++        # kept full-width regardless of which entries are RL-controlled, so that
++        # physical_action_bounds()/metadata and the physical action logged during
++        # evaluation always describe [omega, ap(, ae)] consistently.
+         if self.control_ae:
+             self.u_phys_low = np.array(
+                 [self.omega_min, self.ap_min, self.ae_min], dtype=np.float64
+@@ -452,7 +472,28 @@ class PlatePlant(ODEPlant):
+             self.u_phys_high = np.array(
+                 [self.omega_max, self.ap_max], dtype=np.float64
+             )
+-        self.action_dim = int(self.u_phys_low.size)
++
++        # Controlled-action layout for the normalized RL action.  omega is always
++        # controlled; ap only if control_ap; ae only if control_ae.  These bounds
++        # drive _scale_action; uncontrolled entries are injected as fixed process
++        # parameters (ap from the per-episode value, ae from ae_default).
++        ctrl_low = [self.omega_min]
++        ctrl_high = [self.omega_max]
++        if self.control_ap:
++            self._ap_action_idx = len(ctrl_low)
++            ctrl_low.append(self.ap_min)
++            ctrl_high.append(self.ap_max)
++        else:
++            self._ap_action_idx = None
++        if self.control_ae:
++            self._ae_action_idx = len(ctrl_low)
++            ctrl_low.append(self.ae_min)
++            ctrl_high.append(self.ae_max)
++        else:
++            self._ae_action_idx = None
++        self._ctrl_low = np.array(ctrl_low, dtype=np.float64)
++        self._ctrl_high = np.array(ctrl_high, dtype=np.float64)
++        self.action_dim = int(self._ctrl_low.size)
+ 
+         # Straight x-pass reference timeline, used for diagnostics and y path.
+         pass_duration = estimate_pass_duration(
+@@ -752,16 +793,28 @@ class PlatePlant(ODEPlant):
+     # Action scaling and dynamics
+     # ------------------------------------------------------------------
+     def _scale_action(self, u: np.ndarray) -> np.ndarray:
++        """Map the normalized RL action to the full physical action.
++
++        The returned vector is always the full face-milling action
++        ``[omega, ap]`` (or ``[omega, ap, ae]`` when control_ae=True), regardless
++        of which entries are RL-controlled.  Uncontrolled ap is injected from the
++        per-episode value ``self._episode_ap``; uncontrolled ae from ae_default.
++        This keeps begin_step/end_step/dynamics and the force module unchanged.
++        """
+         u = np.asarray(u, dtype=np.float64).reshape(-1)
+         if u.size != self.action_dim:
+             raise ValueError(
+                 f"PlatePlant expects action shape ({self.action_dim},), got {u.shape}."
+             )
+         u = np.clip(u, -1.0, 1.0)
+-        u_phys = self.u_phys_low + 0.5 * (u + 1.0) * (
+-            self.u_phys_high - self.u_phys_low
+-        )
+-        return np.asarray(u_phys, dtype=np.float64)
++        ctrl = self._ctrl_low + 0.5 * (u + 1.0) * (self._ctrl_high - self._ctrl_low)
++
++        omega = float(ctrl[0])
++        ap = float(ctrl[self._ap_action_idx]) if self.control_ap else float(self._episode_ap)
++        if self.control_ae:
++            ae = float(ctrl[self._ae_action_idx])
++            return np.array([omega, ap, ae], dtype=np.float64)
++        return np.array([omega, ap], dtype=np.float64)
+ 
+     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
+         x = np.asarray(x, dtype=np.float64).reshape(-1)
+@@ -819,10 +872,25 @@ class PlatePlant(ODEPlant):
+                 y0 = float(randomizer.uniform(self.y0_min, self.y0_max))
+                 self.set_milling_line_y(y0)
+ 
++        # 1b. Determine the per-episode axial depth of cut when ap is a fixed
++        # (non-action) process parameter (second-mode / finishing control).
++        # Mirrors the y0 convention: an explicit options["ap"] pins it (for
++        # evaluation), otherwise it is randomized over [ap_min, ap_max] when
++        # randomize_ap is set, else held at the constant ap_fixed value.
++        if not self.control_ap:
++            if "ap" in options:
++                self._episode_ap = float(np.clip(float(options["ap"]), self.ap_min, self.ap_max))
++            elif self.randomize_ap:
++                randomizer = rng if rng is not None else self._rng
++                if randomizer is not None:
++                    self._episode_ap = float(randomizer.uniform(self.ap_min, self.ap_max))
++            else:
++                self._episode_ap = float(self._ap_fixed)
++
+         # 2. Reset force module history and internal kinematic states
+         f_nonlinear2.reset_state_history()
+         self._last_omega = float(self.omega_min)
+-        self._last_ap = float(self.ap_min)
++        self._last_ap = float(self._episode_ap) if not self.control_ap else float(self.ap_min)
+         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
+         self._last_ae = float(self.ae_default)
+         
+@@ -850,7 +918,11 @@ class PlatePlant(ODEPlant):
+             "feed_distance_m": float(self._feed_distance_m),
+             "spindle_phase_rad": float(self._spindle_phase_rad),
+             "rho_interpreted_as": self.rho_interpreted_as,
++            "control_ap": bool(self.control_ap),
+         }
++        if not self.control_ap:
++            # Fixed axial depth held constant for this episode (finishing mode).
++            info["ap_fixed_mm"] = float(self._episode_ap)
+         return x0, info
+ 
+     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:
+diff --git a/custom_rl/rewards/plate_rewards.py b/custom_rl/rewards/plate_rewards.py
+index 8f611c2..cbfc102 100644
+--- a/custom_rl/rewards/plate_rewards.py
++++ b/custom_rl/rewards/plate_rewards.py
+@@ -368,6 +368,40 @@ class DenseProductivePlateReward:
+         if not (0.0 <= self.productivity_gate_min <= 1.0):
+             raise ValueError("productivity_gate_min must be in [0, 1].")
+ 
++    def _physical_action(
++        self, u: np.ndarray, info: dict[str, Any]
++    ) -> tuple[float, float, float, bool]:
++        """Return physical ``[omega, ap, ae]`` and whether ae is an RL action.
++
++        The plant already reports the true physical action in ``info``
++        (``omega_rad_s``, ``ap_mm``, ``ae_mm``).  Preferring those values makes
++        the reward correct when ap (or ae) is a fixed process parameter rather
++        than an RL action, i.e. second-mode / finishing control where the
++        normalized action is ``[omega]`` only.  When these keys are absent (for
++        example on an early-terminated step), fall back to scaling ``u`` so the
++        first-mode behavior is byte-for-byte unchanged.
++        """
++        u = np.asarray(u, dtype=np.float64).reshape(-1)
++        has_ae_action = u.size >= 3
++
++        omega_i = info.get("omega_rad_s")
++        ap_i = info.get("ap_mm")
++        if (
++            omega_i is not None
++            and ap_i is not None
++            and np.isfinite(float(omega_i))
++            and np.isfinite(float(ap_i))
++        ):
++            ae_i = info.get("ae_mm")
++            ae_val = (
++                float(ae_i)
++                if (ae_i is not None and np.isfinite(float(ae_i)))
++                else self.ae_default
++            )
++            return float(omega_i), float(ap_i), ae_val, has_ae_action
++
++        return self._scale_action(u)
++
+     def _scale_action(self, u: np.ndarray) -> tuple[float, float, float, bool]:
+         """Scale normalized action to physical [omega, ap, ae]."""
+         u = np.asarray(u, dtype=np.float64).reshape(-1)
+@@ -422,7 +456,7 @@ class DenseProductivePlateReward:
+         if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
+             return -float(self.termination_penalty)
+ 
+-        omega, ap, ae, has_ae_action = self._scale_action(u)
++        omega, ap, ae, has_ae_action = self._physical_action(u, info)
+ 
+         omega_score = (omega - self.omega_min) / (self.omega_max - self.omega_min)
+         omega_score = float(np.clip(omega_score, 0.0, 1.0))
+diff --git a/scripts/eval_policy.py b/scripts/eval_policy.py
+index fdb1874..bf28424 100644
+--- a/scripts/eval_policy.py
++++ b/scripts/eval_policy.py
+@@ -189,10 +189,15 @@ def _resolve_seeds(model_dir: Path, seeds: list[int] | None) -> list[int]:
+     return discover_model_seeds(model_dir)
+ 
+ 
+-def make_registered_plate_env(**env_kwargs: Any) -> gym.Env:
+-    """Create the registered plate environment using the same workflow as training."""
++def make_registered_plate_env(_env_id: str = ENV_ID, **env_kwargs: Any) -> gym.Env:
++    """Create the registered plate environment using the same workflow as training.
++
++    ``_env_id`` selects the control mode:
++        "CustomODEPlate-v0"        first-mode / roughing (action = [omega, ap])
++        "CustomODEPlateFinish-v0"  second-mode / finishing (action = [omega])
++    """
+     register_envs()
+-    return gym.make(ENV_ID, **env_kwargs)
++    return gym.make(_env_id, **env_kwargs)
+ 
+ 
+ def _episode_y_line(env: gym.Env, args: argparse.Namespace, *, seed: int, episode: int) -> float | None:
+@@ -344,6 +349,16 @@ def main() -> int:
+     )
+     parser.add_argument("--n-episodes", type=int, default=2)
+     parser.add_argument("--out-dir", default=DEFAULT_TRAJ_DIR)
++    parser.add_argument(
++        "--env-id",
++        default=ENV_ID,
++        choices=["CustomODEPlate-v0", "CustomODEPlateFinish-v0"],
++        help=(
++            "Control mode; must match training. CustomODEPlate-v0: first-mode "
++            "roughing (action [omega, ap]). CustomODEPlateFinish-v0: second-mode "
++            "finishing (action [omega], ap fixed/randomized per episode)."
++        ),
++    )
+ 
+     parser.add_argument("--dt", type=float, default=EVAL_DEFAULT_DT, help="Must match training RK4 substep [s]")
+     parser.add_argument("--n-substeps", type=int, default=EVAL_DEFAULT_N_SUBSTEPS)
+@@ -391,6 +406,17 @@ def main() -> int:
+         default=None,
+         help="Cycle through explicit milling lines y=a [m] across episodes",
+     )
++    parser.add_argument(
++        "--ap",
++        type=float,
++        default=None,
++        help=(
++            "Second-mode / finishing only: pin the fixed axial depth of cut ap "
++            "[mm] for every evaluation episode. Ignored in first-mode roughing "
++            "(where ap is an action). Default None keeps the per-episode "
++            "randomized ap of CustomODEPlateFinish-v0."
++        ),
++    )
+     parser.add_argument(
+         "--prefer-final",
+         action="store_true",
+@@ -465,7 +491,7 @@ def main() -> int:
+             randomize_y0=args.randomize_y0,
+         )
+ 
+-        env = make_registered_plate_env(**env_kwargs)
++        env = make_registered_plate_env(_env_id=args.env_id, **env_kwargs)
+ 
+         max_steps = int(args.max_episode_steps or env.unwrapped.max_episode_steps)
+         metadata = _get_metadata(env, max_steps, args.reward)
+@@ -505,7 +531,15 @@ def main() -> int:
+         for ep in range(args.n_episodes):
+             mc_runs: list[dict[str, Any]] = []
+             episode_y_line = _episode_y_line(env, args, seed=seed, episode=ep)
+-            reset_options = {"y0": episode_y_line} if episode_y_line is not None else None
++            reset_options: dict[str, Any] | None = (
++                {"y0": episode_y_line} if episode_y_line is not None else None
++            )
++            # Second-mode / finishing: optionally pin the fixed axial depth ap so
++            # a finishing pass can be evaluated at a chosen constant depth. When
++            # --ap is not given, the finishing env randomizes ap per episode.
++            if args.ap is not None:
++                reset_options = dict(reset_options or {})
++                reset_options["ap"] = float(args.ap)
+ 
+             for mc in range(args.n_mc):
+                 run_seed = seed + 1000 + ep * args.n_mc + mc
+diff --git a/scripts/train_sb3_ppo.py b/scripts/train_sb3_ppo.py
+index 60f1b99..1f2c3e6 100644
+--- a/scripts/train_sb3_ppo.py
++++ b/scripts/train_sb3_ppo.py
+@@ -70,14 +70,18 @@ def _init_action_bias(model: PPO, bias: list[float]) -> None:
+             action_net.bias[:n] = torch.tensor(bias[:n], dtype=torch.float32)
+ 
+ 
+-def make_registered_plate_env(**env_kwargs):
++def make_registered_plate_env(_env_id: str = ENV_ID, **env_kwargs):
+     """Create the registered plate environment inside the active process.
+ 
+     This makes SubprocVecEnv robust on spawn-based systems such as Windows:
+     each worker process registers the custom env before calling gym.make().
++
++    ``_env_id`` selects the control mode:
++        "CustomODEPlate-v0"        first-mode / roughing (action = [omega, ap])
++        "CustomODEPlateFinish-v0"  second-mode / finishing (action = [omega])
+     """
+     register_envs()
+-    return gym.make(ENV_ID, **env_kwargs)
++    return gym.make(_env_id, **env_kwargs)
+ 
+ 
+ def main() -> None:
+@@ -85,6 +89,17 @@ def main() -> None:
+ 
+     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
+ 
++    parser.add_argument(
++        "--env-id",
++        default=ENV_ID,
++        choices=["CustomODEPlate-v0", "CustomODEPlateFinish-v0"],
++        help=(
++            "Control mode. CustomODEPlate-v0: first-mode roughing (action "
++            "[omega, ap]). CustomODEPlateFinish-v0: second-mode finishing "
++            "(action [omega], ap fixed and randomized per episode)."
++        ),
++    )
++
+     parser.add_argument(
+         "--reward",
+         default="productive",
+@@ -201,8 +216,12 @@ def main() -> None:
+         randomize_y0=args.randomize_y0,
+     )
+ 
++    # Factory kwargs for make_vec_env carry the env id (control mode) alongside
++    # the plant kwargs; the probe below uses args.env_id directly.
++    vec_env_kwargs = {**env_kwargs, "_env_id": args.env_id}
++
+     # Show practical episode cap (pass completion usually ends sooner).
+-    _probe = gym.make(ENV_ID, **env_kwargs)
++    _probe = gym.make(args.env_id, **env_kwargs)
+     probe_plant = _probe.unwrapped.plant
+     control_dt = float(args.dt) * int(args.n_substeps)
+     print(
+@@ -259,7 +278,7 @@ def main() -> None:
+             seed=seed,
+             vec_env_cls=vec_env_cls,
+             monitor_dir=str(seed_dir),
+-            env_kwargs=env_kwargs,
++            env_kwargs=vec_env_kwargs,
+         )
+ 
+         eval_env = make_vec_env(
+@@ -267,7 +286,7 @@ def main() -> None:
+             n_envs=1,
+             seed=seed + 10000,
+             vec_env_cls=DummyVecEnv,
+-            env_kwargs=env_kwargs,
++            env_kwargs=vec_env_kwargs,
+         )
+ 
+         eval_callback = EvalCallback(
