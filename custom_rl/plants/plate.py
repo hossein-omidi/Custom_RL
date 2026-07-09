@@ -249,6 +249,9 @@ class PlatePlant(ODEPlant):
         ae_max: float = 50.0,
         ae_default: float = 28.0,
         control_ae: bool = False,
+        control_ap: bool = True,
+        randomize_ap: bool = False,
+        ap_fixed: float | None = None,
         D_mm: float = 63.0,
         feed_per_tooth_mm: float = 0.20,
         gamma_L_deg: float = 45.0,
@@ -345,6 +348,20 @@ class PlatePlant(ODEPlant):
         self.ae_default = float(np.clip(ae_default, self.ae_min, self.ae_max))
         self.control_ae = bool(control_ae)
 
+        # Second-mode / finishing control: when control_ap is False, axial depth
+        # of cut ap is NOT an RL action.  It is a fixed process parameter held
+        # constant within an episode.  Like the milling line y0, it can be
+        # randomized between episodes (randomize_ap) over [ap_min, ap_max], or
+        # held at a single constant value ap_fixed.
+        self.control_ap = bool(control_ap)
+        self.randomize_ap = bool(randomize_ap)
+        if ap_fixed is not None:
+            self._ap_fixed = float(np.clip(ap_fixed, self.ap_min, self.ap_max))
+        else:
+            self._ap_fixed = 0.5 * (self.ap_min + self.ap_max)
+        # Current per-episode axial depth used when ap is a fixed parameter.
+        self._episode_ap = float(self._ap_fixed)
+
         self.D_mm = float(D_mm)
         self.feed_per_tooth_mm = float(feed_per_tooth_mm)
         self.cf = self.feed_per_tooth_mm  # compatibility alias: cf = ft [mm/tooth]
@@ -437,7 +454,10 @@ class PlatePlant(ODEPlant):
         self.force_module = f_nonlinear2
         self.face_milling_force_module = f_nonlinear2
 
-        # Normalized action bounds.  Default action is [omega, ap].
+        # Full physical action bounds [omega, ap] or [omega, ap, ae].  These are
+        # kept full-width regardless of which entries are RL-controlled, so that
+        # physical_action_bounds()/metadata and the physical action logged during
+        # evaluation always describe [omega, ap(, ae)] consistently.
         if self.control_ae:
             self.u_phys_low = np.array(
                 [self.omega_min, self.ap_min, self.ae_min], dtype=np.float64
@@ -452,7 +472,28 @@ class PlatePlant(ODEPlant):
             self.u_phys_high = np.array(
                 [self.omega_max, self.ap_max], dtype=np.float64
             )
-        self.action_dim = int(self.u_phys_low.size)
+
+        # Controlled-action layout for the normalized RL action.  omega is always
+        # controlled; ap only if control_ap; ae only if control_ae.  These bounds
+        # drive _scale_action; uncontrolled entries are injected as fixed process
+        # parameters (ap from the per-episode value, ae from ae_default).
+        ctrl_low = [self.omega_min]
+        ctrl_high = [self.omega_max]
+        if self.control_ap:
+            self._ap_action_idx = len(ctrl_low)
+            ctrl_low.append(self.ap_min)
+            ctrl_high.append(self.ap_max)
+        else:
+            self._ap_action_idx = None
+        if self.control_ae:
+            self._ae_action_idx = len(ctrl_low)
+            ctrl_low.append(self.ae_min)
+            ctrl_high.append(self.ae_max)
+        else:
+            self._ae_action_idx = None
+        self._ctrl_low = np.array(ctrl_low, dtype=np.float64)
+        self._ctrl_high = np.array(ctrl_high, dtype=np.float64)
+        self.action_dim = int(self._ctrl_low.size)
 
         # Straight x-pass reference timeline, used for diagnostics and y path.
         pass_duration = estimate_pass_duration(
@@ -752,16 +793,28 @@ class PlatePlant(ODEPlant):
     # Action scaling and dynamics
     # ------------------------------------------------------------------
     def _scale_action(self, u: np.ndarray) -> np.ndarray:
+        """Map the normalized RL action to the full physical action.
+
+        The returned vector is always the full face-milling action
+        ``[omega, ap]`` (or ``[omega, ap, ae]`` when control_ae=True), regardless
+        of which entries are RL-controlled.  Uncontrolled ap is injected from the
+        per-episode value ``self._episode_ap``; uncontrolled ae from ae_default.
+        This keeps begin_step/end_step/dynamics and the force module unchanged.
+        """
         u = np.asarray(u, dtype=np.float64).reshape(-1)
         if u.size != self.action_dim:
             raise ValueError(
                 f"PlatePlant expects action shape ({self.action_dim},), got {u.shape}."
             )
         u = np.clip(u, -1.0, 1.0)
-        u_phys = self.u_phys_low + 0.5 * (u + 1.0) * (
-            self.u_phys_high - self.u_phys_low
-        )
-        return np.asarray(u_phys, dtype=np.float64)
+        ctrl = self._ctrl_low + 0.5 * (u + 1.0) * (self._ctrl_high - self._ctrl_low)
+
+        omega = float(ctrl[0])
+        ap = float(ctrl[self._ap_action_idx]) if self.control_ap else float(self._episode_ap)
+        if self.control_ae:
+            ae = float(ctrl[self._ae_action_idx])
+            return np.array([omega, ap, ae], dtype=np.float64)
+        return np.array([omega, ap], dtype=np.float64)
 
     def dynamics(self, t: float, x: np.ndarray, u: np.ndarray) -> np.ndarray:
         x = np.asarray(x, dtype=np.float64).reshape(-1)
@@ -819,10 +872,25 @@ class PlatePlant(ODEPlant):
                 y0 = float(randomizer.uniform(self.y0_min, self.y0_max))
                 self.set_milling_line_y(y0)
 
+        # 1b. Determine the per-episode axial depth of cut when ap is a fixed
+        # (non-action) process parameter (second-mode / finishing control).
+        # Mirrors the y0 convention: an explicit options["ap"] pins it (for
+        # evaluation), otherwise it is randomized over [ap_min, ap_max] when
+        # randomize_ap is set, else held at the constant ap_fixed value.
+        if not self.control_ap:
+            if "ap" in options:
+                self._episode_ap = float(np.clip(float(options["ap"]), self.ap_min, self.ap_max))
+            elif self.randomize_ap:
+                randomizer = rng if rng is not None else self._rng
+                if randomizer is not None:
+                    self._episode_ap = float(randomizer.uniform(self.ap_min, self.ap_max))
+            else:
+                self._episode_ap = float(self._ap_fixed)
+
         # 2. Reset force module history and internal kinematic states
         f_nonlinear2.reset_state_history()
         self._last_omega = float(self.omega_min)
-        self._last_ap = float(self.ap_min)
+        self._last_ap = float(self._episode_ap) if not self.control_ap else float(self.ap_min)
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
         self._last_ae = float(self.ae_default)
         
@@ -850,7 +918,11 @@ class PlatePlant(ODEPlant):
             "feed_distance_m": float(self._feed_distance_m),
             "spindle_phase_rad": float(self._spindle_phase_rad),
             "rho_interpreted_as": self.rho_interpreted_as,
+            "control_ap": bool(self.control_ap),
         }
+        if not self.control_ap:
+            # Fixed axial depth held constant for this episode (finishing mode).
+            info["ap_fixed_mm"] = float(self._episode_ap)
         return x0, info
 
     def termination(self, t: float, x: np.ndarray) -> tuple[bool, bool, dict[str, Any]]:

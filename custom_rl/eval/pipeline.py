@@ -180,9 +180,11 @@ def plant_plot_metadata(env) -> dict[str, Any]:
     ae_default = _safe_float(getattr(plant, "ae_default", np.nan))
     ae_ratio = _ae_over_d(ae_default, d_mm)
 
+    env_id = getattr(getattr(env, "spec", None), "id", None) or "CustomODEPlate-v0"
+
     metadata: dict[str, Any] = {
         # Environment/time configuration
-        "env_id": "CustomODEPlate-v0",
+        "env_id": str(env_id),
         "dt": float(base_env.dt),
         "n_substeps": int(base_env.n_substeps),
         "step_dt": float(base_env._step_dt),
@@ -298,6 +300,14 @@ def plant_plot_metadata(env) -> dict[str, Any]:
     if hasattr(plant, "ap_min") and hasattr(plant, "ap_max"):
         metadata["ap_min_mm"] = _safe_float(plant.ap_min)
         metadata["ap_max_mm"] = _safe_float(plant.ap_max)
+
+    # Control-mode convention: ap is an RL action (first-mode / roughing) or a
+    # fixed per-episode process parameter (second-mode / finishing).
+    control_ap = _safe_bool(getattr(plant, "control_ap", True), True)
+    metadata["control_ap"] = control_ap
+    metadata["randomize_ap"] = _safe_bool(getattr(plant, "randomize_ap", False))
+    metadata["control_mode"] = "roughing_omega_ap" if control_ap else "finishing_omega_only"
+    metadata["rl_action_dim"] = int(getattr(plant, "action_dim", len(action_names)))
 
     return metadata
 

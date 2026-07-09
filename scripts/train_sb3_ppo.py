@@ -33,22 +33,71 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.03
 PPO_NET_ARCH = [256, 256]
+PPO_LOG_STD_INIT = -1.0
+
+# Fraction of the physical ap range used as the safe-start target.
+# 0.05 means 5% of (ap_max - ap_min) above ap_min.
+SAFE_AP_FRACTION = 0.05
 
 
-def make_registered_plate_env(**env_kwargs):
+def _compute_safe_action_bias(plant) -> list[float]:
+    """Derive a normalized-action bias from the plant's actual bounds so the
+    untrained policy defaults to a safe operating point (low ap, mid omega)."""
+    ap_range = float(plant.ap_max - plant.ap_min)
+    if ap_range > 0:
+        safe_ap = float(plant.ap_min) + SAFE_AP_FRACTION * ap_range
+        u_ap = 2.0 * (safe_ap - float(plant.ap_min)) / ap_range - 1.0
+    else:
+        u_ap = 0.0
+
+    bias = [0.0, float(np.clip(u_ap, -1.0, 1.0))]
+
+    if int(getattr(plant, "action_dim", 2)) > 2:
+        bias.append(0.0)
+
+    return bias
+
+
+def _init_action_bias(model: PPO, bias: list[float]) -> None:
+    """Set the action-net output bias so the untrained policy defaults to safe ap."""
+    import torch
+
+    action_net = model.policy.action_net
+    if hasattr(action_net, "bias") and action_net.bias is not None:
+        n = min(len(bias), action_net.bias.numel())
+        with torch.no_grad():
+            action_net.bias[:n] = torch.tensor(bias[:n], dtype=torch.float32)
+
+
+def make_registered_plate_env(_env_id: str = ENV_ID, **env_kwargs):
     """Create the registered plate environment inside the active process.
 
     This makes SubprocVecEnv robust on spawn-based systems such as Windows:
     each worker process registers the custom env before calling gym.make().
+
+    ``_env_id`` selects the control mode:
+        "CustomODEPlate-v0"        first-mode / roughing (action = [omega, ap])
+        "CustomODEPlateFinish-v0"  second-mode / finishing (action = [omega])
     """
     register_envs()
-    return gym.make(ENV_ID, **env_kwargs)
+    return gym.make(_env_id, **env_kwargs)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train PPO on CustomODEPlate")
 
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
+
+    parser.add_argument(
+        "--env-id",
+        default=ENV_ID,
+        choices=["CustomODEPlate-v0", "CustomODEPlateFinish-v0"],
+        help=(
+            "Control mode. CustomODEPlate-v0: first-mode roughing (action "
+            "[omega, ap]). CustomODEPlateFinish-v0: second-mode finishing "
+            "(action [omega], ap fixed and randomized per episode)."
+        ),
+    )
 
     parser.add_argument(
         "--reward",
@@ -166,8 +215,12 @@ def main() -> None:
         randomize_y0=args.randomize_y0,
     )
 
+    # Factory kwargs for make_vec_env carry the env id (control mode) alongside
+    # the plant kwargs; the probe below uses args.env_id directly.
+    vec_env_kwargs = {**env_kwargs, "_env_id": args.env_id}
+
     # Show practical episode cap (pass completion usually ends sooner).
-    _probe = gym.make(ENV_ID, **env_kwargs)
+    _probe = gym.make(args.env_id, **env_kwargs)
     probe_plant = _probe.unwrapped.plant
     control_dt = float(args.dt) * int(args.n_substeps)
     print(
@@ -219,7 +272,7 @@ def main() -> None:
             seed=seed,
             vec_env_cls=vec_env_cls,
             monitor_dir=str(seed_dir),
-            env_kwargs=env_kwargs,
+            env_kwargs=vec_env_kwargs,
         )
 
         eval_env = make_vec_env(
@@ -227,7 +280,7 @@ def main() -> None:
             n_envs=1,
             seed=seed + 10000,
             vec_env_cls=DummyVecEnv,
-            env_kwargs=env_kwargs,
+            env_kwargs=vec_env_kwargs,
         )
 
         eval_callback = EvalCallback(

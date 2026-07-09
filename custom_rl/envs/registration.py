@@ -157,6 +157,9 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "ae_max",
         "ae_default",
         "control_ae",
+        "control_ap",
+        "randomize_ap",
+        "ap_fixed",
         # Face-milling force parameters
         "D_mm",
         "feed_per_tooth_mm",
@@ -342,7 +345,20 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
 
 def register_envs() -> None:
-    """Register custom RL environment with Gymnasium.
+    """Register the custom face-milling RL environments with Gymnasium.
+
+    Two environment ids share the same plant, reward, and physics and differ
+    only in the RL action space:
+
+    ``CustomODEPlate-v0`` (first-mode / roughing control)
+        Action = [omega, ap].  Both spindle speed and axial depth of cut are
+        controlled to maximize material removal while suppressing chatter.
+
+    ``CustomODEPlateFinish-v0`` (second-mode / finishing control)
+        Action = [omega] only.  Axial depth of cut ap is a fixed process
+        parameter, randomized per episode over [ap_min, ap_max] exactly like the
+        milling line y0.  Spindle speed alone is modulated to suppress chatter at
+        a constant depth, for a uniform finishing pass.
 
     Do not set Gymnasium's external ``max_episode_steps`` here.
     ``make_plate_env`` computes the episode limit from the actual constructed
@@ -350,30 +366,40 @@ def register_envs() -> None:
     passes that limit into ODEControlEnv. This avoids a stale TimeLimit wrapper
     if the user overrides feed or dt in gym.make(...).
     """
-    env_id = "CustomODEPlate-v0"
+    common_kwargs = {
+        "reward_id": "dense",
+        "dt": DEFAULT_ENV_DT,
+        "n_substeps": DEFAULT_ENV_N_SUBSTEPS,
+        "omega_min": DEFAULT_ENV_OMEGA_MIN,
+        "omega_max": DEFAULT_ENV_OMEGA_MAX,
+        "ap_min": DEFAULT_ENV_AP_MIN_MM,
+        "ap_max": DEFAULT_ENV_AP_MAX_MM,
+        "ae_default": DEFAULT_ENV_AE_DEFAULT_MM,
+        "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
+        "w_limit": DEFAULT_ENV_W_LIMIT,
+        "w_obs_scale": DEFAULT_ENV_W_OBS_SCALE,
+        "wdot_limit": DEFAULT_ENV_WDOT_LIMIT,
+        "wdot_obs_scale": DEFAULT_ENV_WDOT_OBS_SCALE,
+        "randomize_y0": DEFAULT_ENV_RANDOMIZE_Y0,
+        "y_cutter": DEFAULT_ENV_Y_CUTTER,
+        "initial_eta_std": DEFAULT_ENV_INITIAL_ETA_STD,
+        "initial_etad_std": DEFAULT_ENV_INITIAL_ETAD_STD,
+        "modal_damping_ratio": DEFAULT_ENV_MODAL_DAMPING_RATIO,
+    }
 
-    if env_id not in gym.envs.registry:
+    # First-mode / roughing control: action = [omega, ap].
+    if "CustomODEPlate-v0" not in gym.envs.registry:
         gym.register(
-            id=env_id,
+            id="CustomODEPlate-v0",
             entry_point="custom_rl.envs.registration:make_plate_env",
-            kwargs={
-                "reward_id": "dense",
-                "dt": DEFAULT_ENV_DT,
-                "n_substeps": DEFAULT_ENV_N_SUBSTEPS,
-                "omega_min": DEFAULT_ENV_OMEGA_MIN,
-                "omega_max": DEFAULT_ENV_OMEGA_MAX,
-                "ap_min": DEFAULT_ENV_AP_MIN_MM,
-                "ap_max": DEFAULT_ENV_AP_MAX_MM,
-                "ae_default": DEFAULT_ENV_AE_DEFAULT_MM,
-                "feed_per_tooth_mm": DEFAULT_FEED_PER_TOOTH_MM,
-                "w_limit": DEFAULT_ENV_W_LIMIT,
-                "w_obs_scale": DEFAULT_ENV_W_OBS_SCALE,
-                "wdot_limit": DEFAULT_ENV_WDOT_LIMIT,
-                "wdot_obs_scale": DEFAULT_ENV_WDOT_OBS_SCALE,
-                "randomize_y0": DEFAULT_ENV_RANDOMIZE_Y0,
-                "y_cutter": DEFAULT_ENV_Y_CUTTER,
-                "initial_eta_std": DEFAULT_ENV_INITIAL_ETA_STD,
-                "initial_etad_std": DEFAULT_ENV_INITIAL_ETAD_STD,
-                "modal_damping_ratio": DEFAULT_ENV_MODAL_DAMPING_RATIO,
-            },
+            kwargs={**common_kwargs, "control_ap": True},
+        )
+
+    # Second-mode / finishing control: action = [omega]; ap fixed per episode
+    # and randomized over [ap_min, ap_max] like the milling line y0.
+    if "CustomODEPlateFinish-v0" not in gym.envs.registry:
+        gym.register(
+            id="CustomODEPlateFinish-v0",
+            entry_point="custom_rl.envs.registration:make_plate_env",
+            kwargs={**common_kwargs, "control_ap": False, "randomize_ap": True},
         )

@@ -368,6 +368,40 @@ class DenseProductivePlateReward:
         if not (0.0 <= self.productivity_gate_min <= 1.0):
             raise ValueError("productivity_gate_min must be in [0, 1].")
 
+    def _physical_action(
+        self, u: np.ndarray, info: dict[str, Any]
+    ) -> tuple[float, float, float, bool]:
+        """Return physical ``[omega, ap, ae]`` and whether ae is an RL action.
+
+        The plant already reports the true physical action in ``info``
+        (``omega_rad_s``, ``ap_mm``, ``ae_mm``).  Preferring those values makes
+        the reward correct when ap (or ae) is a fixed process parameter rather
+        than an RL action, i.e. second-mode / finishing control where the
+        normalized action is ``[omega]`` only.  When these keys are absent (for
+        example on an early-terminated step), fall back to scaling ``u`` so the
+        first-mode behavior is byte-for-byte unchanged.
+        """
+        u = np.asarray(u, dtype=np.float64).reshape(-1)
+        has_ae_action = u.size >= 3
+
+        omega_i = info.get("omega_rad_s")
+        ap_i = info.get("ap_mm")
+        if (
+            omega_i is not None
+            and ap_i is not None
+            and np.isfinite(float(omega_i))
+            and np.isfinite(float(ap_i))
+        ):
+            ae_i = info.get("ae_mm")
+            ae_val = (
+                float(ae_i)
+                if (ae_i is not None and np.isfinite(float(ae_i)))
+                else self.ae_default
+            )
+            return float(omega_i), float(ap_i), ae_val, has_ae_action
+
+        return self._scale_action(u)
+
     def _scale_action(self, u: np.ndarray) -> tuple[float, float, float, bool]:
         """Scale normalized action to physical [omega, ap, ae]."""
         u = np.asarray(u, dtype=np.float64).reshape(-1)
@@ -422,7 +456,7 @@ class DenseProductivePlateReward:
         if not np.isfinite(w_cost) or not np.isfinite(wdot_cost):
             return -float(self.termination_penalty)
 
-        omega, ap, ae, has_ae_action = self._scale_action(u)
+        omega, ap, ae, has_ae_action = self._physical_action(u, info)
 
         omega_score = (omega - self.omega_min) / (self.omega_max - self.omega_min)
         omega_score = float(np.clip(omega_score, 0.0, 1.0))

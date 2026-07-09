@@ -189,10 +189,15 @@ def _resolve_seeds(model_dir: Path, seeds: list[int] | None) -> list[int]:
     return discover_model_seeds(model_dir)
 
 
-def make_registered_plate_env(**env_kwargs: Any) -> gym.Env:
-    """Create the registered plate environment using the same workflow as training."""
+def make_registered_plate_env(_env_id: str = ENV_ID, **env_kwargs: Any) -> gym.Env:
+    """Create the registered plate environment using the same workflow as training.
+
+    ``_env_id`` selects the control mode:
+        "CustomODEPlate-v0"        first-mode / roughing (action = [omega, ap])
+        "CustomODEPlateFinish-v0"  second-mode / finishing (action = [omega])
+    """
     register_envs()
-    return gym.make(ENV_ID, **env_kwargs)
+    return gym.make(_env_id, **env_kwargs)
 
 
 def _episode_y_line(env: gym.Env, args: argparse.Namespace, *, seed: int, episode: int) -> float | None:
@@ -344,6 +349,16 @@ def main() -> int:
     )
     parser.add_argument("--n-episodes", type=int, default=2)
     parser.add_argument("--out-dir", default=DEFAULT_TRAJ_DIR)
+    parser.add_argument(
+        "--env-id",
+        default=ENV_ID,
+        choices=["CustomODEPlate-v0", "CustomODEPlateFinish-v0"],
+        help=(
+            "Control mode; must match training. CustomODEPlate-v0: first-mode "
+            "roughing (action [omega, ap]). CustomODEPlateFinish-v0: second-mode "
+            "finishing (action [omega], ap fixed/randomized per episode)."
+        ),
+    )
 
     parser.add_argument("--dt", type=float, default=EVAL_DEFAULT_DT, help="Must match training RK4 substep [s]")
     parser.add_argument("--n-substeps", type=int, default=EVAL_DEFAULT_N_SUBSTEPS)
@@ -390,6 +405,17 @@ def main() -> int:
         nargs="*",
         default=None,
         help="Cycle through explicit milling lines y=a [m] across episodes",
+    )
+    parser.add_argument(
+        "--ap",
+        type=float,
+        default=None,
+        help=(
+            "Second-mode / finishing only: pin the fixed axial depth of cut ap "
+            "[mm] for every evaluation episode. Ignored in first-mode roughing "
+            "(where ap is an action). Default None keeps the per-episode "
+            "randomized ap of CustomODEPlateFinish-v0."
+        ),
     )
     parser.add_argument(
         "--prefer-final",
@@ -465,7 +491,7 @@ def main() -> int:
             randomize_y0=args.randomize_y0,
         )
 
-        env = make_registered_plate_env(**env_kwargs)
+        env = make_registered_plate_env(_env_id=args.env_id, **env_kwargs)
 
         max_steps = int(args.max_episode_steps or env.unwrapped.max_episode_steps)
         metadata = _get_metadata(env, max_steps, args.reward)
@@ -505,7 +531,15 @@ def main() -> int:
         for ep in range(args.n_episodes):
             mc_runs: list[dict[str, Any]] = []
             episode_y_line = _episode_y_line(env, args, seed=seed, episode=ep)
-            reset_options = {"y0": episode_y_line} if episode_y_line is not None else None
+            reset_options: dict[str, Any] | None = (
+                {"y0": episode_y_line} if episode_y_line is not None else None
+            )
+            # Second-mode / finishing: optionally pin the fixed axial depth ap so
+            # a finishing pass can be evaluated at a chosen constant depth. When
+            # --ap is not given, the finishing env randomizes ap per episode.
+            if args.ap is not None:
+                reset_options = dict(reset_options or {})
+                reset_options["ap"] = float(args.ap)
 
             for mc in range(args.n_mc):
                 run_seed = seed + 1000 + ep * args.n_mc + mc
