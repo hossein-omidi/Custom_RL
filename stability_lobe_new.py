@@ -320,8 +320,6 @@ def run_fixed_action_trial(
     elif termination_reason in UNSTABLE_REASONS:
         stable = False
     else:
-        # Capped trial (e.g. max_sim_steps) with low vibration throughout:
-        # classify stable -- the cap merely cut the simulation short.
         if max_abs_w < 0.5 * w_limit:
             stable = True
             if termination_reason is None:

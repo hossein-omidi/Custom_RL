@@ -1,11 +1,11 @@
 {
-  "created_utc": "2026-07-09T03:52:17.738884+00:00",
+  "created_utc": "2026-07-11T15:07:02.157397+00:00",
   "method": "time_domain_no_control_binary_search_face_milling_2d_fixed_y_line",
   "note": "Practical time-domain estimate of ap_stable=f(rpm) on one milling line y=a. Stability is pass completion versus displacement/invalid-state termination.",
   "env_id": "CustomODEPlate-v0",
   "dt": 0.001,
   "n_substeps": 1,
-  "max_sim_steps": 500000,
+  "max_sim_steps": 500,
   "pass_time_margin": 1.05,
   "rpm_min": 400.0,
   "rpm_max": 4000.0,

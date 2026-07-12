@@ -6,6 +6,7 @@ import argparse
 from pathlib import Path
 
 import gymnasium as gym
+import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import EvalCallback
 from stable_baselines3.common.env_util import make_vec_env
@@ -106,7 +107,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
+    parser.add_argument("--total-timesteps", type=int, default=600_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -152,7 +153,7 @@ def main() -> None:
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=1,
+        default=2,
         help="Evaluation episodes per callback. Keep small because one stable pass is long.",
     )
     parser.add_argument(
@@ -165,7 +166,7 @@ def main() -> None:
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
-        default=0.01,
+        default=0.001,
         help="Modal acceleration disturbance std [0=off, e.g. 0.01 for stochastic plant]",
     )
     parser.add_argument(
@@ -247,6 +248,10 @@ def main() -> None:
             f"RK4 dt={args.dt:g} s is not smaller than the minimum regenerative "
             f"tooth delay {tau_min:.6g} s. Reduce --dt or lower omega_max."
         )
+
+    safe_bias = _compute_safe_action_bias(probe_plant)
+    print(f"Safe-start action bias (normalized): {safe_bias}")
+
     print(f"Max episode steps (cap): {_probe.unwrapped.max_episode_steps}")
     print(
         f"Note: first PPO rollout collects {PPO_N_STEPS * args.n_envs} env steps "
@@ -256,7 +261,8 @@ def main() -> None:
         "PPO defaults: "
         f"lr={PPO_LEARNING_RATE}, n_steps={PPO_N_STEPS}, batch={PPO_BATCH_SIZE}, "
         f"epochs={PPO_N_EPOCHS}, gamma={PPO_GAMMA}, gae_lambda={PPO_GAE_LAMBDA}, "
-        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}"
+        f"target_kl={PPO_TARGET_KL}, net={PPO_NET_ARCH}, "
+        f"log_std_init={PPO_LOG_STD_INIT}"
     )
     _probe.close()
 
@@ -307,10 +313,15 @@ def main() -> None:
             vf_coef=PPO_VF_COEF,
             max_grad_norm=PPO_MAX_GRAD_NORM,
             target_kl=PPO_TARGET_KL,
-            policy_kwargs=dict(net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH)),
+            policy_kwargs=dict(
+                net_arch=dict(pi=PPO_NET_ARCH, vf=PPO_NET_ARCH),
+                log_std_init=PPO_LOG_STD_INIT,
+            ),
             verbose=1,
             device="cpu",
         )
+
+        _init_action_bias(model, safe_bias)
 
         model.learn(
             total_timesteps=args.total_timesteps,

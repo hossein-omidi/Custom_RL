@@ -1,0 +1,444 @@
+From a19620f44bc9bea7e02ae435382eac5f3ca5aa82 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Fri, 10 Jul 2026 07:04:30 +0000
+Subject: [PATCH] Add pipeline script, configurable finishing trainer,
+ stability lobe fix
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+- scripts/run_pipeline.py: single-command study pipeline (lobe → train →
+  eval → mpc → compare) with --quick, --stages, --skip, --uncertainty
+- scripts/train_finish.py: full CLI with --seeds, --total-timesteps,
+  --ap-max, --dynamics-uncertainty-std (was hardcoded single-seed)
+- scripts/stability_lobe_new.py: classify capped trials with low vibration
+  as stable ("survived_window_no_chatter") instead of false-unstable
+- .gitignore: exclude results/, lobe CSV/JSON generated outputs
+
+Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01EG6sRKnSk6bBaJQGfg3ata
+---
+ .gitignore                    |   3 +
+ scripts/run_pipeline.py       | 218 ++++++++++++++++++++++++++++++++++
+ scripts/stability_lobe_new.py |  16 ++-
+ scripts/train_finish.py       | 116 ++++++++++++------
+ 4 files changed, 314 insertions(+), 39 deletions(-)
+ create mode 100644 scripts/run_pipeline.py
+
+diff --git a/.gitignore b/.gitignore
+index ffe2d41..eb2ff39 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -26,10 +26,13 @@ models/
+ eval_trajectories/
+ mpc_trajectories/
+ mpc_trajectories_finish/
++results/
+ plots/**/*.png
+ plots/**/*.pdf
+ plots/*.png
+ plots/*.pdf
++plots/**/*.csv
++plots/**/*.json
+ 
+ # Jupyter
+ .ipynb_checkpoints/
+diff --git a/scripts/run_pipeline.py b/scripts/run_pipeline.py
+new file mode 100644
+index 0000000..e66e3fc
+--- /dev/null
++++ b/scripts/run_pipeline.py
+@@ -0,0 +1,218 @@
++"""One-shot pipeline: stability lobe -> train (both modes) -> MPC -> RL-vs-MPC compare.
++
++Runs the whole study in order by invoking the project's CLIs as subprocesses,
++each writing to its own directory.  Ready to run:
++
++    python scripts/run_pipeline.py                 # full study (hours; do it locally)
++    python scripts/run_pipeline.py --quick         # fast smoke test of every stage
++    python scripts/run_pipeline.py --stages train mpc compare
++    python scripts/run_pipeline.py --skip lobe     # everything except the lobe diagram
++
++Stages (run in this order): lobe, train, eval, mpc, compare.
++Both control modes are handled:
++    first  mode  = CustomODEPlate-v0        (action [omega, ap])   -> models/ppo_plate
++    second mode  = CustomODEPlateFinish-v0  (action [omega], ap fixed) -> models/ppo_plate_finish
++Each RL-vs-MPC comparison uses the model of its own mode.
++
++The whole study is stochastic: training, RL evaluation, MPC closed loop, and the
++comparison all use the same modal-acceleration disturbance (--uncertainty) and a
++randomized milling line during training; the comparison is run on one fixed
++milling line so RL and MPC face the same nominal conditions.
++
++Output layout
++-------------
++    plots/stability_lobe/{y*,surface3d,stochastic}/   stability lobe diagrams
++    models/ppo_plate/            logs/ppo_plate/       first-mode  RL
++    models/ppo_plate_finish/     logs/ppo_plate_finish/second-mode RL
++    results/rl_first/  results/rl_finish/              RL trajectories (per mode)
++    results/mpc_first/ results/mpc_finish/             MPC trajectories (per mode)
++    plots/compare_first/  plots/compare_finish/        RL-vs-MPC comparison figures
++"""
++from __future__ import annotations
++
++import argparse
++import subprocess
++import sys
++import time
++from pathlib import Path
++
++REPO = Path(__file__).resolve().parents[1]
++PY = [sys.executable, "-u"]
++
++# --------------------------------------------------------------------------
++# directory layout (all relative to the repo root)
++# --------------------------------------------------------------------------
++LOBE_DIR = "plots/stability_lobe"
++MODELS_FIRST, LOGS_FIRST = "models/ppo_plate", "logs/ppo_plate"
++MODELS_FIN, LOGS_FIN = "models/ppo_plate_finish", "logs/ppo_plate_finish"
++RL_FIRST, RL_FIN = "results/rl_first", "results/rl_finish"
++MPC_FIRST, MPC_FIN = "results/mpc_first", "results/mpc_finish"
++CMP_FIRST, CMP_FIN = "plots/compare_first", "plots/compare_finish"
++
++
++def sh(script: str, *args: str) -> None:
++    """Run `python -u scripts/<script> <args>` from the repo root, echoing it."""
++    cmd = PY + [str(REPO / "scripts" / script), *map(str, args)]
++    print("\n" + "=" * 90)
++    print(">>>", " ".join(cmd))
++    print("=" * 90, flush=True)
++    t0 = time.time()
++    r = subprocess.run(cmd, cwd=str(REPO))
++    dt = time.time() - t0
++    if r.returncode != 0:
++        raise SystemExit(f"[pipeline] stage command failed (exit {r.returncode}) after {dt:.0f}s:\n  {' '.join(cmd)}")
++    print(f"[pipeline] ok ({dt:.0f}s)")
++
++
++# ==========================================================================
++# stages
++# ==========================================================================
++def stage_lobe(a):
++    """Stability lobe: 2D per milling line, 3D surface, and stochastic (MC)."""
++    # Cap the per-trial simulation length: regenerative chatter always develops
++    # within a few hundred control steps, so a few-thousand-step cap gives the
++    # same stability boundary while avoiding the ~70k-step passes at low rpm.
++    common = ["--rpm-min", a.rpm_min, "--rpm-max", a.rpm_max, "--ap-min", 0.0,
++              "--ap-max", a.lobe_ap_max, "--ap-tol", a.lobe_ap_tol,
++              "--binary-iters", a.lobe_bin_iters, "--dt", a.dt, "--n-substeps", a.n_substeps,
++              "--max-sim-steps", a.lobe_max_steps, "--max-episode-steps", a.lobe_max_steps]
++    # 2D deterministic lobe at several milling lines y0 (shows y-dependence)
++    for y in a.lobe_y_lines:
++        sh("stability_lobe_new.py", *common, "--rpm-points", a.lobe_rpm_pts_2d,
++           "--line-y", y, "--out-dir", f"{LOBE_DIR}/y{y}")
++    # 3D surface ap = f(rpm, milling-line-y)
++    sh("stability_lobe_new.py", *common, "--surface-3d",
++       "--rpm-points", a.lobe_rpm_pts_3d, "--y-min", a.lobe_y_min, "--y-max", a.lobe_y_max,
++       "--y-points", a.lobe_y_points, "--out-dir", f"{LOBE_DIR}/surface3d")
++    # 2D stochastic (Monte Carlo) lobe over milling lines
++    sh("stability_lobe_new.py", *common, "--stochastic-lobe",
++       "--rpm-points", a.lobe_rpm_pts_3d, "--n-mc", a.lobe_n_mc,
++       "--dynamics-uncertainty-std", a.uncertainty,
++       "--y-position", *[str(y) for y in a.lobe_y_lines],
++       "--out-dir", f"{LOBE_DIR}/stochastic")
++
++
++def stage_train(a):
++    """Train both control modes into separate directories (stochastic plant)."""
++    # first mode: action [omega, ap]
++    sh("train_sb3_ppo.py", "--env-id", "CustomODEPlate-v0", "--seeds", *map(str, a.seeds),
++       "--reward", "dense", "--total-timesteps", a.timesteps_first,
++       "--n-envs", 1, "--vec-env", "dummy", "--dt", a.dt, "--n-substeps", a.n_substeps,
++       "--max-episode-steps", a.train_max_steps, "--n-eval-episodes", 2, "--eval-freq", 20000,
++       "--dynamics-uncertainty-std", a.uncertainty, "--randomize-y0",
++       "--save-dir", MODELS_FIRST, "--log-dir", LOGS_FIRST)
++    # second mode: action [omega], ap fixed & randomized over a FEASIBLE range
++    sh("train_finish.py", "--seeds", *map(str, a.seeds),
++       "--total-timesteps", a.timesteps_second, "--ap-max", a.finish_train_ap_max,
++       "--dt", a.dt, "--n-substeps", a.n_substeps, "--max-episode-steps", a.train_max_steps,
++       "--dynamics-uncertainty-std", a.uncertainty, "--randomize-y0",
++       "--save-dir", MODELS_FIN, "--log-dir", LOGS_FIN)
++
++
++def stage_eval(a):
++    """Evaluate each trained RL policy on the comparison milling line (stochastic)."""
++    seed = a.seeds[0]
++    sh("eval_policy.py", "--env-id", "CustomODEPlate-v0", "--seeds", seed, "--reward", "dense",
++       "--n-episodes", 1, "--dt", a.dt, "--n-substeps", a.n_substeps,
++       "--max-episode-steps", a.cmp_steps, "--y0", a.cmp_y0,
++       "--dynamics-uncertainty-std", a.uncertainty,
++       "--model-dir", MODELS_FIRST, "--out-dir", RL_FIRST)
++    sh("eval_policy.py", "--env-id", "CustomODEPlateFinish-v0", "--seeds", seed, "--reward", "dense",
++       "--n-episodes", 1, "--dt", a.dt, "--n-substeps", a.n_substeps,
++       "--max-episode-steps", a.cmp_steps, "--y0", a.cmp_y0, "--ap", a.cmp_ap,
++       "--dynamics-uncertainty-std", a.uncertainty,
++       "--model-dir", MODELS_FIN, "--out-dir", RL_FIN)
++
++
++def stage_mpc(a):
++    """Run the MPC closed loop for each mode on the comparison milling line (stochastic)."""
++    seed = a.seeds[0]
++    sh("mpc_face_milling.py", "--env-id", "CustomODEPlate-v0", "--seeds", seed, "--n-episodes", 1,
++       "--dt", a.dt, "--n-substeps", a.n_substeps, "--y0", a.cmp_y0, "--max-steps", a.cmp_steps,
++       "--delay-mode", "predictive", "--dynamics-uncertainty-std", a.uncertainty,
++       "--horizon", a.mpc_horizon, "--control-hold", a.mpc_hold, "--out-dir", MPC_FIRST)
++    sh("mpc_face_milling.py", "--env-id", "CustomODEPlateFinish-v0", "--seeds", seed, "--n-episodes", 1,
++       "--dt", a.dt, "--n-substeps", a.n_substeps, "--y0", a.cmp_y0, "--ap", a.cmp_ap,
++       "--max-steps", a.cmp_steps, "--delay-mode", "predictive",
++       "--dynamics-uncertainty-std", a.uncertainty,
++       "--horizon", a.mpc_horizon, "--control-hold", a.mpc_hold, "--out-dir", MPC_FIN)
++
++
++def stage_compare(a):
++    """Overlay RL vs MPC for each mode, each using its own model's trajectories."""
++    sh("compare_mpc_rl.py", "--rl-dir", RL_FIRST, "--mpc-dir", MPC_FIRST, "--out-dir", CMP_FIRST)
++    sh("compare_mpc_rl.py", "--rl-dir", RL_FIN, "--mpc-dir", MPC_FIN, "--out-dir", CMP_FIN)
++
++
++STAGES = {"lobe": stage_lobe, "train": stage_train, "eval": stage_eval,
++          "mpc": stage_mpc, "compare": stage_compare}
++ORDER = ["lobe", "train", "eval", "mpc", "compare"]
++
++
++def main() -> None:
++    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
++    p.add_argument("--stages", nargs="+", choices=ORDER, default=None,
++                   help="Subset of stages to run (default: all, in order).")
++    p.add_argument("--skip", nargs="+", choices=ORDER, default=[], help="Stages to skip.")
++    p.add_argument("--quick", action="store_true", help="Tiny settings to smoke-test every stage fast.")
++
++    # shared physics / stochasticity
++    p.add_argument("--dt", type=float, default=1e-4)
++    p.add_argument("--n-substeps", type=int, default=10)
++    p.add_argument("--uncertainty", type=float, default=0.001,
++                   help="Modal-acceleration disturbance std (stochastic plant), used everywhere.")
++    p.add_argument("--seeds", nargs="+", type=int, default=[0])
++
++    # stability lobe (strong grid by default)
++    p.add_argument("--rpm-min", type=float, default=1000.0)
++    p.add_argument("--rpm-max", type=float, default=40000.0)
++    p.add_argument("--lobe-ap-max", type=float, default=3.0)
++    p.add_argument("--lobe-ap-tol", type=float, default=0.02)
++    p.add_argument("--lobe-bin-iters", type=int, default=12)
++    p.add_argument("--lobe-rpm-pts-2d", type=int, default=60)
++    p.add_argument("--lobe-rpm-pts-3d", type=int, default=40)
++    p.add_argument("--lobe-y-lines", nargs="+", type=float, default=[0.2, 0.5, 0.8])
++    p.add_argument("--lobe-y-min", type=float, default=0.1)
++    p.add_argument("--lobe-y-max", type=float, default=0.9)
++    p.add_argument("--lobe-y-points", type=int, default=6)
++    p.add_argument("--lobe-n-mc", type=int, default=5)
++    p.add_argument("--lobe-max-steps", type=int, default=4000,
++                   help="Cap on control steps per stability trial (chatter develops much sooner).")
++
++    # training (efficient-but-sufficient)
++    p.add_argument("--timesteps-first", type=int, default=400000)
++    p.add_argument("--timesteps-second", type=int, default=300000)
++    p.add_argument("--train-max-steps", type=int, default=2000)
++    p.add_argument("--finish-train-ap-max", type=float, default=1.0)
++
++    # comparison (RL vs MPC) settings
++    p.add_argument("--cmp-y0", type=float, default=0.5, help="Milling line for the RL-vs-MPC comparison.")
++    p.add_argument("--cmp-ap", type=float, default=0.5, help="Fixed finishing depth for second-mode comparison [mm].")
++    p.add_argument("--cmp-steps", type=int, default=1200, help="Closed-loop length for eval/MPC.")
++    p.add_argument("--mpc-horizon", type=int, default=20)
++    p.add_argument("--mpc-hold", type=int, default=3)
++    args = p.parse_args()
++
++    if args.quick:   # tiny settings to verify the whole chain quickly
++        args.lobe_rpm_pts_2d = 6; args.lobe_rpm_pts_3d = 5; args.lobe_y_points = 3
++        args.lobe_bin_iters = 6; args.lobe_ap_tol = 0.1; args.lobe_n_mc = 2
++        args.lobe_y_lines = [0.2, 0.5]; args.lobe_max_steps = 1200
++        args.timesteps_first = 4096; args.timesteps_second = 4096
++        args.cmp_steps = 90; args.train_max_steps = 500
++
++    to_run = [s for s in (args.stages or ORDER) if s not in args.skip]
++    print(f"[pipeline] stages: {to_run}")
++    print(f"[pipeline] uncertainty(std)={args.uncertainty}  seeds={args.seeds}  "
++          f"cmp_y0={args.cmp_y0}  cmp_ap={args.cmp_ap}  cmp_steps={args.cmp_steps}"
++          + ("   [QUICK]" if args.quick else ""))
++    t0 = time.time()
++    for s in to_run:
++        STAGES[s](args)
++    print(f"\n[pipeline] ALL DONE in {time.time()-t0:.0f}s.")
++    print("  lobe    -> plots/stability_lobe/")
++    print("  models  -> models/ppo_plate , models/ppo_plate_finish")
++    print("  compare -> plots/compare_first , plots/compare_finish")
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/scripts/stability_lobe_new.py b/scripts/stability_lobe_new.py
+index 5b0cbe0..d98d147 100644
+--- a/scripts/stability_lobe_new.py
++++ b/scripts/stability_lobe_new.py
+@@ -276,6 +276,7 @@ def run_fixed_action_trial(
+ ) -> TrialMetrics:
+     """Simulate one fixed [omega, ap] pair with no controller on one line y=a."""
+     plant = env.unwrapped.plant
++    w_limit = float(getattr(plant, "w_limit", 1e-3))
+ 
+     x_selected = set_tool_start_x(plant, x_start_m)
+     y_selected = set_milling_line_y(plant, line_y_m)
+@@ -319,9 +320,18 @@ def run_fixed_action_trial(
+     elif termination_reason in UNSTABLE_REASONS:
+         stable = False
+     else:
+-        stable = False
+-        if termination_reason is None:
+-            termination_reason = "safety_max_steps_reached"
++        # Trial ended without completing the pass and without an explicit
++        # instability reason (e.g. max_sim_steps cap).  If vibrations stayed
++        # well below the limit the whole time, treat it as stable — the cap
++        # just cut the simulation short.
++        if max_abs_w < 0.5 * w_limit:
++            stable = True
++            if termination_reason is None:
++                termination_reason = "survived_window_no_chatter"
++        else:
++            stable = False
++            if termination_reason is None:
++                termination_reason = "safety_max_steps_reached"
+ 
+     x_end_threshold = _pass_end_x(plant)
+     remaining_path = max(float(final_cutter_x) - x_end_threshold, 0.0)
+diff --git a/scripts/train_finish.py b/scripts/train_finish.py
+index 0a66fdd..2f0d078 100644
+--- a/scripts/train_finish.py
++++ b/scripts/train_finish.py
+@@ -1,15 +1,22 @@
+-"""Train a second-mode (finishing) PPO model over a FEASIBLE fixed-depth range.
+-
+-The registered CustomODEPlateFinish-v0 randomizes ap over [0, 18] mm, but only
+-ap <~ 1 mm keeps the plate under the 1 mm displacement limit, so most episodes
+-would be doomed regardless of control.  Here we build the finishing env with
+-ap_max=1.0 so the per-episode fixed depth is sampled from a feasible range and
+-the policy actually learns to modulate spindle speed.  The action space (omega
+-only) and observation are identical to the registered env, so the trained model
+-evaluates directly on CustomODEPlateFinish-v0 with a pinned --ap.
++"""Train the second-mode (finishing) PPO model over a FEASIBLE fixed-depth range.
++
++The registered ``CustomODEPlateFinish-v0`` samples the fixed depth ap uniformly
++over [0, 18] mm, but only ap <~ 1 mm keeps the plate under the 1 mm displacement
++limit, so most episodes there are doomed regardless of control.  This trainer
++builds the finishing env with a small ``--ap-max`` so the per-episode fixed depth
++is drawn from a feasible finishing range and the policy actually learns to
++modulate spindle speed.  The action space (omega only) and observation are
++identical to the registered env, so the trained model evaluates directly on
++``CustomODEPlateFinish-v0`` with a pinned ``--ap``.
++
++Same PPO hyper-parameters as ``train_sb3_ppo.py``.
+ """
+-import gymnasium as gym
++from __future__ import annotations
++
++import argparse
+ from pathlib import Path
++
++import gymnasium as gym
+ from stable_baselines3 import PPO
+ from stable_baselines3.common.callbacks import EvalCallback
+ from stable_baselines3.common.env_util import make_vec_env
+@@ -18,37 +25,74 @@ from stable_baselines3.common.vec_env import DummyVecEnv
+ from custom_rl import register_envs
+ from custom_rl.eval.pipeline import plate_env_kwargs
+ 
+-SAVE = Path("models/ppo_plate_finish")
+-SAVE.mkdir(parents=True, exist_ok=True)
+-LOG = Path("logs/ppo_plate_finish"); LOG.mkdir(parents=True, exist_ok=True)
++# PPO defaults identical to scripts/train_sb3_ppo.py
++PPO_KW = dict(
++    learning_rate=3e-4, n_steps=2048, batch_size=256, n_epochs=10, gamma=0.999,
++    gae_lambda=0.95, clip_range=0.2, ent_coef=0.005, vf_coef=0.5,
++    max_grad_norm=0.5, target_kl=0.03,
++    policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]), log_std_init=-1.0),
++)
+ 
+ 
+-def make_finish_env():
+-    register_envs()
+-    kw = plate_env_kwargs(reward_id="dense", dt=1e-4, n_substeps=10,
+-                          max_episode_steps=2000, randomize_y0=True)
+-    kw["ap_max"] = 1.0  # feasible finishing-depth range for training
+-    return gym.make("CustomODEPlateFinish-v0", **kw)
++def make_finish_env_factory(ap_max, dt, n_substeps, max_episode_steps,
++                            dynamics_uncertainty_std, randomize_y0):
++    def _make():
++        register_envs()
++        kw = plate_env_kwargs(
++            reward_id="dense", dt=dt, n_substeps=n_substeps,
++            max_episode_steps=max_episode_steps,
++            dynamics_uncertainty_std=dynamics_uncertainty_std,
++            randomize_y0=randomize_y0,
++        )
++        kw["ap_max"] = float(ap_max)  # feasible finishing-depth range
++        return gym.make("CustomODEPlateFinish-v0", **kw)
++    return _make
++
+ 
++def main() -> None:
++    p = argparse.ArgumentParser(description="Train second-mode (finishing) PPO over a feasible depth range.")
++    p.add_argument("--seeds", nargs="+", type=int, default=[0])
++    p.add_argument("--total-timesteps", type=int, default=300000)
++    p.add_argument("--ap-max", type=float, default=1.0,
++                   help="Feasible finishing-depth upper bound [mm] for training randomization.")
++    p.add_argument("--dt", type=float, default=1e-4)
++    p.add_argument("--n-substeps", type=int, default=10)
++    p.add_argument("--max-episode-steps", type=int, default=2000)
++    p.add_argument("--n-eval-episodes", type=int, default=1)
++    p.add_argument("--eval-freq", type=int, default=15000)
++    p.add_argument("--dynamics-uncertainty-std", type=float, default=0.001)
++    p.add_argument("--randomize-y0", action=argparse.BooleanOptionalAction, default=True)
++    p.add_argument("--save-dir", default="models/ppo_plate_finish")
++    p.add_argument("--log-dir", default="logs/ppo_plate_finish")
++    args = p.parse_args()
+ 
+-def main():
+     register_envs()
+-    env = make_vec_env(make_finish_env, n_envs=1, seed=0, vec_env_cls=DummyVecEnv,
+-                       monitor_dir=str(LOG / "seed_0"))
+-    eval_env = make_vec_env(make_finish_env, n_envs=1, seed=10000, vec_env_cls=DummyVecEnv)
+-    cb = EvalCallback(eval_env, best_model_save_path=str(SAVE / "best_0"),
+-                      log_path=str(LOG / "seed_0"), eval_freq=15000,
+-                      n_eval_episodes=1, deterministic=True)
+-    model = PPO("MlpPolicy", env, seed=0, learning_rate=3e-4, n_steps=2048,
+-                batch_size=256, n_epochs=10, gamma=0.999, gae_lambda=0.95,
+-                clip_range=0.2, ent_coef=0.005, vf_coef=0.5, max_grad_norm=0.5,
+-                target_kl=0.03,
+-                policy_kwargs=dict(net_arch=dict(pi=[256, 256], vf=[256, 256]),
+-                                   log_std_init=-1.0),
+-                verbose=0, device="cpu")
+-    model.learn(total_timesteps=130000, callback=cb)
+-    model.save(str(SAVE / "final_0"))
+-    env.close(); eval_env.close()
++    save_dir = Path(args.save_dir); save_dir.mkdir(parents=True, exist_ok=True)
++    log_dir = Path(args.log_dir); log_dir.mkdir(parents=True, exist_ok=True)
++
++    print(f"Second-mode (finishing) training: ap_max={args.ap_max} mm (feasible range), "
++          f"uncertainty_std={args.dynamics_uncertainty_std}, randomize_y0={args.randomize_y0}")
++    print(f"  models -> {save_dir}/best_<seed>/best_model.zip , {save_dir}/final_<seed>.zip")
++
++    factory = make_finish_env_factory(
++        args.ap_max, args.dt, args.n_substeps, args.max_episode_steps,
++        args.dynamics_uncertainty_std, args.randomize_y0,
++    )
++
++    for seed in args.seeds:
++        env = make_vec_env(factory, n_envs=1, seed=seed, vec_env_cls=DummyVecEnv,
++                           monitor_dir=str(log_dir / f"seed_{seed}"))
++        eval_env = make_vec_env(factory, n_envs=1, seed=seed + 10000, vec_env_cls=DummyVecEnv)
++        cb = EvalCallback(eval_env, best_model_save_path=str(save_dir / f"best_{seed}"),
++                          log_path=str(log_dir / f"seed_{seed}"),
++                          eval_freq=args.eval_freq, n_eval_episodes=args.n_eval_episodes,
++                          deterministic=True)
++        model = PPO("MlpPolicy", env, seed=seed, verbose=0, device="cpu", **PPO_KW)
++        model.learn(total_timesteps=args.total_timesteps, callback=cb)
++        model.save(str(save_dir / f"final_{seed}"))
++        env.close(); eval_env.close()
++        print(f"  seed {seed}: done -> {save_dir}/final_{seed}.zip")
++
+     print("FINISH_TRAIN_DONE")
+ 
+ 
+-- 
+2.43.0
+

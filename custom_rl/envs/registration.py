@@ -29,12 +29,11 @@ DEFAULT_ENV_N_SUBSTEPS = 10
 DEFAULT_FEED_PER_TOOTH_MM = 0.20
 
 # Default process settings shared by training, evaluation, and checker scripts.
-# For first-stage high-speed chatter-suppression training, keep the admissible
-# spindle range at 4000--40000 rpm.  This avoids very long low-speed episodes
-# while preserving the high-speed regime where early regenerative chatter can
-# appear.  Override these explicitly for low-speed lobe studies.
-DEFAULT_ENV_RPM_MIN = 1000.0
-DEFAULT_ENV_RPM_MAX = 40000.0
+# Realistic face-milling spindle range for this machine/tool: 400--4000 rpm.
+# This window also contains the interesting part of the stability lobes for
+# the plate's dominant modes (17-41 Hz), so speed selection genuinely matters.
+DEFAULT_ENV_RPM_MIN = 400.0
+DEFAULT_ENV_RPM_MAX = 4000.0
 DEFAULT_ENV_OMEGA_MIN = float(rpm_to_omega(DEFAULT_ENV_RPM_MIN))
 DEFAULT_ENV_OMEGA_MAX = float(rpm_to_omega(DEFAULT_ENV_RPM_MAX))
 DEFAULT_ENV_AP_MIN_MM = 0.0
@@ -66,10 +65,11 @@ DEFAULT_REWARD_WDOT_WEIGHT = 0.02
 # mildly positive near the edge of the stable envelope, while still growing
 # quadratically as vibration approaches the termination limit.
 DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 30.0
-DEFAULT_REWARD_OMEGA_COST_WEIGHT = 0.3
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 2.0
+DEFAULT_REWARD_ACTION_RATE_WEIGHT = 2.0
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
 DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
-DEFAULT_REWARD_PASS_COMPLETION_BONUS = 2000.0
+DEFAULT_REWARD_PASS_COMPLETION_BONUS = 10000.0
 DEFAULT_REWARD_FAILURE_PROGRESS_PENALTY_WEIGHT = 1.0
 
 # Generalized safety-gated productivity:
@@ -211,6 +211,8 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "ap_productive_target",
         "ac_productive_target",
         "omega_cost_weight",
+        "action_rate_weight",
+        "include_omega_in_productivity",
         "ap_action_weight",
         "ac_action_weight",
         "include_ae_in_productivity",
@@ -310,6 +312,8 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     reward_kwargs.setdefault("wdot_weight", DEFAULT_REWARD_WDOT_WEIGHT)
     reward_kwargs.setdefault("productivity_weight", DEFAULT_REWARD_PRODUCTIVITY_WEIGHT)
     reward_kwargs.setdefault("omega_cost_weight", DEFAULT_REWARD_OMEGA_COST_WEIGHT)
+    reward_kwargs.setdefault("action_rate_weight", DEFAULT_REWARD_ACTION_RATE_WEIGHT)
+    reward_kwargs.setdefault("include_omega_in_productivity", False)
     reward_kwargs.setdefault("productivity_gate_enabled", DEFAULT_REWARD_PRODUCTIVITY_GATE_ENABLED)
     reward_kwargs.setdefault("productivity_w_gate", DEFAULT_REWARD_PRODUCTIVITY_W_GATE)
     reward_kwargs.setdefault("productivity_wdot_gate", DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE)

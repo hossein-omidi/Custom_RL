@@ -138,7 +138,7 @@ def plot_learning_curve(
         mean_return - MC_BAND_STD_MULT * std_return,
         mean_return + MC_BAND_STD_MULT * std_return,
         alpha=0.3,
-        label=f"±{MC_BAND_STD_MULT:.0f}σ (~99.7%)",
+        label=f"±{MC_BAND_STD_MULT:.0f}σ (~95%)",
     )
     ax.plot(step_grid, mean_return, lw=2)
 

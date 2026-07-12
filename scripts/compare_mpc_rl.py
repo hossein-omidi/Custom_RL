@@ -41,8 +41,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-RL_COLOR = "#1f77b4"
-MPC_COLOR = "#d62728"
+RL_COLOR = "#1f77b4"     # blue
+MPC_COLOR = "#d62728"    # red
+RL_STYLE = dict(color=RL_COLOR, linestyle="-", linewidth=1.5)
+MPC_STYLE = dict(color=MPC_COLOR, linestyle="--", linewidth=2.0)
 PASS_REASONS = {"pass_completed_90percent", "pass_completed"}
 
 
@@ -178,37 +180,134 @@ def _plot_episode_overlay(
             if w_limit is not None:
                 break
 
-    series = {
-        "RL": (_series(rl_ep) if rl_ep is not None else None, RL_COLOR),
-        "MPC": (_series(mpc_ep) if mpc_ep is not None else None, MPC_COLOR),
-    }
+    # (series, style, end-label)  RL solid blue, MPC dashed red
+    rl_ser = _series(rl_ep) if rl_ep is not None else None
+    mpc_ser = _series(mpc_ep) if mpc_ep is not None else None
+    rl_lbl = _controller_label("RL", rl_ep)
+    mpc_lbl = _controller_label("MPC", mpc_ep)
+    series = [
+        (rl_ser, RL_STYLE, rl_lbl),
+        (mpc_ser, MPC_STYLE, mpc_lbl),
+    ]
 
     for idx, (key, ylabel, is_w) in enumerate(panels):
         ax = axes[idx]
-        for label, (ser, color) in series.items():
+        for ser, style, label in series:
             if ser is None:
                 continue
             t = ser["times"]
             y = ser[key]
             good = np.isfinite(t) & np.isfinite(y)
             if np.count_nonzero(good) >= 1:
-                ax.plot(t[good], y[good], lw=1.4, color=color, label=label)
+                ax.plot(t[good], y[good], label=label, **style)
         if is_w and w_limit is not None and np.isfinite(float(w_limit)):
-            ax.axhline(float(w_limit), ls="--", lw=1.0, color="k", alpha=0.6, label="w_limit")
-            ax.axhline(-float(w_limit), ls="--", lw=1.0, color="k", alpha=0.6)
+            ax.axhline(float(w_limit), ls=":", lw=1.2, color="k", alpha=0.7,
+                       label=f"w_limit={float(w_limit):g} m")
             ax.set_ylim(bottom=0.0)
         ax.set_ylabel(ylabel)
         ax.grid(True, alpha=0.3)
         if idx == 0:
-            ax.legend(loc="best", fontsize=9)
+            ax.legend(loc="best", fontsize=9, framealpha=0.9)
 
     axes[-1].set_xlabel("Time  [s]")
     axes[-2].set_xlabel("Time  [s]")
-    fig.suptitle(title, fontsize=13)
+    fig.suptitle(title + "     (RL: solid blue   |   MPC: dashed red)", fontsize=12)
     fig.tight_layout()
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=150)
     plt.close(fig)
+
+
+def _plot_mc_bands(
+    rl_eps: list[dict[str, Any]],
+    mpc_eps: list[dict[str, Any]],
+    *,
+    out_path: Path,
+    title: str,
+) -> None:
+    """Monte-Carlo comparison: per-controller mean (solid) +/- 1 std (band).
+
+    All episodes of a controller (across seeds) are aggregated on a common
+    time base (nan-padded to the longest episode; statistics use nanmean /
+    nanstd), so the stochastic plant realisations appear as an uncertainty
+    band instead of a clutter of separate trajectories.
+    """
+    panels = [
+        ("max_abs_w", "max |w(t)|  [m]", True),
+        ("omega_rpm", "Spindle speed  [rpm]", False),
+        ("ap_mm", "Axial depth ap  [mm]", False),
+        ("Fz_N", "Axial force Fz  [N]", False),
+        ("cum_reward", "Cumulative reward", False),
+        ("feed_progress", "Feed progress", False),
+    ]
+
+    def stack(eps: list[dict[str, Any]]):
+        sers = [_series(ep) for ep in eps if ep is not None]
+        if not sers:
+            return None, None
+        n = max(s["times"].shape[0] for s in sers)
+        t = max((s["times"] for s in sers), key=lambda a: a.shape[0])
+        data = {}
+        for key, _, _ in panels:
+            M = np.full((len(sers), n), np.nan)
+            for i, s in enumerate(sers):
+                arr = s[key]
+                M[i, : arr.shape[0]] = arr
+            data[key] = M
+        return t, data
+
+    t_rl, rl_data = stack(rl_eps)
+    t_mpc, mpc_data = stack(mpc_eps)
+
+    w_limit = None
+    for ep in list(rl_eps) + list(mpc_eps):
+        w_limit = _meta(ep).get("w_limit", _meta(ep).get("w_limit_m"))
+        if w_limit is not None:
+            break
+
+    fig, axes = plt.subplots(3, 2, figsize=(13, 10), sharex=True)
+    axes = axes.reshape(-1)
+    groups = [
+        (t_rl, rl_data, "#1f77b4", f"RL  mean±1σ  (n={len(rl_eps)})"),
+        (t_mpc, mpc_data, "#d62728", f"MPC mean±1σ  (n={len(mpc_eps)})"),
+    ]
+    for idx, (key, ylabel, is_w) in enumerate(panels):
+        ax = axes[idx]
+        for t, data, color, label in groups:
+            if data is None:
+                continue
+            M = data[key]
+            with np.errstate(all="ignore"):
+                mean = np.nanmean(M, axis=0)
+                std = np.nanstd(M, axis=0)
+            good = np.isfinite(mean)
+            ax.plot(t[good], mean[good], "-", color=color, lw=2.0, label=label)
+            ax.fill_between(t[good], (mean - std)[good], (mean + std)[good],
+                            color=color, alpha=0.22, linewidth=0)
+        if is_w and w_limit is not None and np.isfinite(float(w_limit)):
+            ax.axhline(float(w_limit), ls=":", lw=1.2, color="k", alpha=0.7,
+                       label=f"w_limit={float(w_limit):g} m")
+            ax.set_ylim(bottom=0.0)
+        ax.set_ylabel(ylabel)
+        ax.grid(True, alpha=0.3)
+        if idx == 0:
+            ax.legend(loc="best", fontsize=9, framealpha=0.9)
+    axes[-1].set_xlabel("Time  [s]")
+    axes[-2].set_xlabel("Time  [s]")
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(out_path, dpi=150)
+    plt.close(fig)
+
+
+def _controller_label(name: str, ep: dict[str, Any] | None) -> str:
+    """Legend label annotated with return / pass-status / termination reason."""
+    if ep is None:
+        return f"{name} (absent)"
+    s = _summary(ep)
+    tag = "pass" if s["pass_completed"] else (s["termination_reason"] or "cap")
+    return f"{name}  (R={s['return']:.0f}, {tag})"
 
 
 def _plot_summary_bars(
@@ -322,6 +421,16 @@ def main() -> int:
                 "mpc": _summary(mpc_ep) if mpc_ep is not None else None,
                 "w_limit": w_limit,
             })
+
+    # Monte-Carlo band figure over ALL episodes (stochastic plant realisations)
+    all_rl = [ep for seed in seeds for ep in rl.get(seed, [])]
+    all_mpc = [ep for seed in seeds for ep in mpc.get(seed, [])]
+    if all_rl or all_mpc:
+        _plot_mc_bands(all_rl, all_mpc,
+                       out_path=out_dir / "compare_mc_bands.png",
+                       title="RL vs MPC under the stochastic plant "
+                             "(Monte-Carlo mean ± 1 std over episodes)")
+        n_plots += 1
 
     if summary_rows:
         _plot_summary_bars(summary_rows, out_path=out_dir / "summary_bars.png")

@@ -26,10 +26,13 @@ models/
 eval_trajectories/
 mpc_trajectories/
 mpc_trajectories_finish/
+results/
 plots/**/*.png
 plots/**/*.pdf
 plots/*.png
 plots/*.pdf
+plots/**/*.csv
+plots/**/*.json
 
 # Jupyter
 .ipynb_checkpoints/

@@ -237,7 +237,14 @@ class DenseProductivePlateReward:
 
     If a 3D action is used, the third action is radial immersion/depth ae [mm],
     and productivity can include ae in the same material-removal proxy:
-        raw_productivity_score = omega_score * ap_score * ae_score
+        # Productivity = axial depth of cut (the material-removal decision).
+        # Spindle speed is deliberately NOT a productivity factor: it is an
+        # energy-like control input, costed below, so RL and MPC face the same
+        # incentive (suppress chatter at the lowest speed/effort that works).
+        if self.include_omega_in_productivity:
+            raw_productivity_score = omega_score * ap_score * ae_score
+        else:
+            raw_productivity_score = ap_score * ae_score
         productivity_score = raw_productivity_score * vibration_gate
     """
 
@@ -248,7 +255,9 @@ class DenseProductivePlateReward:
         action_weight: float = 0.0,
         productivity_weight: float = 30.0,
         negative_ap_weight: float = 2.0,
-        omega_cost_weight: float = 0.3,
+        omega_cost_weight: float = 2.0,
+        action_rate_weight: float = 2.0,
+        include_omega_in_productivity: bool = False,
         ap_action_weight: float = 0.0,
         w_scale: float = 7.5e-4,
         wdot_scale: float = 1.0,
@@ -314,6 +323,12 @@ class DenseProductivePlateReward:
         self.productivity_weight = float(productivity_weight)
         self.negative_ap_weight = float(negative_ap_weight)
         self.omega_cost_weight = float(omega_cost_weight)
+        self.action_rate_weight = float(action_rate_weight)
+        self.include_omega_in_productivity = bool(include_omega_in_productivity)
+        # previous applied action for the smoothness (rate) cost
+        self._prev_omega: float | None = None
+        self._prev_ap: float | None = None
+        self._prev_t: float | None = None
         self.ap_action_weight = float(ap_action_weight)
 
         self.w_scale = float(w_scale)
@@ -493,6 +508,18 @@ class DenseProductivePlateReward:
         productivity_term = self.productivity_weight * productivity_score
 
         omega_cost = self.omega_cost_weight * (omega_score**2)
+
+        # control-input smoothness: quadratic cost on the span-normalised
+        # change of the applied physical action (identical term in the MPC)
+        omega_span = max(self.omega_max - self.omega_min, 1e-12)
+        ap_span = max(self.ap_max - self.ap_min, 1e-12)
+        if self._prev_t is None or t < self._prev_t:
+            action_rate_cost = 0.0
+        else:
+            d_om = (omega - self._prev_omega) / omega_span
+            d_ap = (ap - self._prev_ap) / ap_span
+            action_rate_cost = self.action_rate_weight * (d_om**2 + d_ap**2)
+        self._prev_omega, self._prev_ap, self._prev_t = float(omega), float(ap), float(t)
         negative_ap = max(-ap, 0.0)
         negative_ap_cost = (negative_ap / max(self.ap_max, 1e-12)) ** 2
 
@@ -507,6 +534,7 @@ class DenseProductivePlateReward:
             - w_cost
             - wdot_cost
             - omega_cost
+            - action_rate_cost
             - self.negative_ap_weight * negative_ap_cost
             - ap_action_cost
             - self.action_weight * action_cost
@@ -538,6 +566,7 @@ class DenseProductivePlateReward:
             "productivity_wdot_gate_m_s": float(self.productivity_wdot_gate),
             "productivity": float(productivity_term),
             "omega_cost": float(omega_cost),
+            "action_rate_cost": float(action_rate_cost),
             "negative_ap_cost": float(self.negative_ap_weight * negative_ap_cost),
             "ap_action_cost": float(ap_action_cost),
             "action_cost": float(self.action_weight * action_cost),

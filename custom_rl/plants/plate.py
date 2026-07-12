@@ -56,8 +56,8 @@ DEFAULT_SENSOR_POINTS: tuple[tuple[float, float], ...] = (
 DEFAULT_Y_CUTTER = 0.20
 
 # Spindle speed operating range [rpm]; internal physics uses rad/s.
-RPM_MIN = 1000
-RPM_MAX = 40000.0
+RPM_MIN = 400.0
+RPM_MAX = 4000.0
 
 # Practical reference speed for episode cap estimation.  This does not change
 # pass termination; it only avoids extremely long RL rollout caps at very low rpm.
