@@ -56,7 +56,7 @@ def main() -> None:
     p.add_argument("--ap-max", type=float, default=1.0,
                    help="Feasible finishing-depth upper bound [mm] for training randomization.")
     p.add_argument("--dt", type=float, default=1e-4)
-    p.add_argument("--n-substeps", type=int, default=10)
+    p.add_argument("--n-substeps", type=int, default=5)
     p.add_argument("--max-episode-steps", type=int, default=2000)
     p.add_argument("--n-eval-episodes", type=int, default=1)
     p.add_argument("--eval-freq", type=int, default=15000)

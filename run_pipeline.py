@@ -158,7 +158,7 @@ def main() -> None:
 
     # shared physics / stochasticity
     p.add_argument("--dt", type=float, default=1e-4)
-    p.add_argument("--n-substeps", type=int, default=10)
+    p.add_argument("--n-substeps", type=int, default=5)
     p.add_argument("--uncertainty", type=float, default=0.001,
                    help="Modal-acceleration disturbance std (stochastic plant), used everywhere.")
     p.add_argument("--seeds", nargs="+", type=int, default=[0])

@@ -192,7 +192,7 @@ def _reset_options_for_line_y(plant: Any, line_y_m: float) -> dict[str, float]:
 
 
 def _pass_end_x(plant: Any) -> float:
-    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.1 * plant.L1)))
+    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.95 * plant.L1)))
 
 
 def _feed_rate_m_s(plant: Any, omega_rad_s: float) -> float:
@@ -276,7 +276,6 @@ def run_fixed_action_trial(
 ) -> TrialMetrics:
     """Simulate one fixed [omega, ap] pair with no controller on one line y=a."""
     plant = env.unwrapped.plant
-    w_limit = float(getattr(plant, "w_limit", 1e-3))
 
     x_selected = set_tool_start_x(plant, x_start_m)
     y_selected = set_milling_line_y(plant, line_y_m)
@@ -320,16 +319,9 @@ def run_fixed_action_trial(
     elif termination_reason in UNSTABLE_REASONS:
         stable = False
     else:
-        # Capped trial (e.g. max_sim_steps) with low vibration throughout:
-        # classify stable -- the cap merely cut the simulation short.
-        if max_abs_w < 0.5 * w_limit:
-            stable = True
-            if termination_reason is None:
-                termination_reason = "survived_window_no_chatter"
-        else:
-            stable = False
-            if termination_reason is None:
-                termination_reason = "safety_max_steps_reached"
+        stable = False
+        if termination_reason is None:
+            termination_reason = "safety_max_steps_reached"
 
     x_end_threshold = _pass_end_x(plant)
     remaining_path = max(float(final_cutter_x) - x_end_threshold, 0.0)

@@ -124,7 +124,7 @@ def main() -> None:
     parser.add_argument(
         "--n-substeps",
         type=int,
-        default=10,
+        default=5,
         help="RK4 substeps per environment/control step",
     )
 

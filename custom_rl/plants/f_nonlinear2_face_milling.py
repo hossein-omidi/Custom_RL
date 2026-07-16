@@ -188,6 +188,14 @@ def reset_state_history() -> None:
     last_force_info = None
 
 
+# Bisect directly on the (t, x) history with a key selector so the delay lookup
+# never rebuilds an O(history) times list.  Operating on _state_history itself
+# (rather than a parallel list) keeps it consistent with the RK4 stage-history
+# rollback in the integrator, which trims _state_history in place.
+_HISTORY_TIME_KEY = lambda entry: entry[0]
+_HISTORY_PHASE_KEY = lambda entry: entry[2]   # unwrapped spindle phase in kinematic entries
+
+
 def _append_state_history(t: float, x: np.ndarray) -> None:
     """Append state history while preserving monotonic order as much as possible."""
     global _state_history
@@ -198,8 +206,7 @@ def _append_state_history(t: float, x: np.ndarray) -> None:
         _state_history.append((t, x_copy))
     else:
         # ODE solvers can occasionally evaluate at non-monotonic times.
-        times = [entry[0] for entry in _state_history]
-        idx = bisect.bisect_left(times, t)
+        idx = bisect.bisect_left(_state_history, t, key=_HISTORY_TIME_KEY)
         if idx < len(_state_history) and abs(_state_history[idx][0] - t) < 1e-14:
             _state_history[idx] = (t, x_copy)
         else:
@@ -212,24 +219,24 @@ def _append_state_history(t: float, x: np.ndarray) -> None:
 def _get_state_at_time(t_query: float) -> Optional[np.ndarray]:
     """Return modal state at t_query by linear interpolation from history."""
     global _state_history
-    if len(_state_history) == 0:
+    n = len(_state_history)
+    if n == 0:
         return None
 
     t_query = float(t_query)
-    times = [entry[0] for entry in _state_history]
-    idx = bisect.bisect_left(times, t_query)
+    idx = bisect.bisect_left(_state_history, t_query, key=_HISTORY_TIME_KEY)
 
     if idx == 0:
         # If the requested delay time exactly matches the first accepted
         # state, return it instead of treating it as unavailable.
-        if abs(times[0] - t_query) < 1e-14:
+        if abs(_state_history[0][0] - t_query) < 1e-14:
             return _state_history[0][1].copy()
         return None
-    if idx == len(times):
+    if idx == n:
         # Do not extrapolate a future delayed state from the last accepted state.
         # If this happens, the RK substep is too large for the current tooth delay
         # or a proper within-step DDE interpolant is required.
-        if t_query <= times[-1] + 1e-14:
+        if t_query <= _state_history[-1][0] + 1e-14:
             return _state_history[-1][1].copy()
         return None
 
@@ -305,15 +312,15 @@ def _get_kinematic_at_time(t_query: float):
         return None
 
     t_query = float(t_query)
-    times = [entry[0] for entry in _kinematic_history]
-    idx = bisect.bisect_left(times, t_query)
+    n = len(_kinematic_history)
+    idx = bisect.bisect_left(_kinematic_history, t_query, key=_HISTORY_TIME_KEY)
 
     if idx == 0:
-        if abs(times[0] - t_query) < _KINEMATIC_TOL:
+        if abs(_kinematic_history[0][0] - t_query) < _KINEMATIC_TOL:
             return _kinematic_history[0][1], _kinematic_history[0][2]
         return None
 
-    if idx == len(times):
+    if idx == n:
         # For queries after the last accepted point, the caller should normally
         # propagate from the current accepted state using the current held omega.
         return _kinematic_history[-1][1], _kinematic_history[-1][2]
@@ -377,16 +384,16 @@ def _get_time_at_phase(phase_query: float) -> Optional[float]:
         return None
 
     phase_query = float(phase_query)
-    phases = [entry[2] for entry in _kinematic_history]
-    idx = bisect.bisect_left(phases, phase_query)
+    n = len(_kinematic_history)
+    idx = bisect.bisect_left(_kinematic_history, phase_query, key=_HISTORY_PHASE_KEY)
 
     if idx == 0:
-        if abs(phases[0] - phase_query) < _KINEMATIC_TOL:
+        if abs(_kinematic_history[0][2] - phase_query) < _KINEMATIC_TOL:
             return float(_kinematic_history[0][0])
         return None
 
-    if idx == len(phases):
-        if phase_query <= phases[-1] + _KINEMATIC_TOL:
+    if idx == n:
+        if phase_query <= _kinematic_history[-1][2] + _KINEMATIC_TOL:
             return float(_kinematic_history[-1][0])
         return None
 
@@ -681,17 +688,20 @@ def _engaged(theta: float, theta_s: float, theta_e: float) -> bool:
 # ============================================================
 
 
-def relative_displacement_mm(x_modal: np.ndarray, xc: float, yc: float) -> np.ndarray:
+def relative_displacement_mm(x_modal: np.ndarray, xc: float, yc: float,
+                             phi_components=None) -> np.ndarray:
     """
     Relative dynamic displacement r = cutter - workpiece at (xc,yc), in mm.
 
     The cutter is assumed dynamically rigid here, so r = -workpiece displacement.
     If vector mode shapes are not provided, only z displacement is reconstructed.
+    ``phi_components`` may be a precomputed (phi_x, phi_y, phi_z) tuple at (xc,yc)
+    to avoid re-evaluating the mode shapes (they are reused within one force call).
     """
     x_modal = np.asarray(x_modal, dtype=np.float64).reshape(-1)
     eta = x_modal[0::2]
 
-    phi_x, phi_y, phi_z = _phi_components(xc, yc)
+    phi_x, phi_y, phi_z = phi_components if phi_components is not None else _phi_components(xc, yc)
     w_x_m = float(phi_x @ eta)
     w_y_m = float(phi_y @ eta)
     w_z_m = float(phi_z @ eta)
@@ -701,12 +711,13 @@ def relative_displacement_mm(x_modal: np.ndarray, xc: float, yc: float) -> np.nd
     return cutter_dynamic_mm - workpiece_mm
 
 
-def relative_velocity_mm_s(x_modal: np.ndarray, xc: float, yc: float) -> np.ndarray:
+def relative_velocity_mm_s(x_modal: np.ndarray, xc: float, yc: float,
+                           phi_components=None) -> np.ndarray:
     """Relative dynamic velocity r_dot = cutter_dot - workpiece_dot at (xc,yc), in mm/s."""
     x_modal = np.asarray(x_modal, dtype=np.float64).reshape(-1)
     etad = x_modal[1::2]
 
-    phi_x, phi_y, phi_z = _phi_components(xc, yc)
+    phi_x, phi_y, phi_z = phi_components if phi_components is not None else _phi_components(xc, yc)
     wd_x_m_s = float(phi_x @ etad)
     wd_y_m_s = float(phi_y @ etad)
     wd_z_m_s = float(phi_z @ etad)
@@ -796,10 +807,16 @@ def compute_face_milling_force(
         # compare current state with itself at the same cutter location.
         xc_delay, yc_delay = xc, yc
 
-    rel_now = relative_displacement_mm(x_modal, xc, yc)
-    rel_delay = relative_displacement_mm(x_delay_modal, xc_delay, yc_delay)
+    # Evaluate the cutter-point mode shapes ONCE per point and reuse them:
+    # rel_now, rel_vel_now, and the modal force projection all use phi at (xc,yc),
+    # while rel_delay uses phi at the (slightly different) delayed cutter point.
+    phi_now = _phi_components(xc, yc)
+    phi_delay = phi_now if (xc_delay == xc and yc_delay == yc) else _phi_components(xc_delay, yc_delay)
+
+    rel_now = relative_displacement_mm(x_modal, xc, yc, phi_components=phi_now)
+    rel_delay = relative_displacement_mm(x_delay_modal, xc_delay, yc_delay, phi_components=phi_delay)
     delta_rel = rel_now - rel_delay
-    rel_vel_now = relative_velocity_mm_s(x_modal, xc, yc)
+    rel_vel_now = relative_velocity_mm_s(x_modal, xc, yc, phi_components=phi_now)
 
     phi_pitch = 2.0 * np.pi / float(N)
     theta_base = spindle_phase(t, omega_rad_s) + float(theta0)
@@ -862,7 +879,7 @@ def compute_face_milling_force(
     F_total = np.nan_to_num(F_total, nan=0.0, posinf=MAX_FORCE, neginf=-MAX_FORCE)
     F_total = np.clip(F_total, -MAX_FORCE, MAX_FORCE)
 
-    F_modal = project_force_to_modal(F_total, xc, yc)
+    F_modal = project_force_to_modal(F_total, xc, yc, phi_components=phi_now)
 
     info = FaceMillingForceInfo(
         t=t,
@@ -892,13 +909,14 @@ def compute_face_milling_force(
     return F_total, F_modal, info
 
 
-def project_force_to_modal(F_global_N: np.ndarray, xc: float, yc: float) -> np.ndarray:
+def project_force_to_modal(F_global_N: np.ndarray, xc: float, yc: float,
+                           phi_components=None) -> np.ndarray:
     """Project [Fx,Fy,Fz] onto modal coordinates at cutter point."""
     F_global_N = np.asarray(F_global_N, dtype=np.float64).reshape(3)
     mass = _modal_mass_vec()
     mass = np.where(np.abs(mass) < 1e-18, 1e-18, mass)
 
-    phi_x, phi_y, phi_z = _phi_components(xc, yc)
+    phi_x, phi_y, phi_z = phi_components if phi_components is not None else _phi_components(xc, yc)
 
     mode = str(FORCE_PROJECTION_MODE).lower()
     if mode == "vector":

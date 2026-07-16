@@ -230,14 +230,7 @@ class FaceMillingStabilityModel:
     # ======================================================================
     def periodic_jacobians(self, xc: float, yc: float, k: int, *,
                            coupling: str = "numerical", eps: float = 1e-8) -> dict:
-        """Extract Jp/Jv/Jpd at k angles over one tooth pitch (unit ap = 1 mm).
-
-        The plant force is exactly linear in ap, so these scale with ap; the
-        cutting Jacobians are independent of omega (the angle grid is what
-        matters), and the process-damping velocity Jacobian scales as 1/omega
-        (handled via 'pd' + 'omega_ref').  Delayed-Jacobian low-rank factors
-        (V, L) enable the reduced semi-discretization state.
-        """
+        """Extract Jp/Jv/Jpd at k angles over one tooth pitch (unit ap = 1 mm)."""
         key = (round(float(xc), 9), round(float(yc), 9), int(k), coupling)
         if key in self._jac_cache:
             return self._jac_cache[key]
@@ -246,7 +239,7 @@ class FaceMillingStabilityModel:
         p = self.plant
         omega_ref = 0.5 * (float(p.omega_min) + float(p.omega_max))
         tau_ref = 2.0 * np.pi / (self.N * omega_ref)
-        pitch_dt = tau_ref  # one tooth pitch in time at omega_ref
+        pitch_dt = tau_ref
 
         Jp = np.zeros((k, n, n))
         Jv = np.zeros((k, n, n))
@@ -257,7 +250,7 @@ class FaceMillingStabilityModel:
         if coupling == "analytic":
             phi = self.phi_at(xc, yc)
             R = np.outer(phi / self.M_modal, phi)
-            c_unit = self.disp_to_mm * np.sin(self.gamma_L) * self.Ka  # per mm ap, per tooth
+            c_unit = self.disp_to_mm * np.sin(self.gamma_L) * self.Ka
             for i in range(k):
                 t_eval = (i + 0.5) / k * pitch_dt + tau_ref
                 g = self.engaged_count(t_eval, omega_ref)
@@ -266,7 +259,6 @@ class FaceMillingStabilityModel:
                 Jpd[i] = -Jp[i]
             check = {"coupling": "analytic"}
         elif coupling == "numerical":
-            # save & pin the force-module state so the cutter sits at (xc, yc)
             saved = (f2.x0_cutter, f2.y_cutter,
                      getattr(f2, "USE_ACCEPTED_PATH_KINEMATICS", False))
             try:
@@ -275,8 +267,6 @@ class FaceMillingStabilityModel:
                 feed = f2.feed_rate_m_s(omega_ref)
                 x0v = np.zeros(2 * n)
                 for i in range(k):
-                    # evaluate one pitch later so t_delay = t - tau >= 0; the
-                    # tooth pattern is pitch-periodic so the angles are identical
                     t_eval = (i + 0.5) / k * pitch_dt + tau_ref
                     f2.x0_cutter = float(p.L1 - float(xc) - feed * t_eval)
 
@@ -293,11 +283,9 @@ class FaceMillingStabilityModel:
                             xp = x0v.copy(); xp[slot] = +eps
                             xm = x0v.copy(); xm[slot] = -eps
                             J[i, :, j] = (Q(xp, x0v) - Q(xm, x0v)) / (2 * eps)
-                        # delayed positions
                         xp = x0v.copy(); xp[2 * j] = +eps
                         xm = x0v.copy(); xm[2 * j] = -eps
                         Jpd[i, :, j] = (Q(x0v, xp) - Q(x0v, xm)) / (2 * eps)
-                        # delayed velocities must be inert in this model
                         xp = x0v.copy(); xp[2 * j + 1] = +eps
                         xm = x0v.copy(); xm[2 * j + 1] = -eps
                         jvd_max = max(jvd_max, float(np.max(np.abs(
@@ -306,7 +294,6 @@ class FaceMillingStabilityModel:
             finally:
                 f2.x0_cutter, f2.y_cutter, f2.USE_ACCEPTED_PATH_KINEMATICS = saved
 
-            # cross-check against the hand-derived closed form
             phi = self.phi_at(xc, yc)
             R = np.outer(phi / self.M_modal, phi)
             c_unit = self.disp_to_mm * np.sin(self.gamma_L) * self.Ka
@@ -323,13 +310,12 @@ class FaceMillingStabilityModel:
         else:
             raise ValueError("coupling must be 'numerical' or 'analytic'")
 
-        # low-rank factorisation of the delayed coupling: Jpd_i ~= L_i V^T
         stack = Jpd.reshape(k * n, n)
         _, sv, Vt = np.linalg.svd(stack, full_matrices=False)
         r = int(np.sum(sv > 1e-9 * (sv[0] if sv.size else 1.0)))
         r = max(r, 1) if float(np.max(np.abs(Jpd))) > 0 else 0
-        V = Vt[:r].T                                   # (n, r)
-        L = np.einsum("inm,mr->inr", Jpd, V)           # (k, n, r)
+        V = Vt[:r].T
+        L = np.einsum("inm,mr->inr", Jpd, V)
 
         jac = {"k": k, "Jp": Jp, "Jv": Jv, "V": V, "L": L, "rank": r,
                "omega_ref": omega_ref, "pd": bool(getattr(p, "use_process_damping", False)),
@@ -343,13 +329,7 @@ class FaceMillingStabilityModel:
 # ---------------------------------------------------------------------------
 def sdm_spectral_radius(model: FaceMillingStabilityModel, jac: dict, rpm: float,
                         ap_mm: float, mode_idx: np.ndarray) -> float:
-    """Largest |Floquet multiplier| of the linearised delayed modal system.
-
-    First-order semi-discretization over one tooth period (= regen delay =
-    coefficient period; the first-order delayed weights are both 1/2).  The
-    history carries only the r low-rank coordinates s_j = V^T eta(t - j*dt), so
-    the map dimension is 2n + r*k instead of 2n(k+1) — same theory, much faster.
-    """
+    """Largest |Floquet multiplier| of the linearised delayed modal system."""
     idx = np.asarray(mode_idx, dtype=int)
     n = idx.size
     k = int(jac["k"])
@@ -365,8 +345,8 @@ def sdm_spectral_radius(model: FaceMillingStabilityModel, jac: dict, rpm: float,
     Jv = jac["Jv"][np.ix_(range(k), idx, idx)]
     vscale = (jac["omega_ref"] / omega) if jac["pd"] else 1.0
     r = int(jac["rank"])
-    V = jac["V"][idx, :]                       # (n, r)
-    L = jac["L"][np.ix_(range(k), idx, range(r))] if r else None  # (k, n, r)
+    V = jac["V"][idx, :]
+    L = jac["L"][np.ix_(range(k), idx, range(r))] if r else None
 
     two_n = 2 * n
     d = two_n + r * k
@@ -389,10 +369,8 @@ def sdm_spectral_radius(model: FaceMillingStabilityModel, jac: dict, rpm: float,
                 Rd = np.linalg.solve(A, (P - I2n)) @ Bc
             except np.linalg.LinAlgError:
                 Rd = dt * Bc
-            # delayed term: x(t-tau) endpoints are history slots k-1 and k
             T[:two_n, two_n + r * (k - 2): two_n + r * (k - 1)] += 0.5 * Rd
             T[:two_n, two_n + r * (k - 1): two_n + r * k] += 0.5 * Rd
-            # new s^(1) = V^T * (current positions);  s^(j) <- s^(j-1)
             T[two_n: two_n + r, :n] = V.T
             if k > 1:
                 T[two_n + r:, two_n: two_n + r * (k - 1)] = np.eye(r * (k - 1))
@@ -403,19 +381,17 @@ def sdm_spectral_radius(model: FaceMillingStabilityModel, jac: dict, rpm: float,
 
 def adaptive_k(model: FaceMillingStabilityModel, rpm: float, mode_idx: np.ndarray,
                k_base: int, samples_per_period: float = 6.0, k_max: int = 320) -> int:
-    """Interval count that resolves the fastest retained mode at this speed."""
     omega = float(rpm_to_omega(rpm))
     tau = 2.0 * np.pi / (model.N * max(omega, 1e-12))
     f_max = float(np.max(model.omega_vec[np.asarray(mode_idx)])) / (2.0 * np.pi)
     k_need = int(np.ceil(samples_per_period * f_max * tau))
     k = int(np.clip(max(k_base, k_need), 8, k_max))
-    return int(16 * np.ceil(k / 16))  # quantise so the Jacobian cache stays small
+    return int(16 * np.ceil(k / 16))
 
 
 def sdm_critical_ap(model: FaceMillingStabilityModel, rpm: float, xc: float, yc: float,
                     mode_idx: np.ndarray, *, k_base: int = 48, coupling: str = "numerical",
                     ap_cap_mm: float = 30.0, tol_mm: float = 1e-3, max_iter: int = 40) -> float:
-    """Critical depth ap_lim(rpm): spectral radius crosses 1 (bracket + bisection)."""
     k = adaptive_k(model, rpm, mode_idx, k_base)
     jac = model.periodic_jacobians(xc, yc, k, coupling=coupling)
 
@@ -449,8 +425,6 @@ def sdm_critical_ap(model: FaceMillingStabilityModel, rpm: float, xc: float, yc:
 def zoa_lobe(model: FaceMillingStabilityModel, xc: float, yc: float, *,
              n_lobes: int = 12, freq_pts: int = 4000,
              ap_cap_mm: float = 50.0) -> dict[str, np.ndarray]:
-    """Analytic scallops.  Exact for the averaged single-frequency model:
-    ap = 1/(2*kappa*Re[Phi_zz(i*wc)]);  wc*tau = 2*theta + 2*pi*j."""
     phi = model.phi_at(xc, yc)
     kappa = model.kappa_per_ap()
     wn = model.omega_vec
@@ -468,7 +442,7 @@ def zoa_lobe(model: FaceMillingStabilityModel, xc: float, yc: float, *,
             ap = 1.0 / (2.0 * kappa * G)
             if not np.isfinite(ap) or ap <= 0.0 or ap > ap_cap_mm:
                 continue
-            theta = np.arctan2(1.0, -H / G)  # psi/2 in (0, pi)
+            theta = np.arctan2(1.0, -H / G)
             for j in range(n_lobes):
                 tau = (2.0 * theta + 2.0 * np.pi * j) / wc
                 if tau > 0:
@@ -510,14 +484,7 @@ def compute_heatmap(model: FaceMillingStabilityModel, args) -> dict[str, Any]:
     print(f"  modes kept {mode_idx.tolist()} of {model.K} "
           f"(f={np.round(f_hz[mode_idx], 1).tolist()} Hz, "
           f"compliance ratios={np.round(comp[mode_idx] / comp.max(), 4).tolist()})")
-    f_dom = float(f_hz[int(np.argmax(comp))])
-    last_lobe = 60.0 * f_dom / model.N
-    if args.rpm_min > last_lobe:
-        print(f"  note: the scallops of the dominant {f_dom:.1f} Hz mode lie below "
-              f"{last_lobe:.0f} rpm (rpm=60*f/(N*j)); the requested range sits beyond "
-              f"the last lobe, so the boundary there is smooth.")
 
-    # self-check at ap=0: rho must equal the free-decay multiplier of the slowest mode
     k0 = adaptive_k(model, float(rpm_grid[0]), mode_idx, args.k_intervals)
     jac0 = model.periodic_jacobians(xc, yc, k0, coupling=args.coupling)
     if "rel_err_vs_analytic" in jac0["check"]:
@@ -542,13 +509,12 @@ def compute_heatmap(model: FaceMillingStabilityModel, args) -> dict[str, Any]:
                   f"rho range [{rho[ri].min():.3f}, {rho[ri].max():.3f}]  "
                   f"({time.time() - t0:.0f}s)")
 
-    # refined boundary: first upward rho=1 crossing per rpm, bisected between cells
     ap_bound = np.full(rpm_grid.size, np.nan)
     for ri, rpm in enumerate(rpm_grid):
         row = rho[ri]
         unstable = np.flatnonzero(row >= 1.0)
         if unstable.size == 0:
-            ap_bound[ri] = args.ap_cap  # stable everywhere in scan
+            ap_bound[ri] = args.ap_cap
             continue
         i1 = int(unstable[0])
         if i1 == 0:
@@ -583,12 +549,12 @@ def plot_heatmap(res: dict[str, Any], model: FaceMillingStabilityModel, out: Pat
     pcm = ax.pcolormesh(rpm, ap, rho.T, cmap="RdBu_r", norm=norm, shading="auto",
                         rasterized=True)
     cb = fig.colorbar(pcm, ax=ax, pad=0.015)
-    cb.set_label("Floquet spectral radius  ρ(Φ)   (stable ρ<1, chatter ρ>1)")
+    cb.set_label("Floquet spectral radius  rho(Phi)   (stable rho<1, chatter rho>1)")
     try:
         ax.contour(rpm, ap, rho.T, levels=[0.9, 1.1], colors="k",
                    linewidths=0.8, linestyles=":", alpha=0.55)
         cs = ax.contour(rpm, ap, rho.T, levels=[1.0], colors="k", linewidths=2.4)
-        ax.clabel(cs, fmt={1.0: "ρ = 1  (stability lobe)"}, fontsize=9)
+        ax.clabel(cs, fmt={1.0: "rho = 1  (stability lobe)"}, fontsize=9)
     except Exception:
         pass
     if show_zoa and np.any(np.isfinite(res["zoa_env"])):
@@ -610,7 +576,7 @@ def plot_heatmap(res: dict[str, Any], model: FaceMillingStabilityModel, out: Pat
 
 
 # ---------------------------------------------------------------------------
-# Bisection-only boundary mode (fast CSV) and 3D position sweeps (x or y0)
+# Bisection-only boundary mode and 3D position sweeps (x or y0)
 # ---------------------------------------------------------------------------
 def compute_boundary(model: FaceMillingStabilityModel, args) -> dict[str, Any]:
     xc, yc = args.xc, args.yc
@@ -718,8 +684,6 @@ def plot_3d_surface(res: dict[str, Any], out: Path) -> None:
 # Verification against the real nonlinear plant
 # ---------------------------------------------------------------------------
 def verify_against_plant(model: FaceMillingStabilityModel, args) -> list[dict[str, Any]]:
-    """At probe (rpm, ap) points, integrate the true nonlinear plant from a small
-    seed and compare observed regenerative growth/decay with the SDM prediction."""
     import gymnasium as gym
     from custom_rl import register_envs
     from custom_rl.eval.pipeline import plate_env_kwargs
@@ -734,9 +698,6 @@ def verify_against_plant(model: FaceMillingStabilityModel, args) -> list[dict[st
     kw["x0_cutter"] = float(model.plant.L1 - xc)
     kw["initial_eta_std"] = 1e-6
     kw["control_ap"] = False
-    # Raise the displacement limit so the amplitude criterion does not truncate
-    # the run before the regenerative envelope reveals growth/decay (a large
-    # forced response tripping w_limit is NOT chatter -- see the theory doc).
     kw["w_limit"] = float(args.verify_w_limit)
     env = gym.make("CustomODEPlate-v0", **kw)
 
@@ -797,7 +758,6 @@ def _phys_to_norm(env, omega: float, ap: float) -> np.ndarray:
 
 
 def _growth_per_step(w: np.ndarray) -> float:
-    """Per-step envelope growth in the exponential regime (block maxima, late fit)."""
     w = np.asarray(w, dtype=np.float64)
     w = w[np.isfinite(w) & (w > 0)]
     if w.size < 40:
@@ -819,8 +779,6 @@ def _growth_per_step(w: np.ndarray) -> float:
 
 
 def _growth_ratio(w: np.ndarray) -> float:
-    """Late-peak / post-transient-baseline ratio: catches fast chatter that
-    saturates before a slope is measurable; forced responses give ratio ~ 1."""
     w = np.asarray(w, dtype=np.float64)
     w = w[np.isfinite(w) & (w > 0)]
     if w.size < 20:
@@ -868,7 +826,6 @@ def save_csv_3d(res: dict[str, Any], path: Path) -> None:
 
 
 def build_model(args) -> FaceMillingStabilityModel:
-    """Instantiate the RL plant (defaults = registered-env values) and wrap it."""
     kw = dict(ae_default=args.ae, feed_per_tooth_mm=args.feed,
               milling_mode=args.milling_mode, randomize_y0=False,
               modal_damping_ratio=args.zeta)
@@ -881,19 +838,16 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--out-dir", type=Path, default=Path("plots/lobe_fundamental"))
-    ap.add_argument("--mode", choices=["heatmap", "boundary"], default="heatmap",
-                    help="heatmap: rho(rpm,ap) field + rho=1 line (default); "
-                         "boundary: bisection curve only")
+    ap.add_argument("--mode", choices=["heatmap", "boundary"], default="heatmap")
     ap.add_argument("--rpm-min", type=float, default=400.0)
     ap.add_argument("--rpm-max", type=float, default=4000.0)
     ap.add_argument("--rpm-points", type=int, default=90)
     ap.add_argument("--rpm-points-3d", type=int, default=40)
-    ap.add_argument("--ap-cap", type=float, default=30.0, help="upper ap of the scan [mm]")
+    ap.add_argument("--ap-cap", type=float, default=30.0)
     ap.add_argument("--ap-min-scan", type=float, default=0.02)
     ap.add_argument("--ap-points", type=int, default=70)
-    ap.add_argument("--xc", type=float, default=0.85,
-                    help="cutter x-position [m] (0=clamped, L1=free)")
-    ap.add_argument("--yc", type=float, default=0.20, help="milling-line y [m]")
+    ap.add_argument("--xc", type=float, default=0.85)
+    ap.add_argument("--yc", type=float, default=0.20)
     ap.add_argument("--xc-min", type=float, default=0.30)
     ap.add_argument("--xc-max", type=float, default=0.98)
     ap.add_argument("--xc-points", type=int, default=12)
@@ -901,28 +855,18 @@ def main() -> None:
     ap.add_argument("--yc-max", type=float, default=0.90, help="y0 sweep upper bound [m]")
     ap.add_argument("--yc-points", type=int, default=9)
     ap.add_argument("--n-modes", type=int, default=-1,
-                    help="-1 = ALL plant modes (default; exact linearisation -- "
-                         "truncation can misjudge mode-COUPLING flutter: e.g. modes "
-                         "{0,1} alone are unstable at (2000rpm,1.5mm) while the full "
-                         "6-mode system is stable); 0 = auto by compliance threshold; "
-                         ">0 = top-n by compliance (speed only)")
-    ap.add_argument("--mode-threshold", type=float, default=1e-2,
-                    help="auto mode-truncation: keep compliance >= threshold*max")
-    ap.add_argument("--k-intervals", type=int, default=48,
-                    help="base SDM subintervals per tooth period (auto-raised at "
-                         "low rpm to resolve the fastest retained mode)")
-    ap.add_argument("--coupling", choices=["numerical", "analytic"], default="numerical",
-                    help="numerical: finite-difference Jacobians of the plant's own "
-                         "force code (black-box, default); analytic: closed form")
-    ap.add_argument("--n-lobes", type=int, default=12, help="ZOA lobe count")
-    ap.add_argument("--no-zoa", action="store_true", help="skip the ZOA overlay")
-    # process / model overrides (default = registered-env values)
-    ap.add_argument("--ae", type=float, default=28.0, help="radial immersion ae [mm]")
-    ap.add_argument("--feed", type=float, default=0.20, help="feed per tooth [mm]")
-    ap.add_argument("--zeta", type=float, default=0.02, help="modal damping ratio")
+                    help="-1 = ALL plant modes (default; exact linearisation); "
+                         "0 = auto by compliance threshold; >0 = top-n by compliance")
+    ap.add_argument("--mode-threshold", type=float, default=1e-2)
+    ap.add_argument("--k-intervals", type=int, default=48)
+    ap.add_argument("--coupling", choices=["numerical", "analytic"], default="numerical")
+    ap.add_argument("--n-lobes", type=int, default=12)
+    ap.add_argument("--no-zoa", action="store_true")
+    ap.add_argument("--ae", type=float, default=28.0)
+    ap.add_argument("--feed", type=float, default=0.20)
+    ap.add_argument("--zeta", type=float, default=0.02)
     ap.add_argument("--milling-mode", default="up", choices=["up", "down"])
-    ap.add_argument("--E", type=float, default=None, help="override Young's modulus [Pa]")
-    # modes of operation
+    ap.add_argument("--E", type=float, default=None)
     ap.add_argument("--surface-3d", action="store_true",
                     help="3D surface ap_lim = f(rpm, cutter-x) at fixed y")
     ap.add_argument("--surface-3d-y", action="store_true",
@@ -931,8 +875,7 @@ def main() -> None:
     ap.add_argument("--verify-rpm", nargs="+", type=float, default=[1000, 2000])
     ap.add_argument("--verify-ap", nargs="+", type=float, default=[0.05, 0.5, 3.0])
     ap.add_argument("--verify-steps", type=int, default=4000)
-    ap.add_argument("--verify-w-limit", type=float, default=0.05,
-                    help="displacement limit for the verification env [m]")
+    ap.add_argument("--verify-w-limit", type=float, default=0.05)
     args = ap.parse_args()
 
     out = Path(args.out_dir)

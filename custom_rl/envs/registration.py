@@ -29,15 +29,14 @@ DEFAULT_ENV_N_SUBSTEPS = 10
 DEFAULT_FEED_PER_TOOTH_MM = 0.20
 
 # Default process settings shared by training, evaluation, and checker scripts.
-# Realistic face-milling spindle range for this machine/tool: 400--4000 rpm.
-# This window also contains the interesting part of the stability lobes for
-# the plate's dominant modes (17-41 Hz), so speed selection genuinely matters.
+# Admissible spindle range is 400--4000 rpm, matching the AL7075 face-milling
+# stability-lobe study range.  Override these explicitly for other studies.
 DEFAULT_ENV_RPM_MIN = 400.0
 DEFAULT_ENV_RPM_MAX = 4000.0
 DEFAULT_ENV_OMEGA_MIN = float(rpm_to_omega(DEFAULT_ENV_RPM_MIN))
 DEFAULT_ENV_OMEGA_MAX = float(rpm_to_omega(DEFAULT_ENV_RPM_MAX))
 DEFAULT_ENV_AP_MIN_MM = 0.0
-DEFAULT_ENV_AP_MAX_MM = 18
+DEFAULT_ENV_AP_MAX_MM = 12.0
 DEFAULT_ENV_AE_DEFAULT_MM = 28.0
 DEFAULT_ENV_W_LIMIT = 1.0e-3
 DEFAULT_ENV_W_OBS_SCALE = 5.0e-4
@@ -57,20 +56,47 @@ DEFAULT_REWARD_W_SCALE = 7.5e-4          # softer dense vibration cost; hard lim
 DEFAULT_REWARD_WDOT_SCALE = 1.0          # 1 m/s velocity scale
 DEFAULT_REWARD_W_WEIGHT = 0.6
 DEFAULT_REWARD_WDOT_WEIGHT = 0.02
-# productivity_weight/omega_cost_weight/w_weight were rebalanced from
-# (20.0, 1.0, 1.0) after numerical verification showed the dense per-step
-# reward was negative even at a safe, non-chattering operating point (the
-# vibration cost dominated the productivity term everywhere). The values
-# below keep dense reward close to neutral at a safe operating point and
-# mildly positive near the edge of the stable envelope, while still growing
-# quadratically as vibration approaches the termination limit.
-DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 30.0
-DEFAULT_REWARD_OMEGA_COST_WEIGHT = 2.0
-DEFAULT_REWARD_ACTION_RATE_WEIGHT = 2.0
+# Production-first reward balance (numerically verified).
+#
+# Design: material removal is the FIRST-CLASS objective.  There is NO bonus for
+# merely reaching the pass end; instead, failing to reach it (chatter or timeout)
+# is penalized.  So the return is  (sum of dense production) - (failure penalty),
+# and the optimum is the deepest/most-productive operating point that stays
+# stable -- not "idle until the pass completes".
+#
+#   * pass_completion_bonus = 0   -> reaching the end earns nothing (no idling
+#                                    incentive); production must be earned per step.
+#   * termination/truncation_penalty = 500 -> penalty for NOT reaching the end.
+#   * productivity_weight = 240   -> the normalized MRR proxy divides by the
+#                                    ACTION bound ap_max (=12), so s_ap = ap/12 is
+#                                    throttled to <=1/8 over the feasible depth
+#                                    (<=~1.5 mm).  Scaling P by the same factor
+#                                    (30 -> 240 = 30 * 12/1.5) restores a full-range
+#                                    production gradient WITHOUT restricting the
+#                                    action space.  IMPORTANT: P is coupled to
+#                                    ap_max here; if ap_max changes, rescale P so
+#                                    P/ap_max stays ~= 20 per mm.
+#   * omega_cost_weight = 0.3     -> mild actuator/speed cost, kept well below the
+#                                    productive MRR so the high-rpm (better-lobe)
+#                                    regime is not avoided and a fast productive
+#                                    pass never goes net-negative.
+DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 240.0
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 0.3
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
 DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
-DEFAULT_REWARD_PASS_COMPLETION_BONUS = 10000.0
+DEFAULT_REWARD_PASS_COMPLETION_BONUS = 0.0
 DEFAULT_REWARD_FAILURE_PROGRESS_PENALTY_WEIGHT = 1.0
+
+# Second-mode (finishing) axial depth is NOT an RL action; it is a fixed process
+# parameter randomized per episode over [ap_min, ap_max].  The full [0, 12] mm
+# range is physically infeasible (only ap <~ 1.5 mm is stable at any rpm), so ~88%
+# of finishing episodes would be doomed regardless of the spindle-speed policy.
+# For finishing we therefore randomize the depth over the FEASIBLE band only.
+# This restricts no policy action (finishing controls omega alone).  The finishing
+# productivity_weight is set so P/ap_max stays ~= 20 per mm (40/2.0), matching the
+# roughing production scale.
+DEFAULT_FINISH_AP_MAX_MM = 2.0
+DEFAULT_FINISH_PRODUCTIVITY_WEIGHT = 40.0
 
 # Generalized safety-gated productivity:
 #   G = 1 / (1 + (w_rms/w_gate)^2 + beta*(wdot_rms/wdot_gate)^2)
@@ -211,8 +237,6 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "ap_productive_target",
         "ac_productive_target",
         "omega_cost_weight",
-        "action_rate_weight",
-        "include_omega_in_productivity",
         "ap_action_weight",
         "ac_action_weight",
         "include_ae_in_productivity",
@@ -312,8 +336,6 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     reward_kwargs.setdefault("wdot_weight", DEFAULT_REWARD_WDOT_WEIGHT)
     reward_kwargs.setdefault("productivity_weight", DEFAULT_REWARD_PRODUCTIVITY_WEIGHT)
     reward_kwargs.setdefault("omega_cost_weight", DEFAULT_REWARD_OMEGA_COST_WEIGHT)
-    reward_kwargs.setdefault("action_rate_weight", DEFAULT_REWARD_ACTION_RATE_WEIGHT)
-    reward_kwargs.setdefault("include_omega_in_productivity", False)
     reward_kwargs.setdefault("productivity_gate_enabled", DEFAULT_REWARD_PRODUCTIVITY_GATE_ENABLED)
     reward_kwargs.setdefault("productivity_w_gate", DEFAULT_REWARD_PRODUCTIVITY_W_GATE)
     reward_kwargs.setdefault("productivity_wdot_gate", DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE)
@@ -400,10 +422,19 @@ def register_envs() -> None:
         )
 
     # Second-mode / finishing control: action = [omega]; ap fixed per episode
-    # and randomized over [ap_min, ap_max] like the milling line y0.
+    # and randomized over the FEASIBLE depth band [ap_min, DEFAULT_FINISH_AP_MAX_MM]
+    # (not the full roughing action range, which would doom ~88% of episodes to
+    # unavoidable chatter).  ap is not an action here, so this restricts no policy
+    # choice; productivity_weight is rescaled to keep the production scale matched.
     if "CustomODEPlateFinish-v0" not in gym.envs.registry:
         gym.register(
             id="CustomODEPlateFinish-v0",
             entry_point="custom_rl.envs.registration:make_plate_env",
-            kwargs={**common_kwargs, "control_ap": False, "randomize_ap": True},
+            kwargs={
+                **common_kwargs,
+                "control_ap": False,
+                "randomize_ap": True,
+                "ap_max": DEFAULT_FINISH_AP_MAX_MM,
+                "productivity_weight": DEFAULT_FINISH_PRODUCTIVITY_WEIGHT,
+            },
         )

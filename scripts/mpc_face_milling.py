@@ -152,8 +152,8 @@ class MPCConfig:
 
     # Safe-region softening and control-effort shaping.
     slack_weight: float = 5.0e4       # rho: penalty on safe-region slack (|w|<=w_limit)
-    omega_rate_weight: float | None = None  # None -> reward's action_rate_weight
-    ap_rate_weight: float | None = None     # None -> reward's action_rate_weight
+    omega_rate_weight: float = 0.05   # penalty on normalised d(omega) between steps
+    ap_rate_weight: float = 0.05      # penalty on normalised d(ap) between steps
 
     # Terminal cost: penalise plate vibration at the horizon end (approximate
     # cost-to-go).  Prevents the finite-horizon controller from deferring a
@@ -165,7 +165,7 @@ class MPCConfig:
     # pre-screen fallback when the NLP does not converge).  Depth ramps up
     # cautiously but can drop fast for safety, so the controller cannot jump to a
     # dangerous depth in one step before the closed loop observes the vibration.
-    omega_slew: float = 120.0     # max |d(omega)| per MPC step [rad/s]
+    omega_slew: float = 600.0     # max |d(omega)| per MPC step [rad/s]
     ap_up_slew: float = 0.05      # max depth increase per MPC step [mm]
     ap_down_slew: float = 3.0     # max depth decrease per MPC step [mm]
 
@@ -325,8 +325,6 @@ class FaceMillingMPC:
         self.r_wdot_scale = g("wdot_scale", 1.0)
         self.r_prod_weight = g("productivity_weight", 30.0)
         self.r_omega_cost = g("omega_cost_weight", 2.0)
-        self.r_rate_weight = g("action_rate_weight", 2.0)
-        self.r_include_omega_prod = bool(getattr(reward, "include_omega_in_productivity", False))
         self.r_neg_ap_weight = g("negative_ap_weight", 2.0)
         self.r_gate_enabled = bool(getattr(reward, "productivity_gate_enabled", True))
         self.r_w_gate = g("productivity_w_gate", 5.0e-4)
@@ -422,12 +420,7 @@ class FaceMillingMPC:
         # identically zero in the feasible region and is dropped.
         omega_score = (om_s - self.r_omega_min) / (self.r_omega_max - self.r_omega_min)
         ap_score = (ap - self.r_ap_min) / max(self.r_ap_max - self.r_ap_min, 1e-12)
-        # ae_score = 1 (ae not an action).  Mirror the reward exactly:
-        # productivity is ap-only unless the reward includes omega in it.
-        if self.r_include_omega_prod:
-            raw_prod = omega_score * ap_score
-        else:
-            raw_prod = ap_score
+        raw_prod = omega_score * ap_score  # ae_score = 1 (ae not an action)
 
         if self.r_gate_enabled:
             gate = 1.0 / (
@@ -580,22 +573,14 @@ class FaceMillingMPC:
             ubg += [0.0] * nS
             J = J + self.cfg.slack_weight * ca.sum1(Ss[k])
 
-        # control-rate penalties == the reward's action_rate_cost.
-        # Un is [-1,1]-normalised over each span, so (dUn/2) is the
-        # span-normalised change used by DenseProductivePlateReward.
-        w_om_rate = self.cfg.omega_rate_weight
-        w_ap_rate = self.cfg.ap_rate_weight
-        if w_om_rate is None:
-            w_om_rate = self.r_rate_weight
-        if w_ap_rate is None:
-            w_ap_rate = self.r_rate_weight
+        # control-rate penalties (normalised controls already O(1))
         u_prev_k = un_prev
         for k in range(Np):
-            dom = 0.5 * (Un[k][0] - u_prev_k[0])
-            J = J + w_om_rate * dom**2
+            dom = Un[k][0] - u_prev_k[0]
+            J = J + self.cfg.omega_rate_weight * dom**2
             if nu == 2:
-                dap = 0.5 * (Un[k][1] - u_prev_k[1])
-                J = J + w_ap_rate * dap**2
+                dap = Un[k][1] - u_prev_k[1]
+                J = J + self.cfg.ap_rate_weight * dap**2
             u_prev_k = Un[k]
 
         # assemble decision vector and bounds
@@ -1178,9 +1163,9 @@ def main() -> int:
 
     # timing / integration (must match training/eval to keep the plant identical)
     parser.add_argument("--dt", type=float, default=1.0e-4)
-    parser.add_argument("--n-substeps", type=int, default=10)
-    parser.add_argument("--max-episode-steps", type=int, default=50000)
-    parser.add_argument("--max-steps", type=int, default=3000,
+    parser.add_argument("--n-substeps", type=int, default=5)
+    parser.add_argument("--max-episode-steps", type=int, default=500)
+    parser.add_argument("--max-steps", type=int, default=300,
                         help="Cap on closed-loop control steps per episode (MPC runs are slower than RL).")
     parser.add_argument("--reward", default="dense",
                         choices=["dense", "productive", "quadratic", "sparse"])
@@ -1200,15 +1185,15 @@ def main() -> int:
                         help="Second-mode only: pin the fixed axial depth ap [mm].")
 
     # MPC settings
-    parser.add_argument("--horizon", type=int, default=20)
+    parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--n-rk", type=int, default=6)
     parser.add_argument("--control-hold", type=int, default=3,
                         help="Env control steps per MPC decision (zero-order hold).")
     parser.add_argument("--slack-weight", type=float, default=5.0e4)
-    parser.add_argument("--omega-rate-weight", type=float, default=None)
-    parser.add_argument("--ap-rate-weight", type=float, default=None)
+    parser.add_argument("--omega-rate-weight", type=float, default=0.05)
+    parser.add_argument("--ap-rate-weight", type=float, default=0.05)
     parser.add_argument("--terminal-weight", type=float, default=3.0)
-    parser.add_argument("--omega-slew", type=float, default=120.0,
+    parser.add_argument("--omega-slew", type=float, default=600.0,
                         help="Max |d(omega)| applied per MPC step [rad/s].")
     parser.add_argument("--ap-up-slew", type=float, default=0.05,
                         help="Max depth INCREASE applied per MPC step [mm] (cautious ramp-up).")

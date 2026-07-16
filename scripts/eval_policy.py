@@ -53,8 +53,8 @@ PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 # Training uses RK4 dt=1e-4 with 10 RK4 substeps per environment/control step,
 # giving a 1 ms control interval while still resolving the 40000-rpm tooth delay.
 EVAL_DEFAULT_DT = 1.0e-4
-EVAL_DEFAULT_N_SUBSTEPS = 10
-EVAL_DEFAULT_MAX_EPISODE_STEPS = 50000
+EVAL_DEFAULT_N_SUBSTEPS = 5
+EVAL_DEFAULT_MAX_EPISODE_STEPS = 5000
 EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.0
 EVAL_DEFAULT_RANDOMIZE_Y0 = True
 

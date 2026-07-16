@@ -322,32 +322,11 @@ pass completion, feed progress) and a printed table.
 
 ## Stability lobe diagram (no-control, RL-independent)
 
-Two independent tools compute the stability boundary, answering **different**
-questions (see `docs/STABILITY_LOBE_THEORY.md`):
-
-**1. Fundamental chatter-onset lobe (recommended for a paper)** — the classical
-boundary of the *linearised* regenerative process by **semi-discretization /
-Floquet** (numerical: the plant force code is linearised by finite differences,
-all plant modes kept), presented as a **spectral-radius heat map with the rho=1
-lobe line**, plus a **zeroth-order analytical (Altintas-Budak)** overlay:
-
 ```bash
-python scripts/stability_lobe_fundamental.py --xc 0.85 --yc 0.20 --out-dir plots/lobe_fundamental
-python scripts/stability_lobe_fundamental.py --surface-3d      # 3D ap_lim = f(rpm, cutter-x)
-python scripts/stability_lobe_fundamental.py --surface-3d-y    # 3D ap_lim = f(rpm, milling line y0)
-python scripts/stability_lobe_fundamental.py --verify          # validate vs the nonlinear plant
+python scripts/stability_lobe_new.py --rpm-min 1000 --rpm-max 40000 --ap-min 0 --ap-max 18
 ```
 
-**2. Nonlinear amplitude-envelope boundary** — runs the full nonlinear plant and
-flags a trial by the sensor-amplitude limit `w_limit` (the tool-safety envelope
-the RL reward uses, not the classical chatter onset):
-
-```bash
-python scripts/stability_lobe_new.py --rpm-min 400 --rpm-max 4000 --ap-min 0 --ap-max 18
-```
-
-Sweeps spindle speed and axial depth of cut with no controller; supports 2D/3D
-and stochastic (Monte Carlo) variants and different milling pass lines.
+Sweeps spindle speed and axial depth of cut with no controller to trace the no-control stability boundary; supports 2D/3D and stochastic (Monte Carlo) variants and different milling pass lines. Independent of the RL training pipeline.
 
 ## Validate the stochastic/uncertainty setup
 

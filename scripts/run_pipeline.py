@@ -113,12 +113,12 @@ def stage_eval(a):
     """Evaluate each trained RL policy on the comparison milling line (stochastic)."""
     seed = a.seeds[0]
     sh("eval_policy.py", "--env-id", "CustomODEPlate-v0", "--seeds", seed, "--reward", "dense",
-       "--n-episodes", a.cmp_episodes, "--dt", a.dt, "--n-substeps", a.n_substeps,
+       "--n-episodes", 1, "--dt", a.dt, "--n-substeps", a.n_substeps,
        "--max-episode-steps", a.cmp_steps, "--y0", a.cmp_y0,
        "--dynamics-uncertainty-std", a.uncertainty,
        "--model-dir", MODELS_FIRST, "--out-dir", RL_FIRST)
     sh("eval_policy.py", "--env-id", "CustomODEPlateFinish-v0", "--seeds", seed, "--reward", "dense",
-       "--n-episodes", a.cmp_episodes, "--dt", a.dt, "--n-substeps", a.n_substeps,
+       "--n-episodes", 1, "--dt", a.dt, "--n-substeps", a.n_substeps,
        "--max-episode-steps", a.cmp_steps, "--y0", a.cmp_y0, "--ap", a.cmp_ap,
        "--dynamics-uncertainty-std", a.uncertainty,
        "--model-dir", MODELS_FIN, "--out-dir", RL_FIN)
@@ -127,11 +127,11 @@ def stage_eval(a):
 def stage_mpc(a):
     """Run the MPC closed loop for each mode on the comparison milling line (stochastic)."""
     seed = a.seeds[0]
-    sh("mpc_face_milling.py", "--env-id", "CustomODEPlate-v0", "--seeds", seed, "--n-episodes", a.cmp_episodes,
+    sh("mpc_face_milling.py", "--env-id", "CustomODEPlate-v0", "--seeds", seed, "--n-episodes", 1,
        "--dt", a.dt, "--n-substeps", a.n_substeps, "--y0", a.cmp_y0, "--max-steps", a.cmp_steps,
        "--delay-mode", "predictive", "--dynamics-uncertainty-std", a.uncertainty,
        "--horizon", a.mpc_horizon, "--control-hold", a.mpc_hold, "--out-dir", MPC_FIRST)
-    sh("mpc_face_milling.py", "--env-id", "CustomODEPlateFinish-v0", "--seeds", seed, "--n-episodes", a.cmp_episodes,
+    sh("mpc_face_milling.py", "--env-id", "CustomODEPlateFinish-v0", "--seeds", seed, "--n-episodes", 1,
        "--dt", a.dt, "--n-substeps", a.n_substeps, "--y0", a.cmp_y0, "--ap", a.cmp_ap,
        "--max-steps", a.cmp_steps, "--delay-mode", "predictive",
        "--dynamics-uncertainty-std", a.uncertainty,
@@ -158,14 +158,14 @@ def main() -> None:
 
     # shared physics / stochasticity
     p.add_argument("--dt", type=float, default=1e-4)
-    p.add_argument("--n-substeps", type=int, default=10)
-    p.add_argument("--uncertainty", type=float, default=0.002,
+    p.add_argument("--n-substeps", type=int, default=5)
+    p.add_argument("--uncertainty", type=float, default=0.001,
                    help="Modal-acceleration disturbance std (stochastic plant), used everywhere.")
     p.add_argument("--seeds", nargs="+", type=int, default=[0])
 
     # stability lobe (strong grid by default)
-    p.add_argument("--rpm-min", type=float, default=400.0)
-    p.add_argument("--rpm-max", type=float, default=4000.0)
+    p.add_argument("--rpm-min", type=float, default=1000.0)
+    p.add_argument("--rpm-max", type=float, default=40000.0)
     p.add_argument("--lobe-ap-max", type=float, default=3.0)
     p.add_argument("--lobe-ap-tol", type=float, default=0.02)
     p.add_argument("--lobe-bin-iters", type=int, default=12)
@@ -189,9 +189,7 @@ def main() -> None:
     p.add_argument("--cmp-y0", type=float, default=0.5, help="Milling line for the RL-vs-MPC comparison.")
     p.add_argument("--cmp-ap", type=float, default=0.5, help="Fixed finishing depth for second-mode comparison [mm].")
     p.add_argument("--cmp-steps", type=int, default=1200, help="Closed-loop length for eval/MPC.")
-    p.add_argument("--cmp-episodes", type=int, default=5,
-                   help="Episodes per controller for the Monte-Carlo comparison bands.")
-    p.add_argument("--mpc-horizon", type=int, default=32)
+    p.add_argument("--mpc-horizon", type=int, default=20)
     p.add_argument("--mpc-hold", type=int, default=3)
     args = p.parse_args()
 
@@ -200,7 +198,7 @@ def main() -> None:
         args.lobe_bin_iters = 6; args.lobe_ap_tol = 0.1; args.lobe_n_mc = 2
         args.lobe_y_lines = [0.2, 0.5]; args.lobe_max_steps = 1200
         args.timesteps_first = 4096; args.timesteps_second = 4096
-        args.cmp_steps = 90; args.train_max_steps = 500; args.cmp_episodes = 2
+        args.cmp_steps = 90; args.train_max_steps = 500
 
     to_run = [s for s in (args.stages or ORDER) if s not in args.skip]
     print(f"[pipeline] stages: {to_run}")
