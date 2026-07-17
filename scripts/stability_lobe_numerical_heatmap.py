@@ -173,7 +173,7 @@ def _feed_rate_m_s(plant: Any, omega_rad_s: float) -> float:
 
 
 def _pass_end_x(plant: Any) -> float:
-    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.95 * plant.L1)))
+    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.1 * plant.L1)))
 
 
 def steps_for_trial(plant: Any, *, omega_rad_s: float, x_start_m: float, dt: float,

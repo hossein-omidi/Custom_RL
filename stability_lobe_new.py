@@ -192,7 +192,7 @@ def _reset_options_for_line_y(plant: Any, line_y_m: float) -> dict[str, float]:
 
 
 def _pass_end_x(plant: Any) -> float:
-    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.97 * plant.L1)))
+    return float(getattr(plant, "x_pass_end_m", getattr(plant, "x_pass_end_tol", 0.1 * plant.L1)))
 
 
 def _feed_rate_m_s(plant: Any, omega_rad_s: float) -> float:

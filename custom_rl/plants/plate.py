@@ -412,7 +412,7 @@ class PlatePlant(ODEPlant):
         # The milling pass ends after 90% travel: x = 0.1*L1.  Older code
         # used the name x_pass_end_tol; keep it as a backward-compatible
         # absolute end-position override, but default to the theory value.
-        self.x_pass_end_m = 0.97 * self.L1 if x_pass_end_tol is None else float(x_pass_end_tol)
+        self.x_pass_end_m = 0.1 * self.L1 if x_pass_end_tol is None else float(x_pass_end_tol)
         self.x_pass_end_m = float(np.clip(self.x_pass_end_m, 0.0, self.L1))
         self.x_pass_end_tol = self.x_pass_end_m
         self._last_omega = float(self.omega_min)
