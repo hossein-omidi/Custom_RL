@@ -10,6 +10,7 @@ from custom_rl.envs.ode_control_env import ODEControlEnv
 from custom_rl.plants.plate import (
     PlatePlant,
     estimate_training_episode_steps,
+    omega_to_rpm,
     rpm_to_omega,
 )
 from custom_rl.rewards.plate_rewards import get_plate_reward
@@ -76,12 +77,30 @@ DEFAULT_REWARD_WDOT_WEIGHT = 0.02
 #                                    action space.  IMPORTANT: P is coupled to
 #                                    ap_max here; if ap_max changes, rescale P so
 #                                    P/ap_max stays ~= 20 per mm.
-#   * omega_cost_weight = 0.3     -> mild actuator/speed cost, kept well below the
-#                                    productive MRR so the high-rpm (better-lobe)
-#                                    regime is not avoided and a fast productive
-#                                    pass never goes net-negative.
+#   * omega_cost_weight = 3.0     -> a MEANINGFUL actuation cost (10x the earlier
+#                                    0.3, per an explicit request to price spindle
+#                                    speed as a real actuation cost), calibrated so
+#                                    it matters without swamping production. Because
+#                                    omega_cost = weight * omega_score^2 applies at
+#                                    EVERY step regardless of ap (even idling costs
+#                                    it), weight=20 was numerically tested and found
+#                                    to make idling at 4000rpm cost -20/step -- more
+#                                    than the maximum achievable productivity term
+#                                    anywhere in the grid -- so only 1/8 tested
+#                                    (rpm, ap) operating points net-positive, and the
+#                                    optimum collapsed to low rpm regardless of the
+#                                    plate's actual (rpm-dependent) stability margin.
+#                                    weight=3.0 was verified to restore 5/8 positive
+#                                    points with the optimum correctly at high
+#                                    rpm/ap (the best available stability lobe),
+#                                    while still being 10x more significant than the
+#                                    original 0.3. Adjust in [~2, ~5] to trade a
+#                                    stronger speed penalty against a narrower
+#                                    productive envelope; values >~10 have been
+#                                    numerically shown to make nearly the whole
+#                                    operating range net-negative.
 DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 240.0
-DEFAULT_REWARD_OMEGA_COST_WEIGHT = 20
+DEFAULT_REWARD_OMEGA_COST_WEIGHT = 3.0
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
 DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
 DEFAULT_REWARD_PASS_COMPLETION_BONUS = 0.0
@@ -302,11 +321,16 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     step_dt = float(dt) * int(n_substeps)
     if max_episode_steps is None:
+        # reference_rpm must be the plant's own omega_min (worst-case, slowest
+        # pass), not a hardcoded constant: if the reward encourages low rpm
+        # (e.g. a large omega_cost_weight) or omega_min is lowered, a stale
+        # reference speed silently truncates episodes before pass completion.
         max_episode_steps = estimate_training_episode_steps(
             plant.L1,
             plant.feed_per_tooth_mm,
             plant.N,
             step_dt,
+            reference_rpm=float(omega_to_rpm(plant.omega_min)),
         )
 
     # Keep reward action scaling aligned with the plant.

@@ -1164,9 +1164,23 @@ def main() -> int:
     # timing / integration (must match training/eval to keep the plant identical)
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--n-substeps", type=int, default=5)
-    parser.add_argument("--max-episode-steps", type=int, default=500)
-    parser.add_argument("--max-steps", type=int, default=300,
-                        help="Cap on closed-loop control steps per episode (MPC runs are slower than RL).")
+    parser.add_argument(
+        "--max-episode-steps", type=int, default=None,
+        help="Inner env TimeLimit (env control steps). Default (None) auto-computes "
+             "from the plant's own L1/feed-rate/omega_min, same as train/eval, so it "
+             "never fires before --max-steps*--control-hold (which was previously the "
+             "case at the old fixed default of 500).",
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=20000,
+        help="Cap on closed-loop MPC control-loop steps per episode (each step solves "
+             "one NLP, so this is far more expensive than the RL env-step cap). At the "
+             "default control_hold=3 and n_substeps=5 timing, 20000 steps covers a full "
+             "0.9*L1 pass down to ~rpm 2000-3000; completing a full pass at the slowest "
+             "admissible rpm (near omega_min) needs on the order of 1e5 steps and may "
+             "take a long time (one IPOPT solve per step) -- raise this explicitly for "
+             "low-rpm full-pass studies.",
+    )
     parser.add_argument("--reward", default="dense",
                         choices=["dense", "productive", "quadratic", "sparse"])
     parser.add_argument(
@@ -1185,7 +1199,7 @@ def main() -> int:
                         help="Second-mode only: pin the fixed axial depth ap [mm].")
 
     # MPC settings
-    parser.add_argument("--horizon", type=int, default=10)
+    parser.add_argument("--horizon", type=int, default=32)
     parser.add_argument("--n-rk", type=int, default=6)
     parser.add_argument("--control-hold", type=int, default=3,
                         help="Env control steps per MPC decision (zero-order hold).")

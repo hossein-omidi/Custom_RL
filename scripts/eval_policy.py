@@ -54,7 +54,13 @@ PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 # giving a 1 ms control interval while still resolving the 40000-rpm tooth delay.
 EVAL_DEFAULT_DT = 1.0e-4
 EVAL_DEFAULT_N_SUBSTEPS = 5
-EVAL_DEFAULT_MAX_EPISODE_STEPS = 50000
+# None -> make_plate_env() auto-computes the cap from the plant's OWN L1,
+# feed rate, and omega_min (worst-case, slowest pass), so it always covers a
+# full pass regardless of x_pass_end/rpm-range/reward changes. A hardcoded
+# number here silently truncates episodes if any of those change later
+# (this previously happened: 50000 steps covered a short pass but is far too
+# small for the restored long pass at low rpm).
+EVAL_DEFAULT_MAX_EPISODE_STEPS = None
 EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.0
 EVAL_DEFAULT_RANDOMIZE_Y0 = True
 
@@ -373,7 +379,8 @@ def main() -> int:
         "--max-episode-steps",
         type=int,
         default=EVAL_DEFAULT_MAX_EPISODE_STEPS,
-        help="Max environment/control steps per episode; default matches train_sb3_ppo.py",
+        help="Max environment/control steps per episode; default (None) auto-computes "
+             "from the plant's own L1/feed-rate/omega_min so a full pass always fits.",
     )
     parser.add_argument(
         "--n-mc",

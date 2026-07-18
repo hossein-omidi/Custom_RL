@@ -146,8 +146,10 @@ def main() -> None:
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=25000,
-        help="Max environment/control steps per episode",
+        default=None,
+        help="Max environment/control steps per episode. Default (None) auto-computes "
+             "from the plant's own L1/feed-rate/omega_min so a full pass always fits "
+             "regardless of x_pass_end/rpm-range changes.",
     )
 
     parser.add_argument(
