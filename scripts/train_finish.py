@@ -58,8 +58,8 @@ def main() -> None:
     p.add_argument("--dt", type=float, default=1e-4)
     p.add_argument("--n-substeps", type=int, default=5)
     p.add_argument("--max-episode-steps", type=int, default=None,
-                   help="Default (None) auto-computes from the plant's own "
-                        "L1/feed-rate/omega_min so a full pass always fits.")
+               help="Default (None) auto-computes from the plant's own "
+                    "L1/feed-rate/omega_min so a full pass always fits.")
     p.add_argument("--n-eval-episodes", type=int, default=1)
     p.add_argument("--eval-freq", type=int, default=15000)
     p.add_argument("--dynamics-uncertainty-std", type=float, default=0.001)

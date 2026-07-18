@@ -148,8 +148,7 @@ def main() -> None:
         type=int,
         default=None,
         help="Max environment/control steps per episode. Default (None) auto-computes "
-             "from the plant's own L1/feed-rate/omega_min so a full pass always fits "
-             "regardless of x_pass_end/rpm-range changes.",
+             "from the plant's own L1/feed-rate/omega_min so a full pass always fits.",
     )
 
     parser.add_argument(

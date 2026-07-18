@@ -57,9 +57,7 @@ EVAL_DEFAULT_N_SUBSTEPS = 5
 # None -> make_plate_env() auto-computes the cap from the plant's OWN L1,
 # feed rate, and omega_min (worst-case, slowest pass), so it always covers a
 # full pass regardless of x_pass_end/rpm-range/reward changes. A hardcoded
-# number here silently truncates episodes if any of those change later
-# (this previously happened: 50000 steps covered a short pass but is far too
-# small for the restored long pass at low rpm).
+# number here silently truncates episodes if any of those change later.
 EVAL_DEFAULT_MAX_EPISODE_STEPS = None
 EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.0
 EVAL_DEFAULT_RANDOMIZE_Y0 = True

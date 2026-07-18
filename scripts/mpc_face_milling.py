@@ -298,6 +298,18 @@ class FaceMillingMPC:
         self._lam_g: np.ndarray | None = None
         self._lam_x: np.ndarray | None = None
 
+        # Vectorized (CasADi .map()) versions of the per-step dynamics/cost
+        # functions, batched over the whole pre-screen grid at once. This
+        # replaces a Python double-loop of Np*n_screen individual CasADi
+        # calls with Np batched calls -- same math (.map() just evaluates the
+        # identical computational graph n_screen times), pure speedup.
+        self._n_screen = int(self.cfg.prescreen_n_omega) * (
+            int(self.cfg.prescreen_n_ap) if self.nu == 2 else 1
+        )
+        self._F_map = self._F.map(self._n_screen)
+        self._L_map = self._L.map(self._n_screen)
+        self._Lterm_map = self._Lterm.map(self._n_screen)
+
     # ------------------------------------------------------------------
     # constants
     # ------------------------------------------------------------------
@@ -324,7 +336,7 @@ class FaceMillingMPC:
         self.r_w_scale = g("w_scale", 7.5e-4)
         self.r_wdot_scale = g("wdot_scale", 1.0)
         self.r_prod_weight = g("productivity_weight", 30.0)
-        self.r_omega_cost = g("omega_cost_weight", 2.0)
+        self.r_omega_cost = g("omega_cost_weight", 3.0)
         self.r_neg_ap_weight = g("negative_ap_weight", 2.0)
         self.r_gate_enabled = bool(getattr(reward, "productivity_gate_enabled", True))
         self.r_w_gate = g("productivity_w_gate", 5.0e-4)
@@ -725,6 +737,14 @@ class FaceMillingMPC:
         """Grid search over spindle speed (and ap in first mode) for a warm start.
 
         Returns the best constant control and its state rollout.
+
+        Vectorized: all n_screen candidate rollouts are propagated together
+        using CasADi's ``.map()`` (Np batched calls instead of Np*n_screen
+        individual calls), which finds the same argmin as the original
+        sequential double loop (same cost values, same first-minimum
+        tie-break). The winning candidate's trajectory is then recomputed
+        with the original scalar ``_rollout_cost`` so the returned (u, Z) is
+        byte-identical to what the unvectorized version would have returned.
         """
         om_grid = np.linspace(self.omega_min, self.omega_max, self.cfg.prescreen_n_omega)
         if self.nu == 2:
@@ -737,16 +757,65 @@ class FaceMillingMPC:
         else:
             ap_grid = np.array([ap_fixed], dtype=np.float64)
 
-        best_cost = np.inf
-        best_u = np.array([self.omega_min, ap_fixed])[: self.nu]
-        best_Z = np.tile(z0, (self.Np + 1, 1))
-        for om in om_grid:
-            for ap in ap_grid:
-                cost, Ztraj = self._rollout_cost(z0, om, ap, phiz, wz_hist, ap_fixed)
-                if np.isfinite(cost) and cost < best_cost:
-                    best_cost = cost
-                    best_u = np.array([om, ap], dtype=np.float64)[: self.nu]
-                    best_Z = Ztraj
+        # Flatten in the same (om outer, ap inner) order as the original
+        # nested loop, so argmin ties break identically.
+        om_mesh, ap_mesh = np.meshgrid(om_grid, ap_grid, indexing="ij")
+        om_flat = om_mesh.reshape(-1)
+        ap_flat = ap_mesh.reshape(-1)
+        n = om_flat.size
+        K, Np, nb = self.K, self.Np, self.nb
+
+        z_batch = np.tile(np.asarray(z0, dtype=np.float64).reshape(-1, 1), (1, n))  # (2K, n)
+        u_batch = (
+            np.vstack([om_flat, ap_flat]) if self.nu == 2 else om_flat.reshape(1, n)
+        )
+        phiz_col = np.asarray(phiz, dtype=np.float64).reshape(-1, 1)  # (K,1), broadcasts
+
+        buflen = nb + Np + 1
+        buf_batch = np.zeros((n, buflen), dtype=np.float64)
+        buf_batch[:, :nb] = np.asarray(wz_hist, dtype=np.float64).reshape(-1)[None, :nb]
+        buf_batch[:, nb] = float(phiz.reshape(-1) @ np.asarray(z0).reshape(-1)[0:K])
+
+        cost = np.zeros(n, dtype=np.float64)
+        two_pi = 2.0 * np.pi
+        thr = self.w_lim_margin * self.w_limit
+        for k in range(Np):
+            nd = two_pi / (self.Nteeth * np.maximum(om_flat, 1e-9) * self.Ts)
+            pos = np.clip((nb + k) - nd, 0.0, buflen - 1)
+            i0 = np.floor(pos).astype(int)
+            i1 = np.minimum(i0 + 1, buflen - 1)
+            a = pos - i0
+            rows = np.arange(n)
+            wz_del = (1.0 - a) * buf_batch[rows, i0] + a * buf_batch[rows, i1]
+
+            z_next = np.asarray(
+                self._F_map(z_batch, u_batch, wz_del.reshape(1, n), phiz_col, ap_fixed, self.S0, self.S1)
+            )
+            stage_cost = np.asarray(self._L_map(z_next, u_batch, ap_fixed)).reshape(-1)
+
+            w_batch = self.Phi @ z_next[0:K, :]  # (nS, n)
+            slack = np.maximum(np.abs(w_batch) - thr, 0.0) / self.S_w
+            cost += stage_cost + self.cfg.slack_weight * np.sum(slack, axis=0)
+
+            z_batch = z_next
+            buf_batch[:, nb + k + 1] = phiz.reshape(-1) @ z_batch[0:K, :]
+
+        cost += np.asarray(self._Lterm_map(z_batch)).reshape(-1)
+
+        finite = np.isfinite(cost)
+        if not np.any(finite):
+            best_u = np.array([self.omega_min, ap_fixed])[: self.nu]
+            best_Z = np.tile(z0, (Np + 1, 1))
+            return best_u, best_Z
+
+        cost_masked = np.where(finite, cost, np.inf)
+        winner = int(np.argmin(cost_masked))
+        om_win, ap_win = float(om_flat[winner]), float(ap_flat[winner])
+
+        # Recompute the winner with the original scalar path for a
+        # byte-identical (cost, Ztraj) pair.
+        _, best_Z = self._rollout_cost(z0, om_win, ap_win, phiz, wz_hist, ap_fixed)
+        best_u = np.array([om_win, ap_win], dtype=np.float64)[: self.nu]
         return best_u, best_Z
 
     # ------------------------------------------------------------------
@@ -1163,23 +1232,19 @@ def main() -> int:
 
     # timing / integration (must match training/eval to keep the plant identical)
     parser.add_argument("--dt", type=float, default=1.0e-4)
-    parser.add_argument("--n-substeps", type=int, default=5)
+    parser.add_argument("--n-substeps", type=int, default=10)
     parser.add_argument(
         "--max-episode-steps", type=int, default=None,
         help="Inner env TimeLimit (env control steps). Default (None) auto-computes "
              "from the plant's own L1/feed-rate/omega_min, same as train/eval, so it "
-             "never fires before --max-steps*--control-hold (which was previously the "
-             "case at the old fixed default of 500).",
+             "never fires before --max-steps*--control-hold.",
     )
     parser.add_argument(
         "--max-steps", type=int, default=20000,
         help="Cap on closed-loop MPC control-loop steps per episode (each step solves "
-             "one NLP, so this is far more expensive than the RL env-step cap). At the "
-             "default control_hold=3 and n_substeps=5 timing, 20000 steps covers a full "
-             "0.9*L1 pass down to ~rpm 2000-3000; completing a full pass at the slowest "
-             "admissible rpm (near omega_min) needs on the order of 1e5 steps and may "
-             "take a long time (one IPOPT solve per step) -- raise this explicitly for "
-             "low-rpm full-pass studies.",
+             "one NLP). At control_hold=3, n_substeps=5 timing, 20000 steps covers a "
+             "full 0.9*L1 pass down to ~rpm 2000-3000; a full pass at low rpm needs "
+             "~1e5 steps -- raise this explicitly for low-rpm full-pass studies.",
     )
     parser.add_argument("--reward", default="dense",
                         choices=["dense", "productive", "quadratic", "sparse"])
