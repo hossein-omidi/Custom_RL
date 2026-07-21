@@ -152,8 +152,16 @@ class MPCConfig:
 
     # Safe-region softening and control-effort shaping.
     slack_weight: float = 5.0e4       # rho: penalty on safe-region slack (|w|<=w_limit)
-    omega_rate_weight: float = 0.05   # penalty on normalised d(omega) between steps
-    ap_rate_weight: float = 0.05      # penalty on normalised d(ap) between steps
+    # Control-rate penalties on the NORMALISED controls (both O(1) in [-1,1]).
+    # Raised 0.05 -> 5.0: at 0.05 the rate term (~0.05*du^2, du~O(1)) was ~4 orders
+    # of magnitude below the productivity/slack terms, so the OCP had no incentive
+    # to keep the command smooth and the planned spindle speed/depth alternated
+    # between whatever momentarily maximised productivity.  5.0 makes a full-scale
+    # step cost O(5), comparable to a few steps of productivity, so the optimiser
+    # trades a little productivity for a markedly smoother command WITHOUT changing
+    # the objective's shape (the rate term already existed).
+    omega_rate_weight: float = 5.0    # penalty on normalised d(omega) between steps
+    ap_rate_weight: float = 5.0       # penalty on normalised d(ap) between steps
 
     # Terminal cost: penalise plate vibration at the horizon end (approximate
     # cost-to-go).  Prevents the finite-horizon controller from deferring a
@@ -165,9 +173,30 @@ class MPCConfig:
     # pre-screen fallback when the NLP does not converge).  Depth ramps up
     # cautiously but can drop fast for safety, so the controller cannot jump to a
     # dangerous depth in one step before the closed loop observes the vibration.
-    omega_slew: float = 600.0     # max |d(omega)| per MPC step [rad/s]
-    ap_up_slew: float = 0.05      # max depth increase per MPC step [mm]
-    ap_down_slew: float = 3.0     # max depth decrease per MPC step [mm]
+    #
+    # These are ABSOLUTE (rad/s and mm); FaceMillingMPC.__init__ additionally caps
+    # each to a fraction of the plant's own actuator range (see slew_frac_* below)
+    # so the limit always binds regardless of the plant's rpm/ap scaling.  The
+    # previous omega_slew=600 rad/s exceeded the entire 400-4000 rpm span
+    # (~377 rad/s), so it never bound and the applied spindle speed could jump the
+    # full range in one step -- the alternating command seen in closed loop.
+    #
+    # ap slews rebalanced 0.05/3.0 -> 0.25/1.5: the old up=0.05, down=3.0 asymmetry
+    # let any vibration transient drop the depth 3 mm instantly while recovery took
+    # ~60 MPC steps at 0.05 mm/step, ratcheting depth DOWN over the pass -- the
+    # opposite of the desired increase toward the stiffer clamped end.  0.25 up
+    # lets depth actually climb there while 1.5 down keeps a fast safety back-off.
+    omega_slew: float = 600.0     # max |d(omega)| per MPC step [rad/s] (then range-capped)
+    ap_up_slew: float = 0.25      # max depth increase per MPC step [mm] (then range-capped)
+    ap_down_slew: float = 1.5     # max depth decrease per MPC step [mm] (then range-capped)
+
+    # Fractions of the plant actuator range used to cap the absolute slews above
+    # so they always bind: effective omega_slew = min(omega_slew, slew_frac_omega*
+    # (omega_max-omega_min)); similarly for ap.  These never LOOSEN a configured
+    # slew, only tighten one that is too large for the plant's scale.
+    slew_frac_omega: float = 0.20
+    slew_frac_ap_up: float = 0.15
+    slew_frac_ap_down: float = 1.0
 
     # Spindle-speed pre-screen (global warm start).
     prescreen_n_omega: int = 28       # candidate spindle speeds
@@ -206,7 +235,15 @@ class MPCConfig:
     # averaged out and the unilateral max(chip,0) is dropped), the soft
     # constraint uses w_lim_margin * w_limit as the threshold so the *true*
     # closed-loop displacement stays under w_limit.
-    w_lim_margin: float = 0.6
+    #
+    # Raised 0.6 -> 0.8 to WIDEN the MPC feasible set (the OCP was over-
+    # conservative and kept ap very low).  With the widened w_limit = 3 mm the
+    # soft threshold is now 0.8 * 3 mm = 2.4 mm, still ~20% below the hard limit
+    # -- more than the ~15-25% model under-prediction headroom -- so the true
+    # closed-loop displacement stays under 3 mm while the OCP can use much more
+    # depth of cut.  Lower it again toward 0.6 if the true peak ever approaches
+    # w_limit in closed loop.
+    w_lim_margin: float = 0.8
 
 
 # ===========================================================================
@@ -256,6 +293,20 @@ class FaceMillingMPC:
         self.omega_max = float(plant.omega_max)
         self.ap_min = float(plant.ap_min)
         self.ap_max = float(plant.ap_max)
+
+        # ---- range-cap the applied slew limits so they always bind ----
+        # A slew larger than the actuator range is a no-op (the whole span fits in
+        # one step).  Cap each configured absolute slew to a fraction of the plant's
+        # own range so the closed-loop command stays smooth regardless of the plant's
+        # rpm/ap scaling.  This only tightens a too-large slew; it never loosens one.
+        _om_range = max(self.omega_max - self.omega_min, 1e-9)
+        _ap_range = max(self.ap_max - self.ap_min, 1e-9)
+        self.cfg.omega_slew = min(float(self.cfg.omega_slew),
+                                  float(self.cfg.slew_frac_omega) * _om_range)
+        self.cfg.ap_up_slew = min(float(self.cfg.ap_up_slew),
+                                  float(self.cfg.slew_frac_ap_up) * _ap_range)
+        self.cfg.ap_down_slew = min(float(self.cfg.ap_down_slew),
+                                    float(self.cfg.slew_frac_ap_down) * _ap_range)
 
         # ---- safe region ----
         self.w_limit = float(plant.w_limit)
@@ -1269,15 +1320,16 @@ def main() -> int:
     parser.add_argument("--control-hold", type=int, default=3,
                         help="Env control steps per MPC decision (zero-order hold).")
     parser.add_argument("--slack-weight", type=float, default=5.0e4)
-    parser.add_argument("--omega-rate-weight", type=float, default=0.05)
-    parser.add_argument("--ap-rate-weight", type=float, default=0.05)
+    parser.add_argument("--omega-rate-weight", type=float, default=5.0)
+    parser.add_argument("--ap-rate-weight", type=float, default=5.0)
     parser.add_argument("--terminal-weight", type=float, default=3.0)
     parser.add_argument("--omega-slew", type=float, default=600.0,
-                        help="Max |d(omega)| applied per MPC step [rad/s].")
-    parser.add_argument("--ap-up-slew", type=float, default=0.05,
-                        help="Max depth INCREASE applied per MPC step [mm] (cautious ramp-up).")
-    parser.add_argument("--ap-down-slew", type=float, default=3.0,
-                        help="Max depth DECREASE applied per MPC step [mm] (fast safety back-off).")
+                        help="Max |d(omega)| applied per MPC step [rad/s] "
+                             "(range-capped to slew_frac_omega*(omega_max-omega_min)).")
+    parser.add_argument("--ap-up-slew", type=float, default=0.25,
+                        help="Max depth INCREASE applied per MPC step [mm] (cautious ramp-up, range-capped).")
+    parser.add_argument("--ap-down-slew", type=float, default=1.5,
+                        help="Max depth DECREASE applied per MPC step [mm] (fast safety back-off, range-capped).")
     parser.add_argument("--prescreen-n-omega", type=int, default=28)
     parser.add_argument("--prescreen-n-ap", type=int, default=7)
     parser.add_argument("--delay-sigma", type=float, default=0.7,
@@ -1287,8 +1339,10 @@ def main() -> int:
                         help=("'predictive': regenerative delay uses the per-node decision "
                               "speed so omega affects chatter stability in the OCP (omega-ap "
                               "coupling); 'frozen': delay fixed at the pre-screen speed."))
-    parser.add_argument("--w-lim-margin", type=float, default=0.6,
-                        help="Safe-region threshold as a fraction of w_limit (headroom for model error).")
+    parser.add_argument("--w-lim-margin", type=float, default=0.8,
+                        help="Safe-region threshold as a fraction of w_limit (headroom for model error). "
+                             "0.8 widens the feasible set; at w_limit=3mm the threshold is 2.4mm, "
+                             "still ~20%% below the hard limit.")
     parser.add_argument("--hessian", default="limited-memory",
                         choices=["limited-memory", "exact"],
                         help="IPOPT Hessian: limited-memory (fast) or exact (accurate, slow).")

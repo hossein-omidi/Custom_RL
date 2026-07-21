@@ -39,7 +39,7 @@ DEFAULT_ENV_OMEGA_MAX = float(rpm_to_omega(DEFAULT_ENV_RPM_MAX))
 DEFAULT_ENV_AP_MIN_MM = 0.0
 DEFAULT_ENV_AP_MAX_MM = 12.0
 DEFAULT_ENV_AE_DEFAULT_MM = 28.0
-DEFAULT_ENV_W_LIMIT = 1.0e-3
+DEFAULT_ENV_W_LIMIT = 3.0e-3
 DEFAULT_ENV_W_OBS_SCALE = 5.0e-4
 DEFAULT_ENV_WDOT_LIMIT = 10.0
 DEFAULT_ENV_WDOT_OBS_SCALE = 0.5
@@ -50,10 +50,24 @@ DEFAULT_ENV_INITIAL_ETAD_STD = 0.0
 DEFAULT_ENV_MODAL_DAMPING_RATIO = 0.02
 
 # Reward scaling for the current flexible AL7075 face-milling task.
-# The hard displacement limit is 1 mm.  The dense productivity term is
-# multiplied by a smooth vibration gate, so high material removal is rewarded
-# only when the measured physical vibration remains controlled.
-DEFAULT_REWARD_W_SCALE = 7.5e-4          # softer dense vibration cost; hard limit remains 1 mm
+# The hard displacement limit is now 3 mm (DEFAULT_ENV_W_LIMIT).  The dense
+# productivity term is multiplied by a smooth vibration gate, so high material
+# removal is rewarded only when the measured physical vibration is controlled.
+#
+# BALANCED vibration scales: the two constants below (w_scale, and
+# productivity_w_gate further down) were set to the arithmetic MIDPOINT between
+#   - the OLD tight values (w_scale=7.5e-4, w_gate=5e-4): smooth control, few
+#     early stops, but production heavily throttled; and
+#   - the high-production values (w_scale=2.25e-3, w_gate=1.5e-3): ~2x production
+#     but the reward landscape went flat, so the policy chattered omega/ap across
+#     a wide band and many rollouts stopped early.
+# The midpoint keeps a meaningful production increase over OLD while restoring a
+# steeper gate gradient (sharper reward optimum -> less control alternation) and a
+# ~2x higher displacement cost than the high-production setting.  Numerically
+# verified (free end, same physics): production 2000rpm/0.9mm & 2500rpm/1.5mm &
+# 2500rpm/2.2mm = OLD[0.18,0.25,0.23] -> BALANCED[0.26,0.50,0.57] -> HI[0.28,0.62,0.79];
+# gate over ap 0.9->2.2mm drops 0.85->0.51 (BALANCED, steep) vs 0.93->0.70 (HI, flat).
+DEFAULT_REWARD_W_SCALE = 1.5e-3          # displacement cost scale (midpoint of 7.5e-4 and 2.25e-3)
 DEFAULT_REWARD_WDOT_SCALE = 1.0          # 1 m/s velocity scale
 DEFAULT_REWARD_W_WEIGHT = 0.6
 DEFAULT_REWARD_WDOT_WEIGHT = 0.02
@@ -77,33 +91,15 @@ DEFAULT_REWARD_WDOT_WEIGHT = 0.02
 #                                    action space.  IMPORTANT: P is coupled to
 #                                    ap_max here; if ap_max changes, rescale P so
 #                                    P/ap_max stays ~= 20 per mm.
-#   * omega_cost_weight = 3.0     -> a MEANINGFUL actuation cost (10x the earlier
-#                                    0.3, per an explicit request to price spindle
-#                                    speed as a real actuation cost), calibrated so
-#                                    it matters without swamping production. Because
-#                                    omega_cost = weight * omega_score^2 applies at
-#                                    EVERY step regardless of ap (even idling costs
-#                                    it), weight=20 was numerically tested and found
-#                                    to make idling at 4000rpm cost -20/step -- more
-#                                    than the maximum achievable productivity term
-#                                    anywhere in the grid -- so only 1/8 tested
-#                                    (rpm, ap) operating points net-positive, and the
-#                                    optimum collapsed to low rpm regardless of the
-#                                    plate's actual (rpm-dependent) stability margin.
-#                                    weight=3.0 was verified to restore 5/8 positive
-#                                    points with the optimum correctly at high
-#                                    rpm/ap (the best available stability lobe),
-#                                    while still being 10x more significant than the
-#                                    original 0.3. Adjust in [~2, ~5] to trade a
-#                                    stronger speed penalty against a narrower
-#                                    productive envelope; values >~10 have been
-#                                    numerically shown to make nearly the whole
-#                                    operating range net-negative.
+#   * omega_cost_weight = 0.3     -> mild actuator/speed cost, kept well below the
+#                                    productive MRR so the high-rpm (better-lobe)
+#                                    regime is not avoided and a fast productive
+#                                    pass never goes net-negative.
 DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 240.0
 DEFAULT_REWARD_OMEGA_COST_WEIGHT = 3.0
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
 DEFAULT_REWARD_TRUNCATION_PENALTY = 500.0
-DEFAULT_REWARD_PASS_COMPLETION_BONUS = 0.0
+DEFAULT_REWARD_PASS_COMPLETION_BONUS = 1000.0
 DEFAULT_REWARD_FAILURE_PROGRESS_PENALTY_WEIGHT = 1.0
 
 # Second-mode (finishing) axial depth is NOT an RL action; it is a fixed process
@@ -121,7 +117,11 @@ DEFAULT_FINISH_PRODUCTIVITY_WEIGHT = 40.0
 #   G = 1 / (1 + (w_rms/w_gate)^2 + beta*(wdot_rms/wdot_gate)^2)
 #   productivity = productivity_weight * normalized_MRR * G
 DEFAULT_REWARD_PRODUCTIVITY_GATE_ENABLED = True
-DEFAULT_REWARD_PRODUCTIVITY_W_GATE = 5.0e-4
+# BALANCED (midpoint of old 5e-4 and high-production 1.5e-3): gate is at half
+# strength when w_rms ~ 1 mm (1/3 of the 3 mm hard limit), so productivity is
+# throttled well before chatter -- steering the policy off the unstable edge and
+# reducing the control alternation seen with the 1.5e-3 setting.
+DEFAULT_REWARD_PRODUCTIVITY_W_GATE = 1.0e-3
 DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE = 1.0
 DEFAULT_REWARD_PRODUCTIVITY_WDOT_GATE_WEIGHT = 0.05
 DEFAULT_REWARD_PRODUCTIVITY_GATE_POWER = 2.0
@@ -322,9 +322,9 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     step_dt = float(dt) * int(n_substeps)
     if max_episode_steps is None:
         # reference_rpm must be the plant's own omega_min (worst-case, slowest
-        # pass), not a hardcoded constant: if the reward encourages low rpm
-        # (e.g. a large omega_cost_weight) or omega_min is lowered, a stale
-        # reference speed silently truncates episodes before pass completion.
+        # pass), not a hardcoded constant: if the reward encourages low rpm or
+        # omega_min is lowered, a stale reference speed silently truncates
+        # episodes before pass completion.
         max_episode_steps = estimate_training_episode_steps(
             plant.L1,
             plant.feed_per_tooth_mm,

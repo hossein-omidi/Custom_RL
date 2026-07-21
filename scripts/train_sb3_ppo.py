@@ -107,7 +107,7 @@ def main() -> None:
         help="Reward function for the plate environment",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=600_000)
+    parser.add_argument("--total-timesteps", type=int, default=1_000_000)
     parser.add_argument("--log-dir", default=DEFAULT_LOG_DIR)
     parser.add_argument("--save-dir", default=DEFAULT_MODEL_DIR)
 
@@ -139,28 +139,28 @@ def main() -> None:
     parser.add_argument(
         "--n-substeps",
         type=int,
-        default=5,
+        default=10,
         help="RK4 substeps per environment/control step",
     )
 
     parser.add_argument(
         "--max-episode-steps",
         type=int,
-        default=None,
-        help="Max environment/control steps per episode. Default (None) auto-computes "
-             "from the plant's own L1/feed-rate/omega_min so a full pass always fits.",
+        default=250000,
+        help="Max environment/control steps per episode",
     )
 
     parser.add_argument(
         "--n-eval-episodes",
         type=int,
-        default=2,
-        help="Evaluation episodes per callback. Keep small because one stable pass is long.",
+        default=5,
+        help="Evaluation episodes per callback. A few episodes average out the "
+             "per-episode y0/ap randomization so best-model selection is less noisy.",
     )
     parser.add_argument(
         "--eval-freq",
         type=int,
-        default=25_000,
+        default=20_000,
         help="Evaluate every N total env steps (higher = less eval overhead)",
     )
 

@@ -51,15 +51,14 @@ PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 
 # Standalone evaluation defaults must match the uploaded training script.
 # Training uses RK4 dt=1e-4 with 10 RK4 substeps per environment/control step,
-# giving a 1 ms control interval while still resolving the 40000-rpm tooth delay.
+# giving a 1 ms control interval while still resolving the 4000-rpm tooth delay.
 EVAL_DEFAULT_DT = 1.0e-4
-EVAL_DEFAULT_N_SUBSTEPS = 5
-# None -> make_plate_env() auto-computes the cap from the plant's OWN L1,
-# feed rate, and omega_min (worst-case, slowest pass), so it always covers a
-# full pass regardless of x_pass_end/rpm-range/reward changes. A hardcoded
-# number here silently truncates episodes if any of those change later.
-EVAL_DEFAULT_MAX_EPISODE_STEPS = None
-EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.0
+EVAL_DEFAULT_N_SUBSTEPS = 10
+# None => auto-compute from the plant's own L1/feed-rate/omega_min (matches
+# train_sb3_ppo.py). A fixed cap truncates slow low-rpm passes that need many
+# more control steps to reach x_pass_end, wrongly scoring them as failures.
+EVAL_DEFAULT_MAX_EPISODE_STEPS = 250000
+EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.001
 EVAL_DEFAULT_RANDOMIZE_Y0 = True
 
 PROCESS_KEYS = (
@@ -377,8 +376,7 @@ def main() -> int:
         "--max-episode-steps",
         type=int,
         default=EVAL_DEFAULT_MAX_EPISODE_STEPS,
-        help="Max environment/control steps per episode; default (None) auto-computes "
-             "from the plant's own L1/feed-rate/omega_min so a full pass always fits.",
+        help="Max environment/control steps per episode; default matches train_sb3_ppo.py",
     )
     parser.add_argument(
         "--n-mc",
@@ -508,7 +506,7 @@ def main() -> int:
             raise ValueError(
                 f"RK4 dt={args.dt:g} s is not smaller than the minimum regenerative "
                 f"tooth delay tau_min={tau_min:g} s at omega_max={omega_to_rpm(plant.omega_max):.0f} rpm. "
-                "Use --dt 0.0001 --n-substeps 10 for the current 40000-rpm setup."
+                "Use --dt 0.0001 --n-substeps 10 for the current 4000-rpm setup."
             )
 
         control_dt = float(args.dt) * int(args.n_substeps)
