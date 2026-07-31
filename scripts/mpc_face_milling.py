@@ -1,87 +1,48 @@
-"""Nonlinear Model Predictive Control (NMPC) for face-milling chatter suppression.
+"""Nonlinear Model Predictive Control for face-milling chatter suppression.
 
-This module adds a *second*, physics-based controller to the project so the
-PPO actor-critic policy can be independently verified against a model-based
-optimal controller on the **same** plant and the **same** reward.  It is
-completely independent of the RL training code: it only *uses* the already
-built Gymnasium environment (``CustomODEPlate-v0`` / ``CustomODEPlateFinish-v0``)
-as a simulator, connecting an MPC policy in place of the PPO policy.
+Publication-ready fair sensor-based nominal NMPC baseline aligned with the registered face-milling
+environment. The internal prediction model intentionally remains simpler than
+the nonlinear stochastic simulator: it uses zeroth-order averaged tooth engagement,
+a frozen cutter-point mode vector over each short horizon, and a smooth causal
+fractional-delay approximation. These assumptions are explicit and verified.
 
-It supports both control modes with a single implementation:
+The controller solves a scaled direct-multiple-shooting OCP with CasADi/IPOPT
+on the same Gymnasium plant used by PPO evaluation.  Its prediction model is a
+zeroth-order (period-averaged) regenerative face-milling model in modal
+coordinates, retaining the full delayed regeneration mechanism and the modal
+cubic stiffness so the prediction matches the simulator's own dynamics.
 
-* **first-mode / roughing control**  (``CustomODEPlate-v0``)
-    decision  = [spindle speed omega, axial depth ap]
-* **second-mode / finishing control** (``CustomODEPlateFinish-v0``)
-    decision  = [spindle speed omega];  ap is a fixed per-episode parameter.
+Important implementation properties of this version:
 
---------------------------------------------------------------------------
-Optimal control problem (solved online at every control instant with CasADi)
---------------------------------------------------------------------------
-We solve a finite-horizon OCP by **direct multiple shooting** with IPOPT, in
-the exact structure requested: an objective function minimised subject to a
-*discretised model as equality constraints* and *bounds as inequality
-constraints*.  With modal state ``z = [eta ; eta_dot]`` (K modes each), measured
-plate response ``w = Phi @ eta`` (sensor points), horizon ``Np`` and control
-step ``Ts``:
+* the prediction and reward are evaluated at the environment control time step;
+  a held MPC action is composed from repeated environment-resolution model
+  transitions rather than one coarse transition;
+* the modal cubic stiffness (-lam*eta^3) is KEPT in the prediction (dropping it
+  makes the model inconsistent with the plant and mispredicts near the limit);
+* the default fair-comparison configuration leaves command increments effectively
+  unconstrained and adds no controller-specific rate, terminal, or soft-margin
+  cost; optional actuator limits remain available for dedicated studies;
+* the physical displacement limit is hard at shooting nodes and intermediate
+  held-action steps;
+* the default feedback is a scaled-state extended Kalman filter driven only by
+  the same normalized sensor and cutter-position observation supplied to PPO;
+* optional sensor-velocity and axial-force limits are hard constraints;
+* regenerative history is sampled at environment resolution and interpolated
+  causally over the FULL available window (no fixed truncation that could fall
+  short of the true tooth delay tau=2*pi/(N*omega) at low spindle speed);
+* the spindle-speed pre-screen is vectorized with CasADi .map() (one batched
+  evaluation over the whole grid), never a Python per-candidate loop;
+* IPOPT runs under a hard wall/CPU-time cap and its output is applied only after
+  an explicit primal-feasibility check; otherwise a verified reachable pre-screen
+  / shifted-plan fallback is used, so the closed loop never stalls or applies an unverified IPOPT iterate;
+* the warm start is a re-simulated shifted control plan or a reachable grid
+  pre-screen, not unshifted dual multipliers from the previous OCP.
 
-    minimise   sum_{k=0}^{Np-1}  L( z_{k+1}, u_k )        (dense-reward stage cost)
-                 + rho * sum_k slack_k                     (safe-region softening)
-                 + rate penalties on u
-
-    subject to (EQUALITY constraints)
-      (E1)  z_{k+1} = F_RK4( z_k, u_k, w_z(t_k-tau) )      discretised modal EOM
-      (E2)  w_k     = Phi @ eta_k                          measurement / mode-shape map
-      (E3)  z_0     = z_meas                               initial condition each sample
-
-    subject to (INEQUALITY constraints / bounds)
-      omega_min <= omega_k <= omega_max
-      ap_min    <= ap_k    <= ap_max        (first mode; fixed in second mode)
-      |w_k| <= w_limit + slack_k,   slack_k >= 0           safe machining region
-
---------------------------------------------------------------------------
-Internal prediction model  (derived from, and numerically verified against,
-``custom_rl.plants.f_nonlinear2_face_milling``)
---------------------------------------------------------------------------
-The plant integrates, per retained mode ``k`` (mass-normalised modal EOM):
-
-    eta_k''  = -2 zeta_k wn_k eta_k' - wn_k^2 eta_k - lambda_k eta_k^3 + Q_k
-
-with the face-milling generalised modal force (z-projection, the plant default):
-
-    Q_k = phi_z,k(xc,yc) * Fz / M_k
-    Fz  = sum_{engaged teeth i} [ Ka*ap*h_eff,i + Kae*ap ]
-    h_i = ft*sin(theta_i) + 1000*sin(gamma_L)*( w_z(t) - w_z(t-tau) )
-
-where ``w_z = phi_z(xc,yc) . eta`` is the transverse plate displacement at the
-cutter [m] and ``tau = 2*pi/(N*omega)`` is the tooth-passing (regenerative)
-delay.  For a smooth, differentiable predictive model we use the classical
-**zeroth-order (period-averaged) directional model** (Altintas--Budak): the
-tooth sums are replaced by their one-revolution averages, which are exact
-constants for a fixed radial immersion ``ae``:
-
-    S0 = (N/2pi)(theta_e-theta_s),   S1 = (N/2pi)(cos theta_s - cos theta_e)
-
-    Fz(avg) = Ka*ap*ft*S1                         (nominal cutting force)
-            + Kae*ap*S0                           (edge force)
-            + Ka*ap*1000*sin(gamma_L)*S0*( w_z(t) - w_z(t-tau) )   (regeneration)
-
-This retains the full regenerative chatter mechanism (the delayed feedback that
-makes stability depend on spindle speed) while removing the fast tooth-passing
-ripple and the non-smooth ``max(h,0)`` unilateral-contact term — i.e. it is the
-standard linearised chatter-stability model, appropriate for a model-based
-controller whose job is to keep the process inside the stable region.  The
-delay ``w_z(t-tau)`` is handled by a *method-of-steps* discretisation with
-linear (fractional) interpolation over a rolling buffer of past/predicted
-``w_z`` values, so ``tau(omega)`` — hence the spindle-speed dependence of
-stability — enters the OCP predictively.
-
-The objective is the project's own **dense reward** (``DenseProductivePlateReward``)
-reconstructed symbolically with the environment's exact weights, so the MPC
-maximises the very quantity the PPO return measures.
-
-Because gradient-based NLP cannot by itself jump between stability lobes, each
-solve is seeded by a cheap **spindle-speed pre-screen** (a grid rollout of the
-same discrete model) which gives the OCP a globally-informed warm start.
+The model remains an approximate sensor-based NMPC benchmark: cutter mode shapes are frozen
+over each short prediction horizon and the cutting force uses a smooth
+period-averaged model rather than tooth-by-tooth unilateral contact. The
+symbolic objective matches the environment's dense *running* reward; episodic
+pass-completion and failure adjustments remain evaluated by the true environment.
 """
 
 from __future__ import annotations
@@ -90,8 +51,9 @@ import argparse
 import json
 import sys
 import time
+import warnings
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -144,106 +106,86 @@ PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 # ===========================================================================
 @dataclass
 class MPCConfig:
-    """Tunable MPC settings.  Defaults are tuned for the AL7075 face-milling plant."""
+    """Tunable NMPC settings for the face-milling plate environment.
 
-    horizon: int = 32                 # Np prediction/control horizon steps
-    n_rk: int = 6                     # RK4 substeps per shooting interval
-    control_hold: int = 3             # env control steps per MPC decision (ZOH)
+    ``n_rk`` is the number of RK4 substeps per *environment* control step.
+    When ``control_hold > 1`` the symbolic prediction performs that many
+    environment-resolution transitions and sums the reward at every transition;
+    it does not collapse the held interval into one coarse integration step.
+    """
 
-    # Safe-region softening and control-effort shaping.
-    slack_weight: float = 5.0e4       # rho: penalty on safe-region slack (|w|<=w_limit)
-    # Control-rate penalties on the NORMALISED controls (both O(1) in [-1,1]).
-    # Raised 0.05 -> 5.0: at 0.05 the rate term (~0.05*du^2, du~O(1)) was ~4 orders
-    # of magnitude below the productivity/slack terms, so the OCP had no incentive
-    # to keep the command smooth and the planned spindle speed/depth alternated
-    # between whatever momentarily maximised productivity.  5.0 makes a full-scale
-    # step cost O(5), comparable to a few steps of productivity, so the optimiser
-    # trades a little productivity for a markedly smoother command WITHOUT changing
-    # the objective's shape (the rate term already existed).
-    omega_rate_weight: float = 5.0    # penalty on normalised d(omega) between steps
-    ap_rate_weight: float = 5.0       # penalty on normalised d(ap) between steps
+    horizon: int = 16
+    n_rk: int = 3
+    control_hold: int = 3
 
-    # Terminal cost: penalise plate vibration at the horizon end (approximate
-    # cost-to-go).  Prevents the finite-horizon controller from deferring a
-    # limit breach just beyond the horizon; expressed as an equivalent number of
-    # extra steps of the running vibration cost.
-    terminal_weight: float = 3.0
+    # Fair-comparison defaults: the running objective matches the RL reward.
+    # Controller-specific slack, rate, and terminal shaping are disabled unless
+    # explicitly requested in a sensitivity study.
+    slack_weight: float = 0.0
+    omega_rate_weight: float = 0.0
+    ap_rate_weight: float = 0.0
+    terminal_weight: float = 0.0
 
-    # Slew-rate limits on the APPLIED action (a safety net that also covers the
-    # pre-screen fallback when the NLP does not converge).  Depth ramps up
-    # cautiously but can drop fast for safety, so the controller cannot jump to a
-    # dangerous depth in one step before the closed loop observes the vibration.
-    #
-    # These are ABSOLUTE (rad/s and mm); FaceMillingMPC.__init__ additionally caps
-    # each to a fraction of the plant's own actuator range (see slew_frac_* below)
-    # so the limit always binds regardless of the plant's rpm/ap scaling.  The
-    # previous omega_slew=600 rad/s exceeded the entire 400-4000 rpm span
-    # (~377 rad/s), so it never bound and the applied spindle speed could jump the
-    # full range in one step -- the alternating command seen in closed loop.
-    #
-    # ap slews rebalanced 0.05/3.0 -> 0.25/1.5: the old up=0.05, down=3.0 asymmetry
-    # let any vibration transient drop the depth 3 mm instantly while recovery took
-    # ~60 MPC steps at 0.05 mm/step, ratcheting depth DOWN over the pass -- the
-    # opposite of the desired increase toward the stiffer clamped end.  0.25 up
-    # lets depth actually climb there while 1.5 down keeps a fast safety back-off.
-    omega_slew: float = 600.0     # max |d(omega)| per MPC step [rad/s] (then range-capped)
-    ap_up_slew: float = 0.25      # max depth increase per MPC step [mm] (then range-capped)
-    ap_down_slew: float = 1.5     # max depth decrease per MPC step [mm] (then range-capped)
-
-    # Fractions of the plant actuator range used to cap the absolute slews above
-    # so they always bind: effective omega_slew = min(omega_slew, slew_frac_omega*
-    # (omega_max-omega_min)); similarly for ap.  These never LOOSEN a configured
-    # slew, only tighten one that is too large for the plant's scale.
+    # Physical command-increment limits per MPC decision.  They are imposed as
+    # hard constraints in the OCP.  A final projection remains only as a
+    # numerical safety guard and should normally make no change.
+    # Defaults span the full admissible action range, so these constraints are
+    # nonbinding and both controllers have the same action authority. Supply
+    # finite physical increments explicitly when actuator dynamics are studied.
+    omega_slew: float = 600.0
+    ap_up_slew: float = 0.25
+    ap_down_slew: float = 1.5
     slew_frac_omega: float = 0.20
     slew_frac_ap_up: float = 0.15
     slew_frac_ap_down: float = 1.0
 
-    # Spindle-speed pre-screen (global warm start).
-    prescreen_n_omega: int = 28       # candidate spindle speeds
-    prescreen_n_ap: int = 7           # candidate depths (first mode only)
+    # Optional hard process constraints.  ``None`` means: use a finite matching
+    # plant/environment attribute when one is available; otherwise do not add
+    # that particular constraint.  Displacement always has the plant hard limit.
+    wdot_limit: float | None = None
+    fz_limit: float | None = None
 
-    # Regenerative-delay interpolation width (in Ts samples).  A smooth
-    # (softmax) fractional-delay kernel keeps tau(omega) differentiable so the
-    # OCP selects spindle speed for chatter avoidance; sigma ~ 0.7 approximates
-    # linear interpolation while staying C-infinity for the NLP solver.
+    # Grid pre-screen used to choose a physically reachable stability-lobe warm
+    # start.  Candidate controls are restricted by the same first-move slew
+    # limits as the NLP.
+    prescreen_n_omega: int = 28
+    prescreen_n_ap: int = 7
+
+    # Smooth causal fractional-delay interpolation.  Only samples available at
+    # the current prediction instant are included in the kernel, so future
+    # predicted samples cannot leak into the delayed chip-thickness term.
     delay_sigma: float = 0.7
+    delay_mode: str = "predictive"  # "predictive" or "frozen"
 
-    # Regenerative-delay mode inside the NLP:
-    #   'predictive' : tau = 2*pi/(N*omega_k) uses the per-node DECISION speed, so
-    #                  the OCP sees how spindle speed changes chatter stability
-    #                  (this couples omega and ap -> genuine multivariable control).
-    #   'frozen'     : tau evaluated at the pre-screen speed (a fixed parameter);
-    #                  better conditioned but decouples omega from the dynamics.
-    delay_mode: str = "predictive"
-
-    # IPOPT options.  'limited-memory' (L-BFGS) gives cheap iterations for this
-    # medium-size NLP; 'exact' is more accurate but much slower per iteration.
+    # IPOPT settings and acceptance tolerance.  A finite iterate is applied only
+    # when its explicit primal constraint violation is below primal_feas_tol.
     hessian: str = "limited-memory"
     max_iter: int = 40
     tol: float = 1.0e-6
     acceptable_tol: float = 1.0e-3
+    primal_feas_tol: float = 1.0e-5
     print_level: int = 0
     warm_start: bool = True
 
-    # Feedback: 'state' uses the true modal state from the env (idealised,
-    # full-state MPC baseline); 'observer' uses a min-norm modal estimate from
-    # the sensor observation only (output feedback, comparable to RL sensing).
-    feedback: str = "state"
+    # Hard per-solve computational cap [s].  IPOPT returns its best primal iterate when
+    # it hits this wall/CPU-time budget instead of running to convergence, so a
+    # single pathological OCP cannot stall the receding-horizon loop.  The
+    # returned iterate still passes the explicit primal-feasibility check before
+    # being applied; otherwise the verified pre-screen fallback is used.
+    max_wall_time_s: float = 2.0
 
-    # Safety margin on the displacement limit inside the OCP: because the
-    # averaged model under-predicts the true peak by ~15-25% (tooth ripple is
-    # averaged out and the unilateral max(chip,0) is dropped), the soft
-    # constraint uses w_lim_margin * w_limit as the threshold so the *true*
-    # closed-loop displacement stays under w_limit.
-    #
-    # Raised 0.6 -> 0.8 to WIDEN the MPC feasible set (the OCP was over-
-    # conservative and kept ap very low).  With the widened w_limit = 3 mm the
-    # soft threshold is now 0.8 * 3 mm = 2.4 mm, still ~20% below the hard limit
-    # -- more than the ~15-25% model under-prediction headroom -- so the true
-    # closed-loop displacement stays under 3 mm while the OCP can use much more
-    # depth of cut.  Lower it again toward 0.6 if the true peak ever approaches
-    # w_limit in closed loop.
-    w_lim_margin: float = 0.8
+    # Fair default: EKF uses only the normalized observation supplied to RL.
+    # ``observer`` is a static pseudoinverse ablation and ``state`` is retained
+    # only as an explicitly labelled oracle diagnostic.
+    feedback: str = "ekf"
+    ekf_process_noise_scale: float = 2.0e-2
+    ekf_measurement_noise_scale: float = 1.0e-3
+    ekf_initial_cov_scale: float = 5.0e-1
+
+    # Soft operating threshold.  The actual plant displacement limit remains a
+    # separate hard constraint.  Slack is bounded to the interval between the
+    # inner margin and the physical limit.
+    w_lim_margin: float = 0.7
 
 
 # ===========================================================================
@@ -263,20 +205,59 @@ class FaceMillingMPC:
         plant = base.plant
         reward = base.reward_fn
         self.plant = plant
+        self.base_env = base
+
+        if self.cfg.horizon <= 0 or self.cfg.n_rk <= 0 or self.cfg.control_hold <= 0:
+            raise ValueError("horizon, n_rk and control_hold must be positive")
+        if not (0.0 < float(self.cfg.w_lim_margin) < 1.0):
+            raise ValueError("w_lim_margin must lie strictly between 0 and 1")
+        if self.cfg.delay_sigma <= 0.0:
+            raise ValueError("delay_sigma must be positive")
+        if self.cfg.delay_mode not in {"predictive", "frozen"}:
+            raise ValueError("delay_mode must be 'predictive' or 'frozen'")
+        if self.cfg.primal_feas_tol <= 0.0:
+            raise ValueError("primal_feas_tol must be positive")
+        if self.cfg.feedback not in {"ekf", "observer", "state"}:
+            raise ValueError("feedback must be 'ekf', 'observer', or 'state'")
+        if self.cfg.ekf_process_noise_scale <= 0.0:
+            raise ValueError("ekf_process_noise_scale must be positive")
+        if self.cfg.ekf_measurement_noise_scale <= 0.0:
+            raise ValueError("ekf_measurement_noise_scale must be positive")
+        if self.cfg.ekf_initial_cov_scale <= 0.0:
+            raise ValueError("ekf_initial_cov_scale must be positive")
+
+        # ---- supported control/model configuration ----
+        if bool(getattr(plant, "control_ae", False)):
+            raise NotImplementedError(
+                "The publication NMPC supports fixed radial immersion ae only. "
+                "Create the environment with control_ae=False."
+            )
+        if bool(getattr(plant, "use_process_damping", False)):
+            raise NotImplementedError(
+                "The nominal averaged NMPC does not include process damping. "
+                "Disable plant.use_process_damping or extend the prediction model."
+            )
+        if str(getattr(plant, "force_projection_mode", "z")).lower() != "z":
+            raise NotImplementedError(
+                "The publication NMPC supports the scalar transverse z-force "
+                "projection used by the registered environments."
+            )
 
         # ---- control mode ----
         self.control_ap = bool(getattr(plant, "control_ap", True))
-        self.nu = 2 if self.control_ap else 1  # decision dimension
+        self.nu = 2 if self.control_ap else 1
 
         # ---- structural / modal constants ----
         self.K = int(plant.K)
-        self.wn = np.asarray(plant.omega_vec, dtype=np.float64).reshape(-1)      # natural freqs
+        self.wn = np.asarray(plant.omega_vec, dtype=np.float64).reshape(-1)
         self.zeta = np.asarray(plant.zeta_vec, dtype=np.float64).reshape(-1)
-        self.lam = np.asarray(plant.lambda_vec, dtype=np.float64).reshape(-1)    # mass-normalised cubic
+        self.lam = np.asarray(plant.lambda_vec, dtype=np.float64).reshape(-1)
         self.Mmodal = np.asarray(plant.M_modal, dtype=np.float64).reshape(-1)
-        self.Phi = np.asarray(plant.Phi, dtype=np.float64)                       # (nS, K)
+        self.Phi = np.asarray(plant.Phi, dtype=np.float64)
         self.nS = int(self.Phi.shape[0])
-        self._Phi_pinv = np.linalg.pinv(self.Phi)                                # (K, nS)
+        self._Phi_pinv = np.linalg.pinv(self.Phi)
+        self.w_obs_scale = float(plant.w_obs_scale)
+        self.wdot_obs_scale = float(plant.wdot_obs_scale)
 
         # ---- face-milling force constants ----
         self.Nteeth = int(plant.N)
@@ -293,27 +274,70 @@ class FaceMillingMPC:
         self.omega_max = float(plant.omega_max)
         self.ap_min = float(plant.ap_min)
         self.ap_max = float(plant.ap_max)
+        if not self.omega_max > self.omega_min:
+            raise ValueError("Invalid spindle-speed bounds")
+        if self.control_ap and not self.ap_max > self.ap_min:
+            raise ValueError("Invalid axial-depth bounds")
 
-        # ---- range-cap the applied slew limits so they always bind ----
-        # A slew larger than the actuator range is a no-op (the whole span fits in
-        # one step).  Cap each configured absolute slew to a fraction of the plant's
-        # own range so the closed-loop command stays smooth regardless of the plant's
-        # rpm/ap scaling.  This only tightens a too-large slew; it never loosens one.
-        _om_range = max(self.omega_max - self.omega_min, 1e-9)
-        _ap_range = max(self.ap_max - self.ap_min, 1e-9)
-        self.cfg.omega_slew = min(float(self.cfg.omega_slew),
-                                  float(self.cfg.slew_frac_omega) * _om_range)
-        self.cfg.ap_up_slew = min(float(self.cfg.ap_up_slew),
-                                  float(self.cfg.slew_frac_ap_up) * _ap_range)
-        self.cfg.ap_down_slew = min(float(self.cfg.ap_down_slew),
-                                    float(self.cfg.slew_frac_ap_down) * _ap_range)
+        # Range-cap the configured command increments so a nominally enormous
+        # value cannot silently disable the intended actuator constraint.
+        om_range = self.omega_max - self.omega_min
+        ap_range = max(self.ap_max - self.ap_min, 1.0e-12)
+        self.cfg.omega_slew = min(
+            max(float(self.cfg.omega_slew), 0.0),
+            max(float(self.cfg.slew_frac_omega), 0.0) * om_range,
+        )
+        self.cfg.ap_up_slew = min(
+            max(float(self.cfg.ap_up_slew), 0.0),
+            max(float(self.cfg.slew_frac_ap_up), 0.0) * ap_range,
+        )
+        self.cfg.ap_down_slew = min(
+            max(float(self.cfg.ap_down_slew), 0.0),
+            max(float(self.cfg.slew_frac_ap_down), 0.0) * ap_range,
+        )
+        self.du_omega_norm = 2.0 * self.cfg.omega_slew / om_range
+        self.du_ap_up_norm = 2.0 * self.cfg.ap_up_slew / ap_range
+        self.du_ap_down_norm = 2.0 * self.cfg.ap_down_slew / ap_range
 
-        # ---- safe region ----
+        # ---- safety limits ----
         self.w_limit = float(plant.w_limit)
+        if not np.isfinite(self.w_limit) or self.w_limit <= 0.0:
+            raise ValueError("plant.w_limit must be finite and positive")
         self.w_lim_margin = float(self.cfg.w_lim_margin)
 
-        # ---- decision-variable scaling for a well-conditioned NLP ----
-        # eta near the limit is ~ w_limit/|Phi| ~ 7e-4; eta_dot ~ wn*eta ~ 1e-1.
+        def first_finite_attr(objects: tuple[Any, ...], names: tuple[str, ...]) -> float | None:
+            for obj in objects:
+                for name in names:
+                    val = getattr(obj, name, None)
+                    try:
+                        val_f = float(val)
+                    except (TypeError, ValueError):
+                        continue
+                    if np.isfinite(val_f) and val_f > 0.0:
+                        return val_f
+            return None
+
+        if self.cfg.wdot_limit is not None:
+            self.wdot_limit = float(self.cfg.wdot_limit)
+        else:
+            self.wdot_limit = first_finite_attr(
+                (base, plant),
+                ("wdot_limit", "w_dot_limit", "sensor_velocity_limit", "wdot_sensor_limit"),
+            )
+        if self.wdot_limit is not None and self.wdot_limit <= 0.0:
+            raise ValueError("wdot_limit must be positive when supplied")
+
+        if self.cfg.fz_limit is not None:
+            self.fz_limit = float(self.cfg.fz_limit)
+        else:
+            self.fz_limit = first_finite_attr(
+                (base, plant),
+                ("Fz_limit", "fz_limit", "axial_force_limit", "force_z_limit"),
+            )
+        if self.fz_limit is not None and self.fz_limit <= 0.0:
+            raise ValueError("fz_limit must be positive when supplied")
+
+        # ---- scaling ----
         self.S_eta = 1.0e-3
         self.S_etad = 1.0e-1
         self.S_w = self.w_limit
@@ -321,45 +345,118 @@ class FaceMillingMPC:
             [np.full(self.K, self.S_eta), np.full(self.K, self.S_etad)]
         )
 
+        # Scaled-state measurement model.  The EKF state is xi = Dz^{-1} z,
+        # while the measurement is exactly the normalized sensor part of the RL
+        # observation: [w/w_obs_scale, wdot/wdot_obs_scale].
+        H_eta = self.Phi * (self.S_eta / max(self.w_obs_scale, 1.0e-12))
+        H_etad = self.Phi * (self.S_etad / max(self.wdot_obs_scale, 1.0e-12))
+        self._H_ekf = np.block(
+            [
+                [H_eta, np.zeros((self.nS, self.K))],
+                [np.zeros((self.nS, self.K)), H_etad],
+            ]
+        )
+        nx_ekf = 2 * self.K
+        ny_ekf = 2 * self.nS
+        self._Q_ekf = (float(self.cfg.ekf_process_noise_scale) ** 2) * np.eye(nx_ekf)
+        obs_noise = max(float(getattr(base, "obs_noise_std", 0.0)), 0.0)
+        r_scale = max(float(self.cfg.ekf_measurement_noise_scale), obs_noise, 1.0e-9)
+        self._R_ekf = (r_scale**2) * np.eye(ny_ekf)
+        self._P0_ekf = (float(self.cfg.ekf_initial_cov_scale) ** 2) * np.eye(nx_ekf)
+        self._ekf_x: np.ndarray | None = None
+        self._ekf_P: np.ndarray | None = None
+        self._ekf_last_innovation_norm = float("nan")
+        self._ekf_last_nis = float("nan")
+
         # ---- timing ----
-        env_control_dt = float(base.dt) * int(base.n_substeps)
-        self.env_control_dt = env_control_dt
-        self.Ts = env_control_dt * int(self.cfg.control_hold)
+        self.env_control_dt = float(base.dt) * int(base.n_substeps)
+        if self.env_control_dt <= 0.0:
+            raise ValueError("Environment control time step must be positive")
+        self.Ts = self.env_control_dt * int(self.cfg.control_hold)
         self.Np = int(self.cfg.horizon)
         self.n_rk = int(self.cfg.n_rk)
 
-        # regenerative delay buffer length (>= longest tooth delay in Ts units)
-        tau_max = 2.0 * np.pi / (self.Nteeth * max(self.omega_min, 1e-9))
-        self.nb = int(np.ceil(tau_max / self.Ts)) + 3
-        self.nb = max(self.nb, 4)
+        # Local observability diagnostic for the sensor-based estimator.  The
+        # instantaneous map Phi is generally rectangular (fewer sensors than
+        # modes), but the modal dynamics can still make the complete state
+        # observable over time.  Use the undriven linear structural model only
+        # as a configuration check; the online EKF uses the full nonlinear map.
+        nx_obs = 2 * self.K
+        A_phys0 = np.block(
+            [
+                [np.zeros((self.K, self.K)), np.eye(self.K)],
+                [
+                    -np.diag(self.wn**2),
+                    -np.diag(2.0 * self.zeta * self.wn),
+                ],
+            ]
+        )
+        A_scaled0 = (A_phys0 * self.Dz[None, :]) / self.Dz[:, None]
+        A_disc0 = np.eye(nx_obs) + self.env_control_dt * A_scaled0
+        obs_blocks: list[np.ndarray] = []
+        A_power = np.eye(nx_obs)
+        for _ in range(nx_obs):
+            block = self._H_ekf @ A_power
+            block_norm = max(float(np.linalg.norm(block, ord=2)), 1.0)
+            obs_blocks.append(block / block_norm)
+            A_power = A_power @ A_disc0
+        obs_matrix = np.vstack(obs_blocks)
+        obs_sv = np.linalg.svd(obs_matrix, compute_uv=False)
+        obs_tol = (
+            max(obs_matrix.shape)
+            * np.finfo(np.float64).eps
+            * (float(obs_sv[0]) if obs_sv.size else 1.0)
+        )
+        self.ekf_observability_rank = int(np.sum(obs_sv > obs_tol))
+        self.ekf_observability_full = bool(
+            self.ekf_observability_rank == nx_obs
+        )
+        self.ekf_observability_singular_values = obs_sv
+        if self.cfg.feedback == "ekf" and not self.ekf_observability_full:
+            warnings.warn(
+                "The local linear sensor/model pair is not full-state "
+                f"observable (rank {self.ekf_observability_rank}/{nx_obs}). "
+                "Add/reposition sensors or reduce the estimator model order.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
-        # ---- engagement (ZOA) constants from radial immersion ae ----
+        # Delay history is stored at the environment control-step resolution,
+        # not the coarser MPC decision resolution.
+        tau_max = 2.0 * np.pi / (self.Nteeth * max(self.omega_min, 1.0e-12))
+        self.nb = max(int(np.ceil(tau_max / self.env_control_dt)) + 3, 4)
+
         self.S0, self.S1 = self._engagement_constants(self.ae_default)
-
-        # ---- dense-reward weights (mirror env.reward_fn exactly) ----
         self._load_reward_weights(reward)
+        self.reward_class = type(reward).__name__
 
-        # ---- build symbolic model, stage cost, and NLP solver ----
         self._build_dynamics()
         self._build_stage_cost()
         self._build_nlp()
 
-        # persistent warm start
-        self._x_guess: np.ndarray | None = None
-        self._lam_g: np.ndarray | None = None
-        self._lam_x: np.ndarray | None = None
+        # Primal warm start: retain and shift only the previous control plan,
+        # then re-simulate the states from the new measurement.  Reusing
+        # unshifted dual multipliers from a different OCP is intentionally
+        # avoided because it can degrade IPOPT robustness.
+        self._U_last: np.ndarray | None = None
 
-        # Vectorized (CasADi .map()) versions of the per-step dynamics/cost
-        # functions, batched over the whole pre-screen grid at once. This
-        # replaces a Python double-loop of Np*n_screen individual CasADi
-        # calls with Np batched calls -- same math (.map() just evaluates the
-        # identical computational graph n_screen times), pure speedup.
         self._n_screen = int(self.cfg.prescreen_n_omega) * (
             int(self.cfg.prescreen_n_ap) if self.nu == 2 else 1
         )
+        if self._n_screen <= 0:
+            raise ValueError("Pre-screen grid dimensions must be positive")
         self._F_map = self._F.map(self._n_screen)
         self._L_map = self._L.map(self._n_screen)
         self._Lterm_map = self._Lterm.map(self._n_screen)
+        self._Fz_map = self._Fz.map(self._n_screen)
+
+    def reset(self) -> None:
+        """Clear optimizer and estimator state before a new episode."""
+        self._U_last = None
+        self._ekf_x = None
+        self._ekf_P = None
+        self._ekf_last_innovation_norm = float("nan")
+        self._ekf_last_nis = float("nan")
 
     # ------------------------------------------------------------------
     # constants
@@ -380,7 +477,7 @@ class FaceMillingMPC:
         return float(S0), float(S1)
 
     def _load_reward_weights(self, reward: Any) -> None:
-        """Copy the dense-reward weights so the MPC objective == RL reward."""
+        """Copy the dense running-reward weights used by the RL environment."""
         g = lambda name, default: float(getattr(reward, name, default))
         self.r_w_weight = g("w_weight", 0.6)
         self.r_wdot_weight = g("wdot_weight", 0.02)
@@ -389,6 +486,10 @@ class FaceMillingMPC:
         self.r_prod_weight = g("productivity_weight", 30.0)
         self.r_omega_cost = g("omega_cost_weight", 3.0)
         self.r_neg_ap_weight = g("negative_ap_weight", 2.0)
+        self.r_action_weight = g("action_weight", 0.0)
+        self.r_ap_action_weight = g("ap_action_weight", 0.0)
+        self.r_step_time_cost = g("step_time_cost", 0.0)
+        self.r_dense_time_scale = g("dense_time_scale", 1.0)
         self.r_gate_enabled = bool(getattr(reward, "productivity_gate_enabled", True))
         self.r_w_gate = g("productivity_w_gate", 5.0e-4)
         self.r_wdot_gate = g("productivity_wdot_gate", 1.0)
@@ -406,31 +507,27 @@ class FaceMillingMPC:
     # symbolic continuous dynamics and RK4 discrete map
     # ------------------------------------------------------------------
     def _build_dynamics(self) -> None:
+        """Build one environment-step averaged cutting model and RK4 map."""
         K = self.K
-        z = ca.SX.sym("z", 2 * K)          # [eta ; eta_dot]  (block layout)
-        u = ca.SX.sym("u", self.nu)        # [omega] or [omega, ap]
-        wz_del = ca.SX.sym("wz_del")       # delayed transverse disp at cutter [m]
-        phiz = ca.SX.sym("phiz", K)        # z-mode shapes at cutter point
-        ap_par = ca.SX.sym("ap_par")       # fixed ap (second mode)
+        z = ca.SX.sym("z", 2 * K)
+        u = ca.SX.sym("u", self.nu)
+        wz_del = ca.SX.sym("wz_del")
+        phiz = ca.SX.sym("phiz", K)
+        ap_par = ca.SX.sym("ap_par")
         S0 = ca.SX.sym("S0")
         S1 = ca.SX.sym("S1")
 
         eta = z[0:K]
         etad = z[K : 2 * K]
-        om_s = u[0]                         # spindle speed [rad/s]
         ap = u[1] if self.nu == 2 else ap_par
+        wz = ca.dot(phiz, eta)
 
-        wz = ca.dot(phiz, eta)             # transverse displacement at cutter [m]
-
-        # zeroth-order averaged face-milling axial force (see module docstring)
         Fz = (
             self.Ka * ap * self.ft * S1
             + self.Kae * ap * S0
             + self.Ka * ap * MODAL_DISP_TO_MM * self.sin_gL * S0 * (wz - wz_del)
         )
-        Mvec = ca.DM(self.Mmodal)
-        q = (phiz * Fz) / Mvec             # generalised modal force (K,)
-
+        q = (phiz * Fz) / ca.DM(self.Mmodal)
         wn = ca.DM(self.wn)
         zeta = ca.DM(self.zeta)
         lam = ca.DM(self.lam)
@@ -440,9 +537,14 @@ class FaceMillingMPC:
         self._f = ca.Function(
             "f_rhs", [z, u, wz_del, phiz, ap_par, S0, S1], [dz]
         )
+        self._Fz = ca.Function(
+            "Fz_avg", [z, u, wz_del, phiz, ap_par, S0, S1], [Fz]
+        )
 
-        # RK4 over Ts with n_rk substeps, delayed term held constant (method of steps)
-        h = self.Ts / self.n_rk
+        # Integrate exactly one environment control interval.  A held MPC action
+        # is represented by repeated calls to this map in the OCP, preserving the
+        # reward and delay time scale of the simulator.
+        h = self.env_control_dt / self.n_rk
         zk = z
         for _ in range(self.n_rk):
             k1 = self._f(zk, u, wz_del, phiz, ap_par, S0, S1)
@@ -451,13 +553,43 @@ class FaceMillingMPC:
             k4 = self._f(zk + h * k3, u, wz_del, phiz, ap_par, S0, S1)
             zk = zk + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         self._F = ca.Function(
-            "F_step", [z, u, wz_del, phiz, ap_par, S0, S1], [zk]
+            "F_env_step", [z, u, wz_del, phiz, ap_par, S0, S1], [zk]
+        )
+        # Exact algorithmic Jacobian of the discrete prediction map for the EKF.
+        # The delayed cutter displacement is treated as the known exogenous
+        # history input over this environment step, consistently with _F.
+        A_disc = ca.jacobian(zk, z)
+        self._A_F = ca.Function(
+            "A_env_step", [z, u, wz_del, phiz, ap_par, S0, S1], [A_disc]
         )
 
     # ------------------------------------------------------------------
     # symbolic dense-reward stage cost
     # ------------------------------------------------------------------
     def _build_stage_cost(self) -> None:
+        """Simple smooth POLYNOMIAL economic stage cost (no clip/fmin/fmax/gate).
+
+        The previous stage cost replicated the RL gate reward symbolically
+        (rational gate, sqrt RMS, clipped scores).  Those kinks and rational
+        terms are unnecessary inside the OCP: omega and ap are box-bounded by
+        the NLP itself, so range-normalized scores need no clipping, and safety
+        is enforced by the hard |w| constraints + soft margin, not by a reward
+        gate.  The economic objective below is a low-order polynomial --
+        bilinear productivity (the MRR proxy: feed rate ~ omega, depth ~ ap)
+        minus quadratic vibration costs -- which is smooth, cheap to
+        differentiate, and preserves exactly the trade-off that matters:
+        maximize material removal subject to staying inside the safe region.
+
+            L = -mrr_weight * s_omega * s_ap
+                + vib_weight    * sum_i (w_i  / w_ref )^2 / nS
+                + vibdot_weight * sum_i (wd_i / wd_ref)^2 / nS
+
+        with s_omega = (omega-omega_min)/range in [0,1] (by NLP bounds),
+        s_ap = (ap-ap_min)/range in [0,1], w_ref = w_lim_margin*w_limit.
+        At |w_i| = w_ref the per-sensor vibration cost equals vib_weight,
+        which dwarfs the maximum productivity gain (=mrr_weight), so the
+        optimizer backs away from the margin well before the hard constraint.
+        """
         K = self.K
         z_next = ca.SX.sym("z_next", 2 * K)
         u = ca.SX.sym("u", self.nu)
@@ -466,52 +598,38 @@ class FaceMillingMPC:
         eta = z_next[0:K]
         etad = z_next[K : 2 * K]
         Phi = ca.DM(self.Phi)
-        w = ca.mtimes(Phi, eta)            # (nS,) sensor displacement [m]
-        wd = ca.mtimes(Phi, etad)          # (nS,) sensor velocity [m/s]
+        w = ca.mtimes(Phi, eta)
+        wd = ca.mtimes(Phi, etad)
 
         om_s = u[0]
         ap = u[1] if self.nu == 2 else ap_par
 
-        eps = 1e-24  # smoothing so sqrt is differentiable at 0
-        w_rms = ca.sqrt(ca.sumsqr(w) / self.nS + eps)
-        wd_rms = ca.sqrt(ca.sumsqr(wd) / self.nS + eps)
+        # Range-normalized productivity coordinates; bounded to [0, 1] by the
+        # NLP box bounds on the decision variables, so no clipping is needed.
+        s_omega = (om_s - self.omega_min) / max(self.omega_max - self.omega_min, 1.0e-12)
+        s_ap = (ap - self.ap_min) / max(self.ap_max - self.ap_min, 1.0e-12)
 
-        # omega/ap are box-bounded to [min, max] in the NLP, so the RL reward's
-        # clip(., 0, 1) is a no-op here.  Keeping the scores linear (no fmax/fmin
-        # kinks) makes the objective C-infinity, which lets IPOPT reach dual
-        # feasibility.  ap >= ap_min = 0, so the negative-ap penalty is also
-        # identically zero in the feasible region and is dropped.
-        omega_score = (om_s - self.r_omega_min) / (self.r_omega_max - self.r_omega_min)
-        ap_score = (ap - self.r_ap_min) / max(self.r_ap_max - self.r_ap_min, 1e-12)
-        raw_prod = omega_score * ap_score  # ae_score = 1 (ae not an action)
+        w_ref = max(self.w_lim_margin * self.w_limit, 1.0e-9)
+        wd_ref = 1.0  # [m/s]
 
-        if self.r_gate_enabled:
-            gate = 1.0 / (
-                1.0
-                + (w_rms / self.r_w_gate) ** self.r_gate_power
-                + self.r_wdot_gate_weight * (wd_rms / self.r_wdot_gate) ** self.r_gate_power
-            )
-        else:
-            gate = 1.0
-        prod = self.r_prod_weight * raw_prod * gate
+        mrr_weight = 1.0     # productivity unit
+        vib_weight = 4.0     # per-sensor cost at |w| = w_ref (>> mrr gain)
+        vibdot_weight = 0.1
 
-        w_cost = self.r_w_weight * ca.sumsqr(w / self.r_w_scale) / self.nS
-        wdot_cost = self.r_wdot_weight * ca.sumsqr(wd / self.r_wdot_scale) / self.nS
-        omega_cost = self.r_omega_cost * omega_score**2
+        L = (
+            -mrr_weight * s_omega * s_ap
+            + vib_weight * ca.sumsqr(w / w_ref) / self.nS
+            + vibdot_weight * ca.sumsqr(wd / wd_ref) / self.nS
+        )
+        self._L = ca.Function("L_stage", [z_next, u, ap_par], [L])
 
-        reward = self.r_alive + prod - w_cost - wdot_cost - omega_cost
-        self._L = ca.Function("L_stage", [z_next, u, ap_par], [-reward])
-
-        # terminal cost: vibration cost of the final state, scaled as an
-        # equivalent number of extra running-cost steps (approximate cost-to-go)
+        # Terminal cost: same quadratic vibration form (approximate cost-to-go).
         zt = ca.SX.sym("zt", 2 * K)
-        et = zt[0:K]
-        edt = zt[K : 2 * K]
-        wt = ca.mtimes(Phi, et)
-        wdt = ca.mtimes(Phi, edt)
+        wt = ca.mtimes(Phi, zt[0:K])
+        wdt = ca.mtimes(Phi, zt[K : 2 * K])
         term = self.cfg.terminal_weight * (
-            self.r_w_weight * ca.sumsqr(wt / self.r_w_scale) / self.nS
-            + self.r_wdot_weight * ca.sumsqr(wdt / self.r_wdot_scale) / self.nS
+            vib_weight * ca.sumsqr(wt / w_ref) / self.nS
+            + vibdot_weight * ca.sumsqr(wdt / wd_ref) / self.nS
         )
         self._Lterm = ca.Function("L_term", [zt], [term])
 
@@ -537,132 +655,163 @@ class FaceMillingMPC:
     # multiple-shooting NLP  (scaled state, normalised controls)
     # ------------------------------------------------------------------
     def _build_nlp(self) -> None:
-        K, Np, nS, nu, nb = self.K, self.Np, self.nS, self.nu, self.nb
-        Dz = ca.DM(self.Dz)        # state scale, physical z = Dz .* z_scaled
-        Dz_eta = ca.DM(self.Dz[:K])
-        S_w = self.S_w
-        margin = self.w_lim_margin  # threshold = margin (in scaled w units)
+        """Construct the scaled direct-multiple-shooting NMPC problem.
 
-        # scaled / normalised decision variables
+        The state transition and reward are evaluated at the environment control
+        time step.  ``control_hold`` transitions are composed inside each
+        shooting interval.  Hard actuator increments and the physical
+        displacement limit are true OCP constraints; slack only softens the
+        smaller operating margin.
+        """
+        K, Np, nS, nu, nb = self.K, self.Np, self.nS, self.nu, self.nb
+        Dz = ca.DM(self.Dz)
+        S_w = self.S_w
+        margin = self.w_lim_margin
+        Phi = ca.DM(self.Phi)
+
         Zs = [ca.SX.sym(f"zs_{k}", 2 * K) for k in range(Np + 1)]
         Ws = [ca.SX.sym(f"ws_{k}", nS) for k in range(Np + 1)]
-        Un = [ca.SX.sym(f"un_{k}", nu) for k in range(Np)]   # in [-1, 1]
+        Un = [ca.SX.sym(f"un_{k}", nu) for k in range(Np)]
         Ss = [ca.SX.sym(f"ss_{k}", nS) for k in range(Np + 1)]
 
-        # parameters
-        z_meas = ca.SX.sym("z_meas", 2 * K)      # physical modal state
+        z_meas = ca.SX.sym("z_meas", 2 * K)
         phiz = ca.SX.sym("phiz", K)
-        wz_hist = ca.SX.sym("wz_hist", nb)       # past w_z [m] (oldest..newest)
+        wz_hist = ca.SX.sym("wz_hist", nb)
         ap_fixed = ca.SX.sym("ap_fixed")
-        un_prev = ca.SX.sym("un_prev", nu)       # previous normalised control
+        un_prev = ca.SX.sym("un_prev", nu)
         S0 = ca.SX.sym("S0")
         S1 = ca.SX.sym("S1")
-        omega_ref = ca.SX.sym("omega_ref")       # reference speed for the frozen delay
+        omega_ref = ca.SX.sym("omega_ref")
         P = ca.vertcat(z_meas, phiz, wz_hist, ap_fixed, un_prev, S0, S1, omega_ref)
 
-        # physical state per node
         Zp = [Dz * Zs[k] for k in range(Np + 1)]
-
-        # combined w_z timeline for the delay interpolation:
-        #   [ wz_hist(nb) | wz_node_0 ... wz_node_Np ]  positions 0 .. nb+Np
-        wz_nodes = [ca.dot(phiz, Zp[k][0:K]) for k in range(Np + 1)]
-        wz_comb = ca.vertcat(wz_hist, *wz_nodes)
-        idxs = ca.DM(np.arange(nb + Np + 1, dtype=np.float64))
-
-        # Frozen-delay scheduling: the regenerative delay tau = 2*pi/(N*omega_ref)
-        # is evaluated at the reference speed selected by the global speed
-        # pre-screen (which uses the true tau(omega) per candidate).  This keeps
-        # the delayed displacement w_z(t-tau) linear in the decision states -> a
-        # well-conditioned NLP that reliably refines the depth ramp, while the
-        # non-convex spindle-speed selection is handled by enumeration.  The
-        # softmax kernel below depends only on omega_ref (a parameter), so the
-        # interpolation weights are constant during a solve.
-        nd_ref = (2.0 * np.pi) / (self.Nteeth * omega_ref * self.Ts)
-
-        g, lbg, ubg = [], [], []
+        g: list[Any] = []
+        lbg: list[float] = []
+        ubg: list[float] = []
         J = 0.0
 
-        # (E3) initial condition  z_0 = z_meas
-        g.append(Zp[0] - z_meas)
-        lbg += [0.0] * (2 * K)
-        ubg += [0.0] * (2 * K)
+        def add_constraint(expr: Any, lower: float | list[float], upper: float | list[float]) -> None:
+            g.append(expr)
+            n_expr = int(expr.numel())
+            if np.isscalar(lower):
+                lbg.extend([float(lower)] * n_expr)
+            else:
+                lbg.extend([float(v) for v in lower])
+            if np.isscalar(upper):
+                ubg.extend([float(upper)] * n_expr)
+            else:
+                ubg.extend([float(v) for v in upper])
 
-        two_pi = 2.0 * np.pi
+        add_constraint(Zs[0] - z_meas / Dz, 0.0, 0.0)
+
+        # The caller supplies oldest..current history.  Replace the last history
+        # sample by the current decision-state displacement so the method of
+        # steps is internally consistent even under output-feedback estimation.
+        wz_timeline: list[Any] = [wz_hist[i] for i in range(nb - 1)]
+        wz_timeline.append(ca.dot(phiz, Zp[0][0:K]))
+
+        nd_ref = 2.0 * np.pi / (
+            self.Nteeth * omega_ref * self.env_control_dt
+        )
+
+        # Initial soft-margin cost.  The hard physical limit is enforced through
+        # W variable bounds below.
         for k in range(Np):
             om_k = self._omega_from_norm(Un[k][0])
             ap_k = self._ap_from_norm(Un[k][1]) if nu == 2 else ap_fixed
-            u_phys_k = ca.vertcat(om_k, ap_k) if nu == 2 else om_k
+            u_phys_k = ca.vertcat(om_k, ap_k) if nu == 2 else ca.vertcat(om_k)
 
-            # regenerative delay tau/Ts in samples.  'predictive' uses the
-            # per-node decision speed so omega genuinely affects chatter stability
-            # inside the OCP (omega<->ap interaction); 'frozen' uses the pre-screen
-            # speed (omega decoupled from the dynamics).
-            if self.cfg.delay_mode == "predictive":
-                nd_k = two_pi / (self.Nteeth * om_k * self.Ts)
-            else:
-                nd_k = nd_ref
-            pos = (nb + k) - nd_k
-            d = (idxs - pos) / self.cfg.delay_sigma
-            e = ca.exp(-d * d)
-            wz_del_k = ca.dot(e, wz_comb) / (ca.sum1(e) + 1e-12)
+            z_micro = Zp[k]
+            for _ in range(int(self.cfg.control_hold)):
+                current_idx = len(wz_timeline) - 1
+                if self.cfg.delay_mode == "predictive":
+                    nd_k = 2.0 * np.pi / (
+                        self.Nteeth * om_k * self.env_control_dt
+                    )
+                else:
+                    nd_k = nd_ref
+                pos = current_idx - nd_k
 
-            z_next = self._F(Zp[k], u_phys_k, wz_del_k, phiz, ap_fixed, S0, S1)
+                # Causal smooth interpolation: only history and states already
+                # predicted at this instant enter the delayed displacement.
+                idxs = ca.DM(np.arange(current_idx + 1, dtype=np.float64))
+                timeline_vec = ca.vertcat(*wz_timeline)
+                d = (idxs - pos) / self.cfg.delay_sigma
+                weights = ca.exp(-(d * d))
+                wz_del = ca.dot(weights, timeline_vec) / (ca.sum1(weights) + 1.0e-12)
 
-            # (E1) discretised modal EOM continuity  z_{k+1} = F(z_k, u_k)
-            g.append(Zp[k + 1] - z_next)
-            lbg += [0.0] * (2 * K)
-            ubg += [0.0] * (2 * K)
+                if self.fz_limit is not None:
+                    fz = self._Fz(z_micro, u_phys_k, wz_del, phiz, ap_fixed, S0, S1)
+                    add_constraint(fz / self.fz_limit, -1.0, 1.0)
 
-            # stage cost = -(dense reward of reached state z_{k+1})
-            J = J + self._L(Zp[k + 1], u_phys_k, ap_fixed)
+                z_micro = self._F(
+                    z_micro, u_phys_k, wz_del, phiz, ap_fixed, S0, S1
+                )
+                J = J + self._L(z_micro, u_phys_k, ap_fixed)
 
-        # terminal cost (approximate cost-to-go on plate vibration)
+                # Hard inter-sample sensor constraints.  They prevent a held
+                # action from violating safety between shooting nodes.
+                w_micro_scaled = ca.mtimes(Phi, z_micro[0:K]) / S_w
+                add_constraint(w_micro_scaled, -1.0, 1.0)
+                if self.wdot_limit is not None:
+                    wd_micro_scaled = (
+                        ca.mtimes(Phi, z_micro[K : 2 * K]) / self.wdot_limit
+                    )
+                    add_constraint(wd_micro_scaled, -1.0, 1.0)
+
+                wz_timeline.append(ca.dot(phiz, z_micro[0:K]))
+
+            add_constraint((Zp[k + 1] - z_micro) / Dz, 0.0, 0.0)
+
         J = J + self._Lterm(Zp[Np])
 
-        # (E2) measurement equation  w_k = Phi @ eta_k   (scaled: S_w*Ws = Phi*eta)
-        Phi = ca.DM(self.Phi)
+        # Sensor map and soft inner operating envelope at shooting nodes.
         for k in range(Np + 1):
-            g.append(S_w * Ws[k] - ca.mtimes(Phi, Zp[k][0:K]))
-            lbg += [0.0] * nS
-            ubg += [0.0] * nS
-
-        # safe-region soft inequality  |w_k| <= margin*w_limit + slack_k  (scaled)
-        for k in range(Np + 1):
-            g.append(Ws[k] - Ss[k] - margin)      # <= 0
-            lbg += [-ca.inf] * nS
-            ubg += [0.0] * nS
-            g.append(-Ws[k] - Ss[k] - margin)     # <= 0
-            lbg += [-ca.inf] * nS
-            ubg += [0.0] * nS
+            add_constraint(Ws[k] - ca.mtimes(Phi, Zp[k][0:K]) / S_w, 0.0, 0.0)
+            add_constraint(Ws[k] - Ss[k] - margin, -ca.inf, 0.0)
+            add_constraint(-Ws[k] - Ss[k] - margin, -ca.inf, 0.0)
             J = J + self.cfg.slack_weight * ca.sum1(Ss[k])
+            if self.wdot_limit is not None:
+                wd_scaled = ca.mtimes(Phi, Zp[k][K : 2 * K]) / self.wdot_limit
+                add_constraint(wd_scaled, -1.0, 1.0)
 
-        # control-rate penalties (normalised controls already O(1))
+        # Hard command-increment constraints plus smooth rate penalties.
         u_prev_k = un_prev
         for k in range(Np):
             dom = Un[k][0] - u_prev_k[0]
+            add_constraint(dom, -self.du_omega_norm, self.du_omega_norm)
             J = J + self.cfg.omega_rate_weight * dom**2
             if nu == 2:
                 dap = Un[k][1] - u_prev_k[1]
+                add_constraint(dap, -self.du_ap_down_norm, self.du_ap_up_norm)
                 J = J + self.cfg.ap_rate_weight * dap**2
             u_prev_k = Un[k]
 
-        # assemble decision vector and bounds
-        x_list, lbx, ubx = [], [], []
-        zs_big = 100.0        # scaled state bound (physical ~ zs_big * Dz)
-        ws_big = 50.0         # scaled w bound (physical ~ 50 * w_limit)
-        ss_big = 40.0         # scaled slack bound
+        x_list: list[Any] = []
+        lbx: list[float] = []
+        ubx: list[float] = []
+        zs_big = 100.0
+        slack_max = max(1.0 - margin, 0.0)
+
         for k in range(Np + 1):
-            x_list.append(Zs[k]); lbx += [-zs_big] * (2 * K); ubx += [zs_big] * (2 * K)
+            x_list.append(Zs[k])
+            lbx.extend([-zs_big] * (2 * K))
+            ubx.extend([zs_big] * (2 * K))
         for k in range(Np + 1):
-            x_list.append(Ws[k]); lbx += [-ws_big] * nS; ubx += [ws_big] * nS
+            x_list.append(Ws[k])
+            lbx.extend([-1.0] * nS)
+            ubx.extend([1.0] * nS)
         for k in range(Np):
-            x_list.append(Un[k]); lbx += [-1.0] * nu; ubx += [1.0] * nu
+            x_list.append(Un[k])
+            lbx.extend([-1.0] * nu)
+            ubx.extend([1.0] * nu)
         for k in range(Np + 1):
-            x_list.append(Ss[k]); lbx += [0.0] * nS; ubx += [ss_big] * nS
+            x_list.append(Ss[k])
+            lbx.extend([0.0] * nS)
+            ubx.extend([slack_max] * nS)
 
         x = ca.vertcat(*x_list)
         gcat = ca.vertcat(*g)
-
         nlp = {"x": x, "f": J, "g": gcat, "p": P}
         opts = {
             "print_time": False,
@@ -673,21 +822,26 @@ class FaceMillingMPC:
                 "tol": float(self.cfg.tol),
                 "acceptable_tol": float(self.cfg.acceptable_tol),
                 "acceptable_iter": 5,
-                "acceptable_obj_change_tol": 1e-8,
+                "acceptable_obj_change_tol": 1.0e-8,
                 "hessian_approximation": str(self.cfg.hessian),
                 "mu_strategy": "adaptive",
-                "warm_start_init_point": "yes" if self.cfg.warm_start else "no",
+                "warm_start_init_point": "no",
+                # Computational cap: return the best primal iterate at the budget
+                # rather than stalling the closed loop (both keys set because
+                # IPOPT honours max_cpu_time only when compiled without wall-time).
+                "max_wall_time": float(self.cfg.max_wall_time_s),
+                "max_cpu_time": float(self.cfg.max_wall_time_s),
             },
         }
         self._solver = ca.nlpsol("mpc_solver", "ipopt", nlp, opts)
+        self._g_fun = ca.Function("mpc_constraints", [x, P], [gcat])
+        self._f_fun = ca.Function("mpc_objective", [x, P], [J])
 
-        # bookkeeping for pack/unpack
-        self._lbx = np.array(lbx, dtype=np.float64)
-        self._ubx = np.array(ubx, dtype=np.float64)
-        self._lbg = np.array(lbg, dtype=np.float64)
-        self._ubg = np.array(ubg, dtype=np.float64)
+        self._lbx = np.asarray(lbx, dtype=np.float64)
+        self._ubx = np.asarray(ubx, dtype=np.float64)
+        self._lbg = np.asarray(lbg, dtype=np.float64)
+        self._ubg = np.asarray(ubg, dtype=np.float64)
         self._nx = int(x.size1())
-        # offsets
         self._off_Z = 0
         self._off_W = self._off_Z + (Np + 1) * (2 * K)
         self._off_U = self._off_W + (Np + 1) * nS
@@ -696,24 +850,139 @@ class FaceMillingMPC:
     # ------------------------------------------------------------------
     # numeric helpers reused for pre-screen and warm start
     # ------------------------------------------------------------------
-    def state_estimate(self, info: dict[str, Any]) -> np.ndarray:
-        """Return the modal state z = [eta; eta_dot] for the OCP initial condition.
+    def observation_measurement(self, obs: np.ndarray) -> np.ndarray:
+        """Return the normalized physical sensor measurement seen by PPO.
 
-        ``feedback='state'`` uses the environment's true modal state (idealised
-        full-state MPC baseline).  ``feedback='observer'`` reconstructs a min-norm
-        modal estimate from the physical sensor signals only,
-
-            eta_hat = Phi^+ w_sensor,   eta_dot_hat = Phi^+ wdot_sensor,
-
-        i.e. output feedback comparable to the RL policy's sensing.
+        The last two observation entries are cutter coordinates and are not part
+        of the structural EKF measurement update.
         """
-        if self.cfg.feedback == "observer" and "w_sensor" in info and "wdot_sensor" in info:
-            w = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
-            wd = np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1)
-            eta = self._Phi_pinv @ w
-            etad = self._Phi_pinv @ wd
-            return np.concatenate([eta, etad])
-        return _deinterleave(info["x_modal"], self.K)
+        arr = np.asarray(obs, dtype=np.float64).reshape(-1)
+        need = 2 * self.nS + 2
+        if arr.size < need:
+            raise ValueError(f"Expected observation length at least {need}, got {arr.size}")
+        y = arr[: 2 * self.nS].copy()
+        if not np.all(np.isfinite(y)):
+            raise ValueError("Non-finite physical sensor observation")
+        return y
+
+    def observed_cutter_position(self, obs: np.ndarray) -> tuple[float, float]:
+        """Recover cutter coordinates from the same normalized observation as PPO."""
+        arr = np.asarray(obs, dtype=np.float64).reshape(-1)
+        need = 2 * self.nS + 2
+        if arr.size < need:
+            raise ValueError(f"Expected observation length at least {need}, got {arr.size}")
+        xc = float(np.clip(arr[2 * self.nS], 0.0, 1.0) * self.plant.L1)
+        yc = float(np.clip(arr[2 * self.nS + 1], 0.0, 1.0) * self.plant.L2)
+        return xc, yc
+
+    def phiz_from_observation(self, obs: np.ndarray) -> np.ndarray:
+        xc, yc = self.observed_cutter_position(obs)
+        return self.phiz_at(xc, yc)
+
+    def _static_sensor_reconstruction(self, obs: np.ndarray) -> np.ndarray:
+        """Minimum-norm modal reconstruction used for initialization/ablation."""
+        y = self.observation_measurement(obs)
+        w = y[: self.nS] * self.w_obs_scale
+        wd = y[self.nS :] * self.wdot_obs_scale
+        eta = self._Phi_pinv @ w
+        etad = self._Phi_pinv @ wd
+        return np.concatenate([eta, etad])
+
+    def initialize_feedback(
+        self, obs: np.ndarray, info: dict[str, Any] | None = None
+    ) -> np.ndarray:
+        """Initialize the selected feedback path at episode reset.
+
+        The fair default (EKF) and the static observer use only ``obs``.  The
+        hidden modal state in ``info`` is accessed only when the user explicitly
+        requests the oracle ``state`` ablation.
+        """
+        if self.cfg.feedback == "state":
+            if info is None or "x_modal" not in info:
+                raise RuntimeError("feedback='state' requires info['x_modal']")
+            return _deinterleave(info["x_modal"], self.K)
+
+        z0 = self._static_sensor_reconstruction(obs)
+        if self.cfg.feedback == "observer":
+            return z0
+
+        self._ekf_x = z0 / self.Dz
+        self._ekf_P = self._P0_ekf.copy()
+        return z0
+
+    def update_feedback(
+        self,
+        obs: np.ndarray,
+        u_phys: np.ndarray,
+        phiz_step: np.ndarray,
+        wz_del: float,
+        ap_fixed: float,
+        info: dict[str, Any] | None = None,
+    ) -> np.ndarray:
+        """Advance and correct the sensor-based modal-state estimate.
+
+        For EKF feedback, CasADi supplies the exact Jacobian of the nonlinear
+        discrete RK4 map.  The update is carried out in scaled modal coordinates
+        to avoid ill-conditioning between displacement and velocity units.
+        """
+        if self.cfg.feedback == "state":
+            if info is None or "x_modal" not in info:
+                raise RuntimeError("feedback='state' requires info['x_modal']")
+            return _deinterleave(info["x_modal"], self.K)
+        if self.cfg.feedback == "observer":
+            return self._static_sensor_reconstruction(obs)
+        if self._ekf_x is None or self._ekf_P is None:
+            return self.initialize_feedback(obs, info)
+
+        u_full = np.asarray(u_phys, dtype=np.float64).reshape(-1)
+        u_model = u_full[: self.nu]
+        z_prev = self.Dz * self._ekf_x
+        try:
+            z_pred = np.asarray(
+                self._F(z_prev, u_model, float(wz_del), phiz_step,
+                        float(ap_fixed), self.S0, self.S1),
+                dtype=np.float64,
+            ).reshape(-1)
+            A_phys = np.asarray(
+                self._A_F(z_prev, u_model, float(wz_del), phiz_step,
+                          float(ap_fixed), self.S0, self.S1),
+                dtype=np.float64,
+            )
+            A_scaled = (A_phys * self.Dz[None, :]) / self.Dz[:, None]
+            x_pred = z_pred / self.Dz
+            P_pred = A_scaled @ self._ekf_P @ A_scaled.T + self._Q_ekf
+
+            y = self.observation_measurement(obs)
+            innovation = y - self._H_ekf @ x_pred
+            S = self._H_ekf @ P_pred @ self._H_ekf.T + self._R_ekf
+            PHt = P_pred @ self._H_ekf.T
+            gain = np.linalg.solve(S, PHt.T).T
+            x_new = x_pred + gain @ innovation
+
+            I = np.eye(2 * self.K)
+            IKH = I - gain @ self._H_ekf
+            P_new = IKH @ P_pred @ IKH.T + gain @ self._R_ekf @ gain.T
+            P_new = 0.5 * (P_new + P_new.T)
+            eigval, eigvec = np.linalg.eigh(P_new)
+            eigval = np.clip(eigval, 1.0e-12, 1.0e6)
+            P_new = (eigvec * eigval) @ eigvec.T
+
+            if not (np.all(np.isfinite(x_new)) and np.all(np.isfinite(P_new))):
+                raise FloatingPointError("non-finite EKF state or covariance")
+            x_new = np.clip(x_new, -100.0, 100.0)
+            self._ekf_x = x_new
+            self._ekf_P = P_new
+            self._ekf_last_innovation_norm = float(np.linalg.norm(innovation))
+            self._ekf_last_nis = float(innovation @ np.linalg.solve(S, innovation))
+            return self.Dz * x_new
+        except Exception:
+            # A measurement-only reset is safer than falling back to hidden state.
+            z_reset = self._static_sensor_reconstruction(obs)
+            self._ekf_x = z_reset / self.Dz
+            self._ekf_P = self._P0_ekf.copy()
+            self._ekf_last_innovation_norm = float("inf")
+            self._ekf_last_nis = float("inf")
+            return z_reset
 
     def phiz_at(self, xc: float, yc: float) -> np.ndarray:
         """Evaluate z-projection mode shapes at cutter point (numeric, K,)."""
@@ -727,16 +996,190 @@ class FaceMillingMPC:
 
     @staticmethod
     def _interp_buffer(buf: np.ndarray, pos: float) -> float:
-        """Linear interpolation of buf at real index pos (clamped)."""
-        n = buf.size
-        if n == 0:
+        """Linear interpolation helper retained for diagnostics/tests."""
+        arr = np.asarray(buf, dtype=np.float64).reshape(-1)
+        if arr.size == 0:
             return 0.0
-        p = float(np.clip(pos, 0.0, n - 1))
+        p = float(np.clip(pos, 0.0, arr.size - 1))
         i0 = int(np.floor(p))
-        if i0 >= n - 1:
-            return float(buf[-1])
-        a = p - i0
-        return float((1.0 - a) * buf[i0] + a * buf[i0 + 1])
+        if i0 >= arr.size - 1:
+            return float(arr[-1])
+        alpha = p - i0
+        return float((1.0 - alpha) * arr[i0] + alpha * arr[i0 + 1])
+
+    def _delay_value_numeric(self, timeline: np.ndarray, delay_samples: float) -> float:
+        """Causal smooth delayed-value interpolation used by numeric rollouts."""
+        values = np.asarray(timeline, dtype=np.float64).reshape(-1)
+        if values.size == 0:
+            return 0.0
+        current_idx = values.size - 1
+        pos = current_idx - float(delay_samples)
+        idx = np.arange(values.size, dtype=np.float64)
+        d = (idx - pos) / float(self.cfg.delay_sigma)
+        weights = np.exp(np.clip(-(d * d), -745.0, 0.0))
+        denom = float(np.sum(weights))
+        if not np.isfinite(denom) or denom <= 1.0e-300:
+            return self._interp_buffer(values, pos)
+        return float(np.dot(weights, values) / denom)
+
+    def _phys_from_norm(self, un: np.ndarray, ap_fixed: float) -> np.ndarray:
+        un = np.asarray(un, dtype=np.float64).reshape(-1)
+        omega = self.omega_min + 0.5 * (un[0] + 1.0) * (
+            self.omega_max - self.omega_min
+        )
+        if self.nu == 2:
+            ap = self.ap_min + 0.5 * (un[1] + 1.0) * (
+                self.ap_max - self.ap_min
+            )
+        else:
+            ap = float(ap_fixed)
+        return np.array([omega, ap], dtype=np.float64)
+
+    def project_physical_action(
+        self, u_phys: np.ndarray, u_prev: np.ndarray
+    ) -> np.ndarray:
+        """Emergency projection onto bounds and first-move increment limits."""
+        u = np.asarray(u_phys, dtype=np.float64).reshape(-1).copy()
+        prev = np.asarray(u_prev, dtype=np.float64).reshape(-1)
+        u[0] = np.clip(
+            u[0],
+            max(self.omega_min, prev[0] - self.cfg.omega_slew),
+            min(self.omega_max, prev[0] + self.cfg.omega_slew),
+        )
+        if self.nu == 2:
+            u[1] = np.clip(
+                u[1],
+                max(self.ap_min, prev[1] - self.cfg.ap_down_slew),
+                min(self.ap_max, prev[1] + self.cfg.ap_up_slew),
+            )
+        return u
+
+    def _project_un_plan(self, U: np.ndarray, un_prev: np.ndarray) -> np.ndarray:
+        """Sequentially project a normalized plan onto all hard slew limits."""
+        plan = np.asarray(U, dtype=np.float64).reshape(self.Np, self.nu).copy()
+        prev = np.asarray(un_prev, dtype=np.float64).reshape(self.nu)
+        for k in range(self.Np):
+            plan[k, 0] = np.clip(
+                plan[k, 0],
+                max(-1.0, prev[0] - self.du_omega_norm),
+                min(1.0, prev[0] + self.du_omega_norm),
+            )
+            if self.nu == 2:
+                plan[k, 1] = np.clip(
+                    plan[k, 1],
+                    max(-1.0, prev[1] - self.du_ap_down_norm),
+                    min(1.0, prev[1] + self.du_ap_up_norm),
+                )
+            prev = plan[k]
+        return plan
+
+    def _rollout_plan(
+        self,
+        z0: np.ndarray,
+        U_norm: np.ndarray,
+        phiz: np.ndarray,
+        wz_hist: np.ndarray,
+        ap_fixed: float,
+        un_prev: np.ndarray,
+        omega_ref: float,
+    ) -> tuple[float, np.ndarray, bool]:
+        """Roll out a complete normalized plan with the exact NMPC discretization."""
+        z = np.asarray(z0, dtype=np.float64).reshape(2 * self.K).copy()
+        phiz = np.asarray(phiz, dtype=np.float64).reshape(self.K)
+        hist = np.asarray(wz_hist, dtype=np.float64).reshape(-1)
+        if hist.size != self.nb:
+            if hist.size == 0:
+                hist = np.zeros(self.nb, dtype=np.float64)
+            elif hist.size < self.nb:
+                hist = np.pad(hist, (self.nb - hist.size, 0), mode="edge")
+            else:
+                hist = hist[-self.nb :]
+        hist = hist.copy()
+        hist[-1] = float(phiz @ z[: self.K])
+        timeline = hist.tolist()
+
+        U = self._project_un_plan(U_norm, un_prev)
+        Z = np.zeros((self.Np + 1, 2 * self.K), dtype=np.float64)
+        Z[0] = z
+        cost = 0.0
+        feasible = True
+
+        w0 = self.Phi @ z[: self.K]
+        if np.max(np.abs(w0)) > self.w_limit * (1.0 + 1.0e-9):
+            feasible = False
+        if self.wdot_limit is not None:
+            wd0 = self.Phi @ z[self.K :]
+            if np.max(np.abs(wd0)) > self.wdot_limit * (1.0 + 1.0e-9):
+                feasible = False
+        slack0 = np.maximum(np.abs(w0) / self.S_w - self.w_lim_margin, 0.0)
+        cost += self.cfg.slack_weight * float(np.sum(slack0))
+
+        prev = np.asarray(un_prev, dtype=np.float64).reshape(self.nu)
+        for k in range(self.Np):
+            un = U[k]
+            dom = float(un[0] - prev[0])
+            cost += self.cfg.omega_rate_weight * dom * dom
+            if abs(dom) > self.du_omega_norm + 1.0e-9:
+                feasible = False
+            if self.nu == 2:
+                dap = float(un[1] - prev[1])
+                cost += self.cfg.ap_rate_weight * dap * dap
+                if dap > self.du_ap_up_norm + 1.0e-9 or dap < -self.du_ap_down_norm - 1.0e-9:
+                    feasible = False
+            prev = un
+
+            u_phys_full = self._phys_from_norm(un, ap_fixed)
+            u_model = u_phys_full if self.nu == 2 else u_phys_full[:1]
+            om = float(u_phys_full[0])
+            for _ in range(int(self.cfg.control_hold)):
+                if self.cfg.delay_mode == "predictive":
+                    nd = 2.0 * np.pi / (
+                        self.Nteeth * max(om, 1.0e-12) * self.env_control_dt
+                    )
+                else:
+                    nd = 2.0 * np.pi / (
+                        self.Nteeth * max(float(omega_ref), 1.0e-12) * self.env_control_dt
+                    )
+                wz_del = self._delay_value_numeric(np.asarray(timeline), nd)
+
+                if self.fz_limit is not None:
+                    fz = float(
+                        np.asarray(
+                            self._Fz(
+                                z, u_model, wz_del, phiz, ap_fixed, self.S0, self.S1
+                            )
+                        ).reshape(-1)[0]
+                    )
+                    if abs(fz) > self.fz_limit * (1.0 + 1.0e-9):
+                        feasible = False
+
+                z = np.asarray(
+                    self._F(z, u_model, wz_del, phiz, ap_fixed, self.S0, self.S1),
+                    dtype=np.float64,
+                ).reshape(-1)
+                if not np.all(np.isfinite(z)):
+                    return float("inf"), Z, False
+                cost += float(
+                    np.asarray(self._L(z, u_model, ap_fixed), dtype=np.float64).reshape(-1)[0]
+                )
+
+                w = self.Phi @ z[: self.K]
+                if np.max(np.abs(w)) > self.w_limit * (1.0 + 1.0e-9):
+                    feasible = False
+                if self.wdot_limit is not None:
+                    wd = self.Phi @ z[self.K :]
+                    if np.max(np.abs(wd)) > self.wdot_limit * (1.0 + 1.0e-9):
+                        feasible = False
+                timeline.append(float(phiz @ z[: self.K]))
+
+            Z[k + 1] = z
+            slack = np.maximum(np.abs(self.Phi @ z[: self.K]) / self.S_w - self.w_lim_margin, 0.0)
+            cost += self.cfg.slack_weight * float(np.sum(slack))
+
+        cost += float(np.asarray(self._Lterm(z), dtype=np.float64).reshape(-1)[0])
+        if not np.isfinite(cost):
+            feasible = False
+        return float(cost), Z, bool(feasible)
 
     def _rollout_cost(
         self,
@@ -746,36 +1189,15 @@ class FaceMillingMPC:
         phiz: np.ndarray,
         wz_hist: np.ndarray,
         ap_fixed: float,
-    ) -> tuple[float, np.ndarray]:
-        """Roll the discrete model under constant (omega, ap); return (cost, Z traj)."""
-        K, Np, nb = self.K, self.Np, self.nb
-        z = np.asarray(z0, dtype=np.float64).reshape(-1).copy()
-        u = np.array([omega, ap], dtype=np.float64) if self.nu == 2 else np.array([omega])
-        buf = np.concatenate([np.asarray(wz_hist, dtype=np.float64).reshape(-1),
-                              [float(phiz @ z[0:K])]])
-        Ztraj = np.zeros((Np + 1, 2 * K), dtype=np.float64)
-        Ztraj[0] = z
-        cost = 0.0
-        two_pi = 2.0 * np.pi
-        thr = self.w_lim_margin * self.w_limit
-        for k in range(Np):
-            nd = two_pi / (self.Nteeth * max(omega, 1e-9) * self.Ts)
-            pos = (nb + k) - nd
-            wz_del = self._interp_buffer(buf, pos)
-            z = np.asarray(
-                self._F(z, u, wz_del, phiz, ap_fixed, self.S0, self.S1)
-            ).reshape(-1)
-            Ztraj[k + 1] = z
-            buf = np.append(buf, float(phiz @ z[0:K]))
-            cost += float(np.asarray(self._L(z, u, ap_fixed)).reshape(-1)[0])
-            # safe-region penalty (mirror the NLP soft constraint so the global
-            # pre-screen prefers productive *and* safe operating points)
-            w = self.Phi @ z[0:K]
-            slack = np.maximum(np.abs(w) - thr, 0.0) / self.S_w
-            cost += self.cfg.slack_weight * float(np.sum(slack))
-        # terminal cost (consistent with the NLP objective)
-        cost += float(np.asarray(self._Lterm(z)).reshape(-1)[0])
-        return cost, Ztraj
+        u_prev: np.ndarray,
+    ) -> tuple[float, np.ndarray, bool]:
+        """Roll out a constant physically reachable candidate control."""
+        u_phys = np.array([omega, ap], dtype=np.float64)[: self.nu]
+        un = self._norm_from_phys(u_phys)
+        U = np.tile(un, (self.Np, 1))
+        return self._rollout_plan(
+            z0, U, phiz, wz_hist, ap_fixed, self._norm_from_phys(u_prev), omega
+        )
 
     def _prescreen(
         self,
@@ -784,90 +1206,236 @@ class FaceMillingMPC:
         wz_hist: np.ndarray,
         ap_fixed: float,
         u_prev: np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Grid search over spindle speed (and ap in first mode) for a warm start.
+    ) -> tuple[np.ndarray, np.ndarray, float, np.ndarray]:
+        """Vectorized, slew-feasible grid search for a robust primal warm start."""
+        prev = np.asarray(u_prev, dtype=np.float64).reshape(-1)
+        om_lo = max(self.omega_min, prev[0] - self.cfg.omega_slew)
+        om_hi = min(self.omega_max, prev[0] + self.cfg.omega_slew)
+        om_grid = np.linspace(om_lo, om_hi, int(self.cfg.prescreen_n_omega))
 
-        Returns the best constant control and its state rollout.
-
-        Vectorized: all n_screen candidate rollouts are propagated together
-        using CasADi's ``.map()`` (Np batched calls instead of Np*n_screen
-        individual calls), which finds the same argmin as the original
-        sequential double loop (same cost values, same first-minimum
-        tie-break). The winning candidate's trajectory is then recomputed
-        with the original scalar ``_rollout_cost`` so the returned (u, Z) is
-        byte-identical to what the unvectorized version would have returned.
-        """
-        om_grid = np.linspace(self.omega_min, self.omega_max, self.cfg.prescreen_n_omega)
         if self.nu == 2:
-            # Quadratic spacing concentrates candidates at low ap, where the
-            # safe cutting envelope lives (large ap breaches the displacement
-            # limit); the high-ap tail is still sampled but sparsely.
-            ap_lo = max(self.ap_min, 0.0)
-            frac = np.linspace(0.0, 1.0, self.cfg.prescreen_n_ap) ** 2
-            ap_grid = ap_lo + frac * (self.ap_max - ap_lo)
+            ap_lo = max(self.ap_min, prev[1] - self.cfg.ap_down_slew)
+            ap_hi = min(self.ap_max, prev[1] + self.cfg.ap_up_slew)
+            frac = np.linspace(0.0, 1.0, int(self.cfg.prescreen_n_ap)) ** 2
+            ap_grid = ap_lo + frac * (ap_hi - ap_lo)
         else:
-            ap_grid = np.array([ap_fixed], dtype=np.float64)
+            ap_grid = np.array([float(ap_fixed)], dtype=np.float64)
 
-        # Flatten in the same (om outer, ap inner) order as the original
-        # nested loop, so argmin ties break identically.
         om_mesh, ap_mesh = np.meshgrid(om_grid, ap_grid, indexing="ij")
         om_flat = om_mesh.reshape(-1)
         ap_flat = ap_mesh.reshape(-1)
         n = om_flat.size
-        K, Np, nb = self.K, self.Np, self.nb
+        K = self.K
 
-        z_batch = np.tile(np.asarray(z0, dtype=np.float64).reshape(-1, 1), (1, n))  # (2K, n)
+        z_batch = np.tile(np.asarray(z0, dtype=np.float64).reshape(-1, 1), (1, n))
         u_batch = (
             np.vstack([om_flat, ap_flat]) if self.nu == 2 else om_flat.reshape(1, n)
         )
-        phiz_col = np.asarray(phiz, dtype=np.float64).reshape(-1, 1)  # (K,1), broadcasts
+        phiz_vec = np.asarray(phiz, dtype=np.float64).reshape(K)
+        # CasADi Function.map aggregates non-scalar inputs horizontally.
+        # Repeat the cutter mode-shape vector for every pre-screen candidate;
+        # a single Kx1 column is not dimension-compatible with a KxN mapped input.
+        phiz_batch = np.tile(phiz_vec.reshape(-1, 1), (1, n))
 
-        buflen = nb + Np + 1
-        buf_batch = np.zeros((n, buflen), dtype=np.float64)
-        buf_batch[:, :nb] = np.asarray(wz_hist, dtype=np.float64).reshape(-1)[None, :nb]
-        buf_batch[:, nb] = float(phiz.reshape(-1) @ np.asarray(z0).reshape(-1)[0:K])
+        hist = np.asarray(wz_hist, dtype=np.float64).reshape(-1)
+        if hist.size < self.nb:
+            hist = np.pad(hist, (self.nb - hist.size, 0), mode="edge" if hist.size else "constant")
+        hist = hist[-self.nb :].copy()
+        hist[-1] = float(phiz_vec @ np.asarray(z0, dtype=np.float64).reshape(-1)[:K])
+        total_micro = self.Np * int(self.cfg.control_hold)
+        buf = np.zeros((n, self.nb + total_micro), dtype=np.float64)
+        buf[:, : self.nb] = hist[None, :]
 
-        cost = np.zeros(n, dtype=np.float64)
-        two_pi = 2.0 * np.pi
-        thr = self.w_lim_margin * self.w_limit
-        for k in range(Np):
-            nd = two_pi / (self.Nteeth * np.maximum(om_flat, 1e-9) * self.Ts)
-            pos = np.clip((nb + k) - nd, 0.0, buflen - 1)
-            i0 = np.floor(pos).astype(int)
-            i1 = np.minimum(i0 + 1, buflen - 1)
-            a = pos - i0
-            rows = np.arange(n)
-            wz_del = (1.0 - a) * buf_batch[rows, i0] + a * buf_batch[rows, i1]
+        un_prev = self._norm_from_phys(prev)
+        un_batch = np.vstack([
+            2.0 * (om_flat - self.omega_min) / (self.omega_max - self.omega_min) - 1.0,
+        ])
+        if self.nu == 2:
+            apn = 2.0 * (ap_flat - self.ap_min) / max(self.ap_max - self.ap_min, 1.0e-12) - 1.0
+            un_batch = np.vstack([un_batch, apn])
 
-            z_next = np.asarray(
-                self._F_map(z_batch, u_batch, wz_del.reshape(1, n), phiz_col, ap_fixed, self.S0, self.S1)
+        cost = self.cfg.omega_rate_weight * (un_batch[0] - un_prev[0]) ** 2
+        if self.nu == 2:
+            cost += self.cfg.ap_rate_weight * (un_batch[1] - un_prev[1]) ** 2
+        infeasible = np.zeros(n, dtype=bool)
+        violation_score = np.zeros(n, dtype=np.float64)
+
+        w0 = self.Phi @ z_batch[:K, :]
+        w0_ratio = np.max(np.abs(w0), axis=0) / self.w_limit
+        infeasible |= w0_ratio > 1.0 + 1.0e-9
+        violation_score = np.maximum(violation_score, np.maximum(w0_ratio - 1.0, 0.0))
+        if self.wdot_limit is not None:
+            wd0 = self.Phi @ z_batch[K:, :]
+            wd0_ratio = np.max(np.abs(wd0), axis=0) / self.wdot_limit
+            infeasible |= wd0_ratio > 1.0 + 1.0e-9
+            violation_score = np.maximum(violation_score, np.maximum(wd0_ratio - 1.0, 0.0))
+        cost += self.cfg.slack_weight * np.sum(
+            np.maximum(np.abs(w0) / self.S_w - self.w_lim_margin, 0.0), axis=0
+        )
+
+        q = 0
+        for _k in range(self.Np):
+            for _ in range(int(self.cfg.control_hold)):
+                current_idx = self.nb - 1 + q
+                if self.cfg.delay_mode == "predictive":
+                    # tau(omega) uses each candidate's own speed -> the pre-screen
+                    # sees the spindle-speed dependence of chatter stability.
+                    nd = 2.0 * np.pi / (
+                        self.Nteeth * np.maximum(om_flat, 1.0e-12) * self.env_control_dt
+                    )
+                else:
+                    # 'frozen': delay evaluated at the fixed previous applied speed
+                    # (a constant), consistent with the frozen NLP schedule which
+                    # uses omega_ref = pre-screen best.  Must NOT vary with the
+                    # candidate speed, or 'frozen' would silently behave like
+                    # 'predictive' inside the pre-screen.
+                    nd = np.full(
+                        n,
+                        2.0 * np.pi / (
+                            self.Nteeth * max(float(prev[0]), 1.0e-12) * self.env_control_dt
+                        ),
+                    )
+                pos = current_idx - nd
+                idx = np.arange(current_idx + 1, dtype=np.float64)[None, :]
+                d = (idx - pos[:, None]) / float(self.cfg.delay_sigma)
+                weights = np.exp(np.clip(-(d * d), -745.0, 0.0))
+                wz_del = np.sum(weights * buf[:, : current_idx + 1], axis=1) / (
+                    np.sum(weights, axis=1) + 1.0e-300
+                )
+
+                if self.fz_limit is not None:
+                    fz = np.asarray(
+                        self._Fz_map(
+                            z_batch,
+                            u_batch,
+                            wz_del.reshape(1, n),
+                            phiz_batch,
+                            ap_fixed,
+                            self.S0,
+                            self.S1,
+                        ),
+                        dtype=np.float64,
+                    ).reshape(-1)
+                    fz_ratio = np.abs(fz) / self.fz_limit
+                    infeasible |= fz_ratio > 1.0 + 1.0e-9
+                    violation_score = np.maximum(
+                        violation_score, np.maximum(fz_ratio - 1.0, 0.0)
+                    )
+
+                z_next = np.asarray(
+                    self._F_map(
+                        z_batch,
+                        u_batch,
+                        wz_del.reshape(1, n),
+                        phiz_batch,
+                        ap_fixed,
+                        self.S0,
+                        self.S1,
+                    ),
+                    dtype=np.float64,
+                )
+                stage = np.asarray(
+                    self._L_map(z_next, u_batch, ap_fixed), dtype=np.float64
+                ).reshape(-1)
+                cost += stage
+                infeasible |= ~np.all(np.isfinite(z_next), axis=0)
+
+                w = self.Phi @ z_next[:K, :]
+                w_ratio = np.max(np.abs(w), axis=0) / self.w_limit
+                infeasible |= w_ratio > 1.0 + 1.0e-9
+                violation_score = np.maximum(
+                    violation_score, np.maximum(w_ratio - 1.0, 0.0)
+                )
+                if self.wdot_limit is not None:
+                    wd = self.Phi @ z_next[K:, :]
+                    wd_ratio = np.max(np.abs(wd), axis=0) / self.wdot_limit
+                    infeasible |= wd_ratio > 1.0 + 1.0e-9
+                    violation_score = np.maximum(
+                        violation_score, np.maximum(wd_ratio - 1.0, 0.0)
+                    )
+
+                z_batch = z_next
+                q += 1
+                buf[:, self.nb - 1 + q] = phiz_vec @ z_batch[:K, :]
+
+            cost += self.cfg.slack_weight * np.sum(
+                np.maximum(np.abs(self.Phi @ z_batch[:K, :]) / self.S_w - self.w_lim_margin, 0.0),
+                axis=0,
             )
-            stage_cost = np.asarray(self._L_map(z_next, u_batch, ap_fixed)).reshape(-1)
 
-            w_batch = self.Phi @ z_next[0:K, :]  # (nS, n)
-            slack = np.maximum(np.abs(w_batch) - thr, 0.0) / self.S_w
-            cost += stage_cost + self.cfg.slack_weight * np.sum(slack, axis=0)
+        cost += np.asarray(self._Lterm_map(z_batch), dtype=np.float64).reshape(-1)
+        finite_cost = np.isfinite(cost)
+        feasible_cost = np.where(finite_cost & ~infeasible, cost, np.inf)
 
-            z_batch = z_next
-            buf_batch[:, nb + k + 1] = phiz.reshape(-1) @ z_batch[0:K, :]
+        if np.any(np.isfinite(feasible_cost)):
+            winner = int(np.argmin(feasible_cost))
+        else:
+            # No hard-feasible grid point was found.  Choose the reachable
+            # candidate with the smallest predicted normalized violation; use
+            # objective value only as a tie-break.  The solver may still recover
+            # feasibility, and the returned fallback is safer than blindly
+            # repeating the previous command.
+            safe_score = np.where(finite_cost, violation_score, np.inf)
+            if not np.any(np.isfinite(safe_score)):
+                fallback = self.project_physical_action(
+                    np.array([prev[0], prev[1] if self.nu == 2 else ap_fixed]), prev
+                )
+                un = self._norm_from_phys(fallback[: self.nu])
+                U = np.tile(un, (self.Np, 1))
+                c, Z, _ = self._rollout_plan(
+                    z0, U, phiz, wz_hist, ap_fixed, un_prev, float(fallback[0])
+                )
+                return fallback[: self.nu], Z, c, U
+            min_violation = float(np.min(safe_score))
+            candidates = np.flatnonzero(
+                np.isclose(safe_score, min_violation, rtol=1.0e-10, atol=1.0e-12)
+            )
+            winner = int(candidates[np.argmin(cost[candidates])])
+        best_phys = np.array([om_flat[winner], ap_flat[winner]], dtype=np.float64)
+        best_decision_phys = best_phys[: self.nu]
+        best_un = self._norm_from_phys(best_decision_phys)
+        U = np.tile(best_un, (self.Np, 1))
+        best_cost, best_Z, _ = self._rollout_plan(
+            z0, U, phiz, wz_hist, ap_fixed, un_prev, float(best_phys[0])
+        )
+        return best_decision_phys, best_Z, best_cost, U
 
-        cost += np.asarray(self._Lterm_map(z_batch)).reshape(-1)
+    def _pack_initial_guess(self, Z: np.ndarray, U: np.ndarray) -> np.ndarray:
+        """Pack a simulated state/control plan into the NLP decision vector."""
+        Z = np.asarray(Z, dtype=np.float64).reshape(self.Np + 1, 2 * self.K)
+        U = np.asarray(U, dtype=np.float64).reshape(self.Np, self.nu)
+        x0 = np.zeros(self._nx, dtype=np.float64)
+        x0[self._off_Z : self._off_W] = (Z / self.Dz[None, :]).reshape(-1)
+        W = (self.Phi @ Z[:, : self.K].T).T / self.S_w
+        x0[self._off_W : self._off_U] = np.clip(W, -1.0, 1.0).reshape(-1)
+        x0[self._off_U : self._off_S] = np.clip(U, -1.0, 1.0).reshape(-1)
+        slack = np.maximum(np.abs(W) - self.w_lim_margin, 0.0)
+        slack = np.clip(slack, 0.0, max(1.0 - self.w_lim_margin, 0.0))
+        x0[self._off_S :] = slack.reshape(-1)
+        return np.clip(x0, self._lbx, self._ubx)
 
-        finite = np.isfinite(cost)
-        if not np.any(finite):
-            best_u = np.array([self.omega_min, ap_fixed])[: self.nu]
-            best_Z = np.tile(z0, (Np + 1, 1))
-            return best_u, best_Z
-
-        cost_masked = np.where(finite, cost, np.inf)
-        winner = int(np.argmin(cost_masked))
-        om_win, ap_win = float(om_flat[winner]), float(ap_flat[winner])
-
-        # Recompute the winner with the original scalar path for a
-        # byte-identical (cost, Ztraj) pair.
-        _, best_Z = self._rollout_cost(z0, om_win, ap_win, phiz, wz_hist, ap_fixed)
-        best_u = np.array([om_win, ap_win], dtype=np.float64)[: self.nu]
-        return best_u, best_Z
+    def _constraint_violation(self, x: np.ndarray, p: np.ndarray) -> float:
+        """Return the maximum violation of variable and nonlinear bounds."""
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+        if x.size != self._nx or not np.all(np.isfinite(x)):
+            return float("inf")
+        gval = np.asarray(self._g_fun(x, p), dtype=np.float64).reshape(-1)
+        if not np.all(np.isfinite(gval)):
+            return float("inf")
+        violations = [0.0]
+        finite = np.isfinite(self._lbx)
+        if np.any(finite):
+            violations.append(float(np.max(np.maximum(self._lbx[finite] - x[finite], 0.0))))
+        finite = np.isfinite(self._ubx)
+        if np.any(finite):
+            violations.append(float(np.max(np.maximum(x[finite] - self._ubx[finite], 0.0))))
+        finite = np.isfinite(self._lbg)
+        if np.any(finite):
+            violations.append(float(np.max(np.maximum(self._lbg[finite] - gval[finite], 0.0))))
+        finite = np.isfinite(self._ubg)
+        if np.any(finite):
+            violations.append(float(np.max(np.maximum(gval[finite] - self._ubg[finite], 0.0))))
+        return max(violations)
 
     # ------------------------------------------------------------------
     # solve one OCP
@@ -880,109 +1448,191 @@ class FaceMillingMPC:
         ap_fixed: float,
         u_prev: np.ndarray,
     ) -> dict[str, Any]:
-        """Solve the OCP at the current state; return first control and diagnostics.
+        """Solve one finite-horizon OCP and return a verified first action."""
+        z_meas = np.asarray(z_meas, dtype=np.float64).reshape(2 * self.K)
+        phiz = np.asarray(phiz, dtype=np.float64).reshape(self.K)
+        u_prev = np.asarray(u_prev, dtype=np.float64).reshape(self.nu)
+        hist = np.asarray(wz_hist, dtype=np.float64).reshape(-1)
+        if hist.size == 0:
+            hist = np.full(self.nb, float(phiz @ z_meas[: self.K]))
+        elif hist.size < self.nb:
+            hist = np.pad(hist, (self.nb - hist.size, 0), mode="edge")
+        else:
+            hist = hist[-self.nb :]
+        hist = hist.copy()
+        hist[-1] = float(phiz @ z_meas[: self.K])
 
-        Parameters
-        ----------
-        z_meas : (2K,) modal state in block layout [eta ; eta_dot].
-        phiz   : (K,) z-mode shapes at the current cutter point.
-        wz_hist: (nb,) past transverse displacement at cutter (oldest..newest).
-        ap_fixed: fixed axial depth (second mode); ignored bound-wise in first mode.
-        u_prev : (nu,) previously applied physical control.
-        """
-        K, Np, nS, nu, nb = self.K, self.Np, self.nS, self.nu, self.nb
-        z_meas = np.asarray(z_meas, dtype=np.float64).reshape(-1)
-        phiz = np.asarray(phiz, dtype=np.float64).reshape(-1)
-        wz_hist = np.asarray(wz_hist, dtype=np.float64).reshape(-1)
-        u_prev = np.asarray(u_prev, dtype=np.float64).reshape(-1)
-
-        # global warm start from the pre-screen (physical rollout)
-        u_ws, Z_ws = self._prescreen(z_meas, phiz, wz_hist, ap_fixed, u_prev)
-        un_ws = self._norm_from_phys(u_ws)
         un_prev = self._norm_from_phys(u_prev)
-
-        # build scaled/normalised initial guess vector
-        x0 = np.zeros(self._nx, dtype=np.float64)
-        Zs_ws = Z_ws / self.Dz[None, :]                       # (Np+1, 2K) scaled
-        x0[self._off_Z : self._off_Z + (Np + 1) * (2 * K)] = Zs_ws.reshape(-1)
-        Ws_ws = (self.Phi @ Z_ws[:, 0:K].T).T / self.S_w      # (Np+1, nS) scaled
-        x0[self._off_W : self._off_W + (Np + 1) * nS] = Ws_ws.reshape(-1)
-        x0[self._off_U : self._off_U + Np * nu] = np.tile(un_ws, Np)
-        Ss_ws = np.maximum(np.abs(Ws_ws) - self.w_lim_margin, 0.0)
-        x0[self._off_S : self._off_S + (Np + 1) * nS] = Ss_ws.reshape(-1)
-
-        # NB: x0 is the pre-screen rollout, which satisfies the discretised
-        # dynamics exactly (it is a numeric integration of F), so it is a
-        # dynamics-feasible warm start.  We do NOT blend it with the previous
-        # solution because averaging two state trajectories breaks feasibility
-        # and hurts IPOPT convergence; the dual warm start (lam) is reused below.
-
-        omega_ref = float(u_ws[0])  # frozen-delay reference = pre-screen best speed
-        p = np.concatenate([
-            z_meas, phiz, wz_hist, [float(ap_fixed)], un_prev,
-            [self.S0], [self.S1], [omega_ref],
-        ])
-
-        args = dict(
-            x0=x0, p=p,
-            lbx=self._lbx, ubx=self._ubx, lbg=self._lbg, ubg=self._ubg,
+        u_ws, Z_ws, cost_ws, U_ws = self._prescreen(
+            z_meas, phiz, hist, ap_fixed, u_prev
         )
-        if self.cfg.warm_start and self._lam_g is not None:
-            args["lam_g0"] = self._lam_g
-            args["lam_x0"] = self._lam_x
+        U_init = U_ws
+        Z_init = Z_ws
+        cost_init = float(cost_ws)
+        omega_ref = float(u_ws[0])
+        warm_start_source = "prescreen"
 
-        sol = self._solver(**args)
-        stats = self._solver.stats()
-        converged = bool(stats.get("success", False))
-        status = str(stats.get("return_status", ""))
+        # Verify the fallback independently.  If the grid winner is not hard
+        # feasible, first try a physically conservative emergency plan: retain
+        # the reachable spindle command and reduce controlled axial depth toward
+        # ap_min as fast as the actuator constraint permits.  In finishing mode
+        # ap is fixed, so the least-violation reachable prescreen remains the
+        # only available fallback when no speed is predicted feasible.
+        cost_check, Z_check, fallback_verified = self._rollout_plan(
+            z_meas, U_init, phiz, hist, ap_fixed, un_prev, omega_ref
+        )
+        if fallback_verified and np.isfinite(cost_check):
+            cost_init = float(cost_check)
+            Z_init = Z_check
+        elif self.control_ap:
+            # Construct a sequentially reachable emergency plan that reduces
+            # depth toward ap_min at every decision, rather than making one
+            # decrement and then holding that still-high depth for the horizon.
+            U_emergency = np.zeros((self.Np, self.nu), dtype=np.float64)
+            emergency_prev = np.asarray(u_prev, dtype=np.float64).copy()
+            emergency_phys = emergency_prev.copy()
+            for kk in range(self.Np):
+                target = np.array([float(emergency_prev[0]), self.ap_min], dtype=np.float64)
+                emergency_phys = self.project_physical_action(target, emergency_prev)
+                U_emergency[kk] = self._norm_from_phys(emergency_phys)
+                emergency_prev = emergency_phys.copy()
+            cost_emergency, Z_emergency, emergency_verified = self._rollout_plan(
+                z_meas,
+                U_emergency,
+                phiz,
+                hist,
+                ap_fixed,
+                un_prev,
+                float(self._phys_from_norm(U_emergency[0], ap_fixed)[0]),
+            )
+            if emergency_verified and np.isfinite(cost_emergency):
+                U_init = U_emergency
+                Z_init = Z_emergency
+                cost_init = float(cost_emergency)
+                omega_ref = float(emergency_phys[0])
+                warm_start_source = "verified_emergency_low_depth"
+                fallback_verified = True
+            else:
+                fallback_verified = False
+        else:
+            fallback_verified = False
 
-        xopt = np.asarray(sol["x"], dtype=np.float64).reshape(-1)
-        obj = float(np.asarray(sol["f"]).reshape(-1)[0])
-        # IPOPT returns the best (primal-feasible) iterate even when it stops at
-        # the iteration cap or the "acceptable" level.  With the soft safe-region
-        # slacks the problem is always feasible, so we use that iterate unless it
-        # is numerically invalid.  This makes the receding-horizon controller
-        # robust to the loose dual-feasibility tolerance of this nonconvex NLP.
-        usable = (
-            np.all(np.isfinite(xopt))
+        # Shift the previous control sequence and re-simulate it from the new
+        # measurement.  Select it only when it is feasible and has a lower
+        # predicted cost than the reachable pre-screen candidate.
+        if self.cfg.warm_start and self._U_last is not None:
+            U_shift = np.vstack([self._U_last[1:], self._U_last[-1:]])
+            U_shift = self._project_un_plan(U_shift, un_prev)
+            omega_ref_shift = float(self._phys_from_norm(U_shift[0], ap_fixed)[0])
+            cost_shift, Z_shift, feasible_shift = self._rollout_plan(
+                z_meas,
+                U_shift,
+                phiz,
+                hist,
+                ap_fixed,
+                un_prev,
+                omega_ref_shift,
+            )
+            if feasible_shift and np.isfinite(cost_shift) and (
+                not np.isfinite(cost_init) or cost_shift <= cost_init
+            ):
+                U_init = U_shift
+                Z_init = Z_shift
+                cost_init = float(cost_shift)
+                omega_ref = omega_ref_shift
+                warm_start_source = "shifted_previous"
+                fallback_verified = True
+
+        x0 = self._pack_initial_guess(Z_init, U_init)
+        p_vec = np.concatenate(
+            [
+                z_meas,
+                phiz,
+                hist,
+                [float(ap_fixed)],
+                un_prev,
+                [self.S0],
+                [self.S1],
+                [omega_ref],
+            ]
+        )
+
+        converged = False
+        status = "solver_not_run"
+        iterations = -1
+        solver_exception: str | None = None
+        xopt: np.ndarray | None = None
+        obj = float(cost_init)
+        primal_violation = float("inf")
+        solve_t0 = time.perf_counter()
+        try:
+            sol = self._solver(
+                x0=x0,
+                p=p_vec,
+                lbx=self._lbx,
+                ubx=self._ubx,
+                lbg=self._lbg,
+                ubg=self._ubg,
+            )
+            stats = self._solver.stats()
+            converged = bool(stats.get("success", False))
+            status = str(stats.get("return_status", ""))
+            iterations = int(stats.get("iter_count", -1))
+            x_candidate = np.asarray(sol["x"], dtype=np.float64).reshape(-1)
+            obj_candidate = float(np.asarray(sol["f"], dtype=np.float64).reshape(-1)[0])
+            if x_candidate.size == self._nx and np.all(np.isfinite(x_candidate)) and np.isfinite(obj_candidate):
+                xopt = x_candidate
+                obj = obj_candidate
+                primal_violation = self._constraint_violation(x_candidate, p_vec)
+        except Exception as exc:  # CasADi/IPOPT failure: use verified fallback
+            solver_exception = f"{type(exc).__name__}: {exc}"
+            status = "solver_exception"
+        solve_time = time.perf_counter() - solve_t0
+
+        feasible = bool(
+            xopt is not None
+            and np.isfinite(primal_violation)
+            and primal_violation <= float(self.cfg.primal_feas_tol)
             and np.isfinite(obj)
-            and status not in ("Infeasible_Problem_Detected", "Invalid_Number_Detected")
+            and (not np.isfinite(cost_init) or obj <= cost_init + 1.0e-8)
         )
-        if usable:
-            self._x_guess = xopt.copy()
-            self._lam_g = np.asarray(sol["lam_g"], dtype=np.float64).reshape(-1)
-            self._lam_x = np.asarray(sol["lam_x"], dtype=np.float64).reshape(-1)
+        fallback_used = not feasible
+
+        if feasible:
+            U_plan = xopt[self._off_U : self._off_S].reshape(self.Np, self.nu)
+            U_plan = np.clip(U_plan, -1.0, 1.0)
+            self._U_last = U_plan.copy()
         else:
-            # reset the dual warm start so a bad solve does not cascade into the
-            # next one; the next solve restarts cleanly from the pre-screen point.
-            self._x_guess = None
-            self._lam_g = None
-            self._lam_x = None
+            U_plan = np.asarray(U_init, dtype=np.float64).reshape(self.Np, self.nu)
+            self._U_last = U_plan.copy()
+            obj = float(cost_init)
 
-        Un_opt = xopt[self._off_U : self._off_U + Np * nu].reshape(Np, nu)
-        un0 = Un_opt[0].copy()
-
-        if not (usable and np.all(np.isfinite(un0))):
-            # fall back to the globally best pre-screen control
-            un0 = np.asarray(un_ws, dtype=np.float64).reshape(-1)
-
-        # normalised decision -> physical [omega, ap] (inject fixed ap in 2nd mode)
-        omega = self.omega_min + 0.5 * (un0[0] + 1.0) * (self.omega_max - self.omega_min)
-        if nu == 2:
-            ap = self.ap_min + 0.5 * (un0[1] + 1.0) * (self.ap_max - self.ap_min)
-        else:
-            ap = float(ap_fixed)
-        u_phys = np.array([omega, ap], dtype=np.float64)
+        un0 = U_plan[0].copy()
+        u_full = self._phys_from_norm(un0, ap_fixed)
+        # This projection should be numerically inactive because the same limits
+        # are present in the NLP and pre-screen.  It protects the environment if
+        # a solver returns a value outside tolerance.
+        projected = self.project_physical_action(u_full, u_prev)
+        projection_norm = float(np.linalg.norm(projected - u_full, ord=np.inf))
+        u_full = projected
 
         return {
-            "u_phys": u_phys,           # [omega_rad_s, ap_mm]
-            "u_decision": un0,          # normalised decision in [-1, 1]^nu
-            "U_plan": Un_opt,
-            "cost": obj,
-            "success": bool(usable),
+            "u_phys": u_full,
+            "u_decision": un0,
+            "U_plan": U_plan,
+            "cost": float(obj),
+            "success": bool(feasible),
+            "feasible": bool(feasible),
             "converged": bool(converged),
-            "iter": int(stats.get("iter_count", -1)),
+            "fallback_used": bool(fallback_used),
+            "fallback_verified": bool(feasible or fallback_verified),
+            "warm_start_source": warm_start_source,
+            "primal_violation": float(primal_violation),
+            "iter": int(iterations),
             "return_status": status,
+            "solver_exception": solver_exception,
+            "solve_time_s": float(solve_time),
+            "safety_projection_inf_norm": projection_norm,
         }
 
     # ------------------------------------------------------------------
@@ -1061,36 +1711,43 @@ def run_episode(
     metadata: dict[str, Any],
     verbose: bool = True,
 ) -> dict[str, Any]:
-    """Run one closed-loop MPC episode and return an eval_policy-schema record."""
+    """Run one closed-loop MPC episode using environment-step delay history."""
+    if max_steps <= 0:
+        raise ValueError("max_steps must be positive")
+
     plant = env.unwrapped.plant
     K = mpc.K
     hold = int(mpc.cfg.control_hold)
+    mpc.reset()
 
     obs, reset_info = env.reset(seed=seed, options=reset_options)
-    if "x_modal" not in reset_info:
-        raise RuntimeError("Environment reset info lacks 'x_modal'; MPC needs modal state.")
-
-    z_block = mpc.state_estimate(reset_info)
-    eta0 = z_block[0:K].copy()
-
-    # fixed per-episode axial depth (second mode) read from the plant
+    obs_arr_current = np.asarray(obs, dtype=np.float64).reshape(-1)
+    z_block = mpc.initialize_feedback(obs_arr_current, reset_info)
     ap_fixed = float(getattr(plant, "_episode_ap", 0.5 * (mpc.ap_min + mpc.ap_max)))
     if mpc.control_ap:
-        ap_fixed = 0.5 * (mpc.ap_min + mpc.ap_max)  # only used as a bound reference
+        ap_fixed = 0.5 * (mpc.ap_min + mpc.ap_max)
 
-    # delay buffer of past eta (fill with initial state -> zero initial regeneration)
-    eta_hist: deque[np.ndarray] = deque([eta0.copy() for _ in range(mpc.nb)], maxlen=mpc.nb)
+    def cutter_mode_shape(obs_value: np.ndarray) -> np.ndarray:
+        # Use the normalized cutter coordinates included in the RL observation,
+        # not privileged plant kinematic state.
+        return mpc.phiz_from_observation(obs_value)
 
-    # previous physical control: start at mid speed and a SAFE low depth so the
-    # slew-limited ramp-up begins from a non-chattering operating point.
-    om_start = 0.5 * (mpc.omega_min + mpc.omega_max)
-    ap_start = mpc.ap_min + 0.01 * (mpc.ap_max - mpc.ap_min)
+    phiz0 = cutter_mode_shape(obs_arr_current)
+    wz0 = float(phiz0 @ z_block[:K])
+    # Oldest..current scalar cutter displacement, sampled at the environment
+    # control interval.  Each new value is computed with the cutter mode shape
+    # at the time that value occurred.
+    wz_hist: deque[float] = deque([wz0 for _ in range(mpc.nb)], maxlen=mpc.nb)
+
+    om_start = float(np.clip(getattr(plant, "_last_omega", mpc.omega_min),
+                             mpc.omega_min, mpc.omega_max))
+    ap_start = float(np.clip(getattr(plant, "_last_ap", ap_fixed),
+                             mpc.ap_min, mpc.ap_max))
     if mpc.control_ap:
         u_prev = np.array([om_start, ap_start], dtype=np.float64)
     else:
         u_prev = np.array([om_start], dtype=np.float64)
 
-    # trajectory logs
     times: list[float] = []
     observations: list[list[float]] = []
     physical_signals: list[list[float]] = []
@@ -1102,116 +1759,187 @@ def run_episode(
     wdot_sensor_hist: list[list[float]] = []
     reward_terms_hist: list[dict[str, Any]] = []
     process_hist: dict[str, list[float]] = {key: [] for key in PROCESS_KEYS}
-    solve_iters: list[int] = []
-    solve_success: list[bool] = []
 
-    termination_reason = None
+    solve_iters: list[int] = []
+    solve_feasible: list[bool] = []
+    solve_converged: list[bool] = []
+    fallback_used: list[bool] = []
+    fallback_verified: list[bool] = []
+    primal_violations: list[float] = []
+    solve_times: list[float] = []
+    projection_sizes: list[float] = []
+    solve_statuses: list[str] = []
+
+    # EKF observer diagnostics (per environment step).  The estimate and the true
+    # modal state are both recorded so post-hoc analysis can quantify the observer
+    # error; the ground truth is used ONLY for these diagnostics, never by the
+    # controller (which sees only the RL observation).
+    ekf_innovation_norm: list[float] = []
+    ekf_nis: list[float] = []
+    ekf_estimate_hist: list[list[float]] = []
+    ekf_output_err: list[float] = []   # ||w_est - w_true|| / (||w_true|| + eps)
+    ekf_modal_err: list[float] = []    # ||eta_est - eta_true|| / (||eta_true|| + eps)
+
+    termination_reason: str | None = None
     terminated_final = False
     truncated_final = False
     pass_completed_final = False
-
-    step = 0
+    env_step = 0
+    mpc_solve_count = 0
     t0 = time.time()
-    while step < max_steps:
-        # current cutter position -> mode shapes at cutter
-        xc = float(np.clip(plant.L1 - plant._feed_distance_m - plant.x0_cutter, 0.0, plant.L1))
-        yc = float(plant.y_cutter)
-        phiz = mpc.phiz_at(xc, yc)
-        wz_hist = np.array([float(phiz @ e) for e in eta_hist], dtype=np.float64)
 
-        sol = mpc.solve(z_block, phiz, wz_hist, ap_fixed, u_prev)
+    while env_step < max_steps:
+        phiz = cutter_mode_shape(obs_arr_current)
+        sol = mpc.solve(
+            z_block,
+            phiz,
+            np.asarray(wz_hist, dtype=np.float64),
+            ap_fixed,
+            u_prev,
+        )
         u_phys = np.asarray(sol["u_phys"], dtype=np.float64).copy()
-
-        # slew-rate limit the APPLIED action (safety net covering the pre-screen
-        # fallback too): omega bounded symmetrically; depth ramps up slowly but
-        # can fall fast, so the controller never jumps to a chattering depth in a
-        # single step before the closed loop reacts to the observed vibration.
-        om_prev = float(u_prev[0])
-        u_phys[0] = float(np.clip(u_phys[0], om_prev - mpc.cfg.omega_slew,
-                                  om_prev + mpc.cfg.omega_slew))
-        if mpc.control_ap:
-            ap_prev = float(u_prev[1])
-            u_phys[1] = float(np.clip(u_phys[1], ap_prev - mpc.cfg.ap_down_slew,
-                                      ap_prev + mpc.cfg.ap_up_slew))
-
         a_norm = mpc.to_env_action(u_phys)
-        solve_iters.append(int(sol["iter"]))
-        solve_success.append(bool(sol["success"]))
+        mpc_solve_count += 1
 
-        # apply the decision for `hold` env steps (zero-order hold)
+        solve_iters.append(int(sol["iter"]))
+        solve_feasible.append(bool(sol["feasible"]))
+        solve_converged.append(bool(sol["converged"]))
+        fallback_used.append(bool(sol["fallback_used"]))
+        fallback_verified.append(bool(sol.get("fallback_verified", False)))
+        primal_violations.append(float(sol["primal_violation"]))
+        solve_times.append(float(sol["solve_time_s"]))
+        projection_sizes.append(float(sol["safety_projection_inf_norm"]))
+        solve_statuses.append(str(sol["return_status"]))
+
         done = False
         for _ in range(hold):
+            if env_step >= max_steps:
+                done = True
+                break
+
+            # Estimator prediction uses only quantities available to the controller:
+            # its applied command, the current observed cutter position, and its
+            # own estimated delayed cutter-displacement history.
+            if mpc.cfg.delay_mode == "predictive":
+                nd_est = 2.0 * np.pi / (
+                    mpc.Nteeth * max(float(u_phys[0]), 1.0e-12) * mpc.env_control_dt
+                )
+            else:
+                nd_est = 2.0 * np.pi / (
+                    mpc.Nteeth * max(float(u_prev[0]), 1.0e-12) * mpc.env_control_dt
+                )
+            wz_del_est = mpc._delay_value_numeric(
+                np.asarray(wz_hist, dtype=np.float64), nd_est
+            )
+            phiz_step = cutter_mode_shape(obs_arr_current)
+
             obs, reward, terminated, truncated, info = env.step(a_norm)
             obs_arr = np.asarray(obs, dtype=np.float64).reshape(-1)
-
             actions.append(np.asarray(a_norm, dtype=np.float64).reshape(-1).tolist())
             physical_actions.append([float(u_phys[0]), float(u_phys[1])])
             observations.append(obs_arr.tolist())
+
             if "w_sensor" in info:
-                w_sensor_hist.append(np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1).tolist())
                 wsens = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
             else:
-                wsens = np.zeros(mpc.nS)
+                wsens = np.zeros(mpc.nS, dtype=np.float64)
             if "wdot_sensor" in info:
-                wdot_sensor_hist.append(np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1).tolist())
                 wdsens = np.asarray(info["wdot_sensor"], dtype=np.float64).reshape(-1)
             else:
-                wdsens = np.zeros(mpc.nS)
+                wdsens = np.zeros(mpc.nS, dtype=np.float64)
+            w_sensor_hist.append(wsens.tolist())
+            wdot_sensor_hist.append(wdsens.tolist())
             physical_signals.append(np.concatenate([wsens, wdsens]).tolist())
+
             if "reward_terms" in info:
                 reward_terms_hist.append(dict(info["reward_terms"]))
             if "x_modal" in info:
-                x_modal_hist.append(np.asarray(info["x_modal"], dtype=np.float64).reshape(-1).tolist())
+                x_modal_hist.append(
+                    np.asarray(info["x_modal"], dtype=np.float64).reshape(-1).tolist()
+                )
             for key, val in _process_snapshot(info, plant).items():
                 process_hist[key].append(val)
             rewards.append(float(reward))
-            times.append(float(info.get("t", len(rewards) * metadata["step_dt"])))
+            times.append(float(info.get("t", (env_step + 1) * mpc.env_control_dt)))
+            env_step += 1
 
-            step += 1
+            # Update from exactly the same normalized sensor observation seen
+            # by the RL policy. Hidden modal coordinates remain diagnostics only.
+            z_block = mpc.update_feedback(
+                obs_arr, u_phys, phiz_step, wz_del_est, ap_fixed, info
+            )
+            obs_arr_current = obs_arr
+            phiz_observed = cutter_mode_shape(obs_arr_current)
+            wz_hist.append(float(phiz_observed @ z_block[:K]))
+
+            # EKF observer diagnostics (analysis only; not used for control).
+            if mpc.cfg.feedback == "ekf":
+                ekf_innovation_norm.append(float(mpc._ekf_last_innovation_norm))
+                ekf_nis.append(float(mpc._ekf_last_nis))
+                ekf_estimate_hist.append(np.asarray(z_block, dtype=np.float64).reshape(-1).tolist())
+                if "x_modal" in info:
+                    z_true = _deinterleave(info["x_modal"], K)
+                    w_true = mpc.Phi @ z_true[:K]
+                    w_est = mpc.Phi @ np.asarray(z_block[:K], dtype=np.float64)
+                    ekf_output_err.append(
+                        float(np.linalg.norm(w_est - w_true) / (np.linalg.norm(w_true) + 1e-12))
+                    )
+                    ekf_modal_err.append(
+                        float(
+                            np.linalg.norm(np.asarray(z_block[:K]) - z_true[:K])
+                            / (np.linalg.norm(z_true[:K]) + 1e-12)
+                        )
+                    )
+
             if terminated or truncated:
                 terminated_final = bool(terminated)
                 truncated_final = bool(truncated)
                 termination_reason = info.get("termination_reason")
                 pass_completed_final = bool(
-                    info.get("pass_completed") or termination_reason in PASS_COMPLETED_REASONS
+                    info.get("pass_completed")
+                    or termination_reason in PASS_COMPLETED_REASONS
                 )
                 done = True
                 break
-            if step >= max_steps:
-                done = True
-                break
 
-        # update feedback state and delay buffer
-        z_block = mpc.state_estimate(info)
-        eta_hist.append(z_block[0:K].copy())
-        u_prev = u_phys.copy() if mpc.control_ap else np.array([u_phys[0]])
-
+        u_prev = u_phys[: mpc.nu].copy()
         if done:
             break
 
+    if env_step >= max_steps and not terminated_final and not truncated_final:
+        truncated_final = True
+        termination_reason = "external_max_env_steps"
+
     wall = time.time() - t0
     if verbose:
-        succ = 100.0 * (np.mean(solve_success) if solve_success else 0.0)
+        feasible_pct = 100.0 * (np.mean(solve_feasible) if solve_feasible else 0.0)
+        conv_pct = 100.0 * (np.mean(solve_converged) if solve_converged else 0.0)
+        fallback_pct = 100.0 * (np.mean(fallback_used) if fallback_used else 0.0)
         print(
-            f"    seed {seed}: steps={len(rewards)} return={sum(rewards):.1f} "
-            f"pass={'Y' if pass_completed_final else 'N'} reason={termination_reason} "
-            f"solve_ok={succ:.0f}% wall={wall:.1f}s"
+            f"    scenario_seed {seed}: env_steps={len(rewards)} solves={mpc_solve_count} "
+            f"return={sum(rewards):.1f} pass={'Y' if pass_completed_final else 'N'} "
+            f"reason={termination_reason} feasible={feasible_pct:.0f}% "
+            f"converged={conv_pct:.0f}% fallback={fallback_pct:.0f}% wall={wall:.1f}s"
         )
 
     w_arr = np.asarray(w_sensor_hist, dtype=np.float64)
     max_abs_w = float(np.max(np.abs(w_arr))) if w_arr.size else float("nan")
     rms_w = float(np.sqrt(np.mean(w_arr**2))) if w_arr.size else float("nan")
+    finite_primal = np.asarray(primal_violations, dtype=np.float64)
+    finite_primal = finite_primal[np.isfinite(finite_primal)]
 
     record = {
         "controller": "mpc",
         "metadata": metadata,
-        "seed": int(seed),
+        "scenario_seed": int(seed),
         "reset_options": reset_options,
         "reset_info": _to_jsonable(dict(reset_info)),
         "y_line_m": _safe_float(reset_info.get("y_cutter", np.nan)),
         "x_start_m": _safe_float(reset_info.get("x_start", np.nan)),
         "x_end_target_m": _safe_float(reset_info.get("x_end", np.nan)),
-        "ap_fixed_mm": _safe_float(reset_info.get("ap_fixed_mm", ap_fixed if not mpc.control_ap else np.nan)),
+        "ap_fixed_mm": _safe_float(
+            reset_info.get("ap_fixed_mm", ap_fixed if not mpc.control_ap else np.nan)
+        ),
         "times": times,
         "observations": observations,
         "physical_signals": physical_signals,
@@ -1229,6 +1957,34 @@ def run_episode(
         "truncated": bool(truncated_final),
         "pass_completed": bool(pass_completed_final),
         "termination_reason": termination_reason,
+        "mpc_diagnostics": {
+            "iterations": solve_iters,
+            "feasible": solve_feasible,
+            "converged": solve_converged,
+            "fallback_used": fallback_used,
+            "fallback_verified": fallback_verified,
+            "primal_violation": primal_violations,
+            "solve_time_s": solve_times,
+            "safety_projection_inf_norm": projection_sizes,
+            "return_status": solve_statuses,
+            "ekf_innovation_norm": ekf_innovation_norm,
+            "ekf_nis": ekf_nis,
+            "ekf_estimate": ekf_estimate_hist,
+            "ekf_output_err": ekf_output_err,
+            "ekf_modal_err": ekf_modal_err,
+        },
+        "ekf": {
+            "feedback": mpc.cfg.feedback,
+            "n_measurements": int(2 * mpc.nS),
+            "n_states": int(2 * mpc.K),
+            "observability_rank": int(mpc.ekf_observability_rank),
+            "observability_full": bool(mpc.ekf_observability_full),
+            "process_noise_scale": float(mpc.cfg.ekf_process_noise_scale),
+            "measurement_noise_scale": float(mpc.cfg.ekf_measurement_noise_scale),
+            "mean_nis": float(np.mean(ekf_nis)) if ekf_nis else float("nan"),
+            "mean_output_err": float(np.mean(ekf_output_err)) if ekf_output_err else float("nan"),
+            "final_modal_err": float(ekf_modal_err[-1]) if ekf_modal_err else float("nan"),
+        },
         "summary": {
             "return": float(sum(rewards)),
             "length": int(len(rewards)),
@@ -1236,8 +1992,16 @@ def run_episode(
             "rms_w_m": rms_w,
             "pass_completed": bool(pass_completed_final),
             "termination_reason": termination_reason,
+            "mpc_solve_count": int(mpc_solve_count),
             "mpc_mean_solve_iters": float(np.mean(solve_iters)) if solve_iters else float("nan"),
-            "mpc_solve_success_frac": float(np.mean(solve_success)) if solve_success else 0.0,
+            "mpc_solve_feasible_frac": float(np.mean(solve_feasible)) if solve_feasible else 0.0,
+            "mpc_solve_converged_frac": float(np.mean(solve_converged)) if solve_converged else 0.0,
+            "mpc_fallback_frac": float(np.mean(fallback_used)) if fallback_used else 0.0,
+            "mpc_verified_fallback_frac": float(np.mean(fallback_verified)) if fallback_verified else 0.0,
+            "mpc_max_primal_violation": float(np.max(finite_primal)) if finite_primal.size else float("nan"),
+            "mpc_mean_solve_time_s": float(np.mean(solve_times)) if solve_times else float("nan"),
+            "mpc_p95_solve_time_s": float(np.percentile(solve_times, 95)) if solve_times else float("nan"),
+            "mpc_max_safety_projection": float(np.max(projection_sizes)) if projection_sizes else 0.0,
             "mpc_wall_time_s": float(wall),
         },
     }
@@ -1257,105 +2021,177 @@ def build_env(args: argparse.Namespace) -> gym.Env:
         dynamics_uncertainty_std=args.dynamics_uncertainty_std,
         randomize_y0=args.randomize_y0,
     )
-    if getattr(args, "w_limit", None) is not None:
-        # Relax/override the plant displacement limit (termination) and, through
-        # plant.w_limit, the MPC safe-region constraint.
+    if args.w_limit is not None:
         env_kwargs["w_limit"] = float(args.w_limit)
     return gym.make(args.env_id, **env_kwargs)
 
 
+def _load_reference_scenarios(
+    directory: Path, seed: int
+) -> list[dict[str, Any]]:
+    """Extract reset scenarios from an RL trajectory file for matched MPC tests."""
+    path = Path(directory) / f"trajectories_seed{seed}.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"Reference trajectory file not found: {path}")
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    if isinstance(data, dict):
+        data = [data]
+    if not isinstance(data, list):
+        raise ValueError(f"Reference trajectory must contain a record or list: {path}")
+
+    scenarios: list[dict[str, Any]] = []
+    for ep_idx, parent in enumerate(data):
+        if not isinstance(parent, dict):
+            continue
+        runs = parent.get("runs")
+        records = runs if isinstance(runs, list) and runs else [parent]
+        for run_idx, child in enumerate(records):
+            if not isinstance(child, dict):
+                continue
+            rec = {**parent, **child}
+            options = dict(rec.get("reset_options") or {})
+            y_line = rec.get("y_line_m", rec.get("reset_info", {}).get("y_cutter"))
+            try:
+                y_line_f = float(y_line)
+            except (TypeError, ValueError):
+                y_line_f = float("nan")
+            if "y0" not in options and np.isfinite(y_line_f):
+                options["y0"] = y_line_f
+
+            ap_val = rec.get("ap_fixed_mm", rec.get("reset_info", {}).get("ap_fixed_mm"))
+            try:
+                ap_f = float(ap_val)
+            except (TypeError, ValueError):
+                ap_f = float("nan")
+            if "ap" not in options and np.isfinite(ap_f):
+                options["ap"] = ap_f
+
+            explicit_seed = rec.get("scenario_seed", rec.get("reset_seed"))
+            scenario_seed = int(explicit_seed) if explicit_seed is not None else int(seed * 1000 + ep_idx * 100 + run_idx)
+            scenarios.append(
+                {
+                    "episode": int(ep_idx),
+                    "run_index": int(run_idx),
+                    "scenario_seed": scenario_seed,
+                    "reset_options": options or None,
+                    "reference_file": str(path),
+                }
+            )
+    return scenarios
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Nonlinear MPC (CasADi) chatter-suppression controller for face milling."
+        description="Nonlinear MPC chatter-suppression controller for face milling."
     )
     parser.add_argument(
         "--env-id",
         default="CustomODEPlate-v0",
         choices=["CustomODEPlate-v0", "CustomODEPlateFinish-v0"],
-        help=(
-            "Control mode. CustomODEPlate-v0: first-mode roughing (decision [omega, ap]). "
-            "CustomODEPlateFinish-v0: second-mode finishing (decision [omega], ap fixed)."
-        ),
     )
     parser.add_argument("--seeds", nargs="+", type=int, default=[0])
-    parser.add_argument("--n-episodes", type=int, default=1)
+    parser.add_argument(
+        "--n-episodes",
+        type=int,
+        default=None,
+        help="Episodes per seed when --match-rl-dir is not used (default: 1).",
+    )
+    parser.add_argument(
+        "--match-rl-dir",
+        default=None,
+        help="Optional RL trajectory directory. Reuse its y0/ap reset scenarios and episode layout for paired evaluation.",
+    )
     parser.add_argument("--out-dir", default="mpc_trajectories")
 
-    # timing / integration (must match training/eval to keep the plant identical)
     parser.add_argument("--dt", type=float, default=1.0e-4)
     parser.add_argument("--n-substeps", type=int, default=10)
+    parser.add_argument("--max-episode-steps", type=int, default=None)
     parser.add_argument(
-        "--max-episode-steps", type=int, default=None,
-        help="Inner env TimeLimit (env control steps). Default (None) auto-computes "
-             "from the plant's own L1/feed-rate/omega_min, same as train/eval, so it "
-             "never fires before --max-steps*--control-hold.",
+        "--max-env-steps",
+        "--max-steps",
+        dest="max_env_steps",
+        type=int,
+        default=20000,
+        help="External cap in environment control steps. --max-steps is retained as a backward-compatible alias.",
     )
     parser.add_argument(
-        "--max-steps", type=int, default=20000,
-        help="Cap on closed-loop MPC control-loop steps per episode (each step solves "
-             "one NLP). At control_hold=3, n_substeps=5 timing, 20000 steps covers a "
-             "full 0.9*L1 pass down to ~rpm 2000-3000; a full pass at low rpm needs "
-             "~1e5 steps -- raise this explicitly for low-rpm full-pass studies.",
+        "--reward",
+        default="productive",
+        choices=["dense", "productive"],
+        help="The symbolic MPC objective supports the dense/productive reward family.",
     )
-    parser.add_argument("--reward", default="dense",
-                        choices=["dense", "productive", "quadratic", "sparse"])
-    parser.add_argument(
-        "--w-limit", type=float, default=None,
-        help=("Override the environment displacement safe/termination limit [m]. "
-              "The registered value is 1e-3 m. Set e.g. --w-limit 0.1 to relax the "
-              "hard limit (|w|<=0.1) so the pass is not terminated by instability and "
-              "the full actuator/state variation is visible. Applies to the plant "
-              "termination AND the MPC safe-region constraint (which reads plant.w_limit)."),
-    )
+    parser.add_argument("--w-limit", type=float, default=None)
     parser.add_argument("--dynamics-uncertainty-std", type=float, default=0.0)
-    parser.add_argument("--randomize-y0", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--y0", type=float, default=None,
-                        help="Fix the milling line y0 [m] for every episode.")
-    parser.add_argument("--ap", type=float, default=None,
-                        help="Second-mode only: pin the fixed axial depth ap [mm].")
+    parser.add_argument(
+        "--randomize-y0", action=argparse.BooleanOptionalAction, default=True
+    )
+    parser.add_argument("--y0", type=float, default=None)
+    parser.add_argument("--ap", type=float, default=None)
 
-    # MPC settings
-    parser.add_argument("--horizon", type=int, default=32)
-    parser.add_argument("--n-rk", type=int, default=6)
-    parser.add_argument("--control-hold", type=int, default=3,
-                        help="Env control steps per MPC decision (zero-order hold).")
-    parser.add_argument("--slack-weight", type=float, default=5.0e4)
-    parser.add_argument("--omega-rate-weight", type=float, default=5.0)
-    parser.add_argument("--ap-rate-weight", type=float, default=5.0)
-    parser.add_argument("--terminal-weight", type=float, default=3.0)
+    parser.add_argument("--horizon", type=int, default=16)
+    parser.add_argument("--n-rk", type=int, default=3,
+                        help="RK4 substeps per environment control step in the prediction model.")
+    parser.add_argument("--control-hold", type=int, default=3)
+    parser.add_argument("--slack-weight", type=float, default=0.0)
+    parser.add_argument("--omega-rate-weight", type=float, default=0.0)
+    parser.add_argument("--ap-rate-weight", type=float, default=0.0)
+    parser.add_argument("--terminal-weight", type=float, default=0.0)
     parser.add_argument("--omega-slew", type=float, default=600.0,
-                        help="Max |d(omega)| applied per MPC step [rad/s] "
-                             "(range-capped to slew_frac_omega*(omega_max-omega_min)).")
+                    help="Max d(omega) per MPC update [rad/s]; range-capped so it always binds.")
     parser.add_argument("--ap-up-slew", type=float, default=0.25,
-                        help="Max depth INCREASE applied per MPC step [mm] (cautious ramp-up, range-capped).")
+                    help="Max depth INCREASE per MPC update [mm] (cautious ramp-up).")
     parser.add_argument("--ap-down-slew", type=float, default=1.5,
-                        help="Max depth DECREASE applied per MPC step [mm] (fast safety back-off, range-capped).")
+                    help="Max depth DECREASE per MPC update [mm] (fast safety back-off).")
+    parser.add_argument("--wdot-limit", type=float, default=None,
+                        help="Optional hard sensor-velocity limit [m/s]. Auto-detected from the environment when omitted.")
+    parser.add_argument("--fz-limit", type=float, default=None,
+                        help="Optional hard absolute axial-force limit [N].")
     parser.add_argument("--prescreen-n-omega", type=int, default=28)
     parser.add_argument("--prescreen-n-ap", type=int, default=7)
-    parser.add_argument("--delay-sigma", type=float, default=0.7,
-                        help="Softmax fractional-delay kernel width [Ts samples].")
-    parser.add_argument("--delay-mode", default="predictive",
-                        choices=["predictive", "frozen"],
-                        help=("'predictive': regenerative delay uses the per-node decision "
-                              "speed so omega affects chatter stability in the OCP (omega-ap "
-                              "coupling); 'frozen': delay fixed at the pre-screen speed."))
-    parser.add_argument("--w-lim-margin", type=float, default=0.8,
-                        help="Safe-region threshold as a fraction of w_limit (headroom for model error). "
-                             "0.8 widens the feasible set; at w_limit=3mm the threshold is 2.4mm, "
-                             "still ~20%% below the hard limit.")
-    parser.add_argument("--hessian", default="limited-memory",
-                        choices=["limited-memory", "exact"],
-                        help="IPOPT Hessian: limited-memory (fast) or exact (accurate, slow).")
-    parser.add_argument("--tol", type=float, default=1e-6, help="IPOPT convergence tolerance.")
+    parser.add_argument("--delay-sigma", type=float, default=0.7)
+    parser.add_argument(
+        "--delay-mode",
+        default="predictive",
+        choices=["predictive", "frozen"],
+    )
+    parser.add_argument("--w-lim-margin", type=float, default=0.7,
+                    help="Soft threshold fraction of w_limit; 0.7 keeps ~30 percent headroom "
+                         "for the averaged-model underprediction so the TRUE peak stays under w_limit.")
+    parser.add_argument(
+        "--hessian", default="limited-memory", choices=["limited-memory", "exact"]
+    )
+    parser.add_argument("--tol", type=float, default=1.0e-6)
+    parser.add_argument("--primal-feas-tol", type=float, default=1.0e-5)
     parser.add_argument("--max-iter", type=int, default=40)
-    parser.add_argument("--feedback", default="state", choices=["state", "observer"])
-    parser.add_argument("--ipopt-verbose", action="store_true",
-                        help="Print IPOPT solver output (print_level 5).")
-
+    parser.add_argument("--max-wall-time-s", type=float, default=2.0,
+                        help="Hard per-solve IPOPT computation budget [s]; the best primal "
+                             "iterate is returned at the cap so the loop never stalls.")
+    parser.add_argument("--feedback", default="ekf", choices=["ekf", "observer", "state"])
+    parser.add_argument("--ekf-process-noise-scale", type=float, default=2.0e-2,
+                        help="Scaled modal-state process-noise standard deviation per environment step.")
+    parser.add_argument("--ekf-measurement-noise-scale", type=float, default=1.0e-3,
+                        help="Normalized sensor-observation noise standard deviation.")
+    parser.add_argument("--ekf-initial-cov-scale", type=float, default=5.0e-1,
+                        help="Initial scaled-state EKF standard deviation.")
+    parser.add_argument("--ipopt-verbose", action="store_true")
     args = parser.parse_args()
 
-    if args.dt <= 0 or args.n_substeps <= 0:
-        raise SystemExit("--dt and --n-substeps must be positive.")
+    positive = {
+        "dt": args.dt,
+        "n_substeps": args.n_substeps,
+        "max_env_steps": args.max_env_steps,
+        "horizon": args.horizon,
+        "n_rk": args.n_rk,
+        "control_hold": args.control_hold,
+        "prescreen_n_omega": args.prescreen_n_omega,
+        "prescreen_n_ap": args.prescreen_n_ap,
+    }
+    for name, value in positive.items():
+        if float(value) <= 0.0:
+            raise SystemExit(f"--{name.replace('_', '-')} must be positive")
+    if args.n_episodes is not None and args.n_episodes <= 0:
+        raise SystemExit("--n-episodes must be positive")
 
     cfg = MPCConfig(
         horizon=args.horizon,
@@ -1368,6 +2204,8 @@ def main() -> int:
         omega_slew=args.omega_slew,
         ap_up_slew=args.ap_up_slew,
         ap_down_slew=args.ap_down_slew,
+        wdot_limit=args.wdot_limit,
+        fz_limit=args.fz_limit,
         prescreen_n_omega=args.prescreen_n_omega,
         prescreen_n_ap=args.prescreen_n_ap,
         delay_sigma=args.delay_sigma,
@@ -1375,81 +2213,149 @@ def main() -> int:
         w_lim_margin=args.w_lim_margin,
         hessian=args.hessian,
         tol=args.tol,
+        primal_feas_tol=args.primal_feas_tol,
         max_iter=args.max_iter,
+        max_wall_time_s=args.max_wall_time_s,
         feedback=args.feedback,
+        ekf_process_noise_scale=args.ekf_process_noise_scale,
+        ekf_measurement_noise_scale=args.ekf_measurement_noise_scale,
+        ekf_initial_cov_scale=args.ekf_initial_cov_scale,
         print_level=5 if args.ipopt_verbose else 0,
     )
 
     out_dir = Path(args.out_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
-
     env = build_env(args)
     plant = env.unwrapped.plant
 
-    # tooth-delay feasibility (same guard as eval_policy)
-    tau_min = 2.0 * np.pi / (max(int(plant.N), 1) * max(float(plant.omega_max), 1e-12))
+    tau_min = 2.0 * np.pi / (
+        max(int(plant.N), 1) * max(float(plant.omega_max), 1.0e-12)
+    )
     if float(args.dt) >= tau_min:
         env.close()
         raise SystemExit(
-            f"RK4 dt={args.dt:g}s is not smaller than the minimum tooth delay "
-            f"{tau_min:g}s. Use --dt 0.0001 --n-substeps 10."
+            f"RK4 dt={args.dt:g}s is not smaller than minimum tooth delay {tau_min:g}s"
         )
 
     mpc = FaceMillingMPC(env, cfg)
-
     metadata = plant_plot_metadata(env)
     metadata["controller"] = "mpc"
+    metadata["env_id"] = args.env_id
     metadata["reward_id"] = args.reward
+    metadata["scenario_source"] = args.match_rl_dir
     metadata["mpc"] = {
         "horizon": cfg.horizon,
-        "Ts_s": mpc.Ts,
-        "n_rk": cfg.n_rk,
+        "env_control_dt_s": mpc.env_control_dt,
+        "mpc_Ts_s": mpc.Ts,
+        "n_rk_per_env_step": cfg.n_rk,
         "control_hold": cfg.control_hold,
-        "delay_buffer_nb": mpc.nb,
-        "S0": mpc.S0,
-        "S1": mpc.S1,
+        "delay_buffer_nb_env_steps": mpc.nb,
+        "delay_mode": cfg.delay_mode,
+        "delay_sigma": cfg.delay_sigma,
         "feedback": cfg.feedback,
-        "slack_weight": cfg.slack_weight,
+        "reward_class": mpc.reward_class,
+        "w_limit": mpc.w_limit,
+        "w_inner_limit": mpc.w_lim_margin * mpc.w_limit,
+        "wdot_limit": mpc.wdot_limit,
+        "fz_limit": mpc.fz_limit,
+        "omega_slew": cfg.omega_slew,
+        "ap_up_slew": cfg.ap_up_slew,
+        "ap_down_slew": cfg.ap_down_slew,
+        "primal_feas_tol": cfg.primal_feas_tol,
         "prescreen_n_omega": cfg.prescreen_n_omega,
         "prescreen_n_ap": cfg.prescreen_n_ap,
+        "comparison_role": (
+            "sensor_ekf_output_feedback_nmpc"
+            if cfg.feedback == "ekf"
+            else (
+                "sensor_pseudoinverse_output_feedback_nmpc"
+                if cfg.feedback == "observer"
+                else "oracle_full_state_nominal_nmpc_diagnostic_only"
+            )
+        ),
+        "ekf_process_noise_scale": cfg.ekf_process_noise_scale,
+        "ekf_measurement_noise_scale": cfg.ekf_measurement_noise_scale,
+        "ekf_initial_cov_scale": cfg.ekf_initial_cov_scale,
+        "ekf_local_observability_rank": mpc.ekf_observability_rank,
+        "ekf_local_observability_state_dim": 2 * mpc.K,
+        "ekf_local_observability_full": mpc.ekf_observability_full,
+        "internal_model": "period_averaged_regenerative_modal_duffing",
+        "model_assumptions": [
+            "fixed radial immersion ae over each episode",
+            "scalar axial/transverse force projection",
+            "no process damping in the internal model",
+            "frozen cutter-point mode vector over each short prediction horizon",
+            "smooth causal fractional-delay approximation",
+            "nominal deterministic prediction; uncertainty remains in evaluation plant",
+            "default controller state is reconstructed by an EKF from the RL observation only",
+        ],
     }
 
-    mode = "second-mode finishing (omega)" if not mpc.control_ap else "first-mode roughing (omega, ap)"
-    print(f"MPC controller: {mode}")
-    print(f"  env_id={args.env_id}  Np={cfg.horizon}  n_rk={cfg.n_rk}  "
-          f"delay_buffer={mpc.nb}  feedback={cfg.feedback}")
+    mode = "finishing: omega" if not mpc.control_ap else "roughing: omega and ap"
+    print(f"MPC controller ({mode})")
+    if cfg.feedback == "ekf":
+        print("  feedback=ekf: fair sensor-based nonlinear state estimator")
+    elif cfg.feedback == "observer":
+        print("  feedback=observer: static minimum-norm sensor reconstruction ablation")
+    else:
+        print("  feedback=state: oracle diagnostic only; do not use for the main RL comparison")
     print(
-        f"  sample times: RK4 dt={args.dt*1e3:.3f} ms x n_substeps={args.n_substeps} "
-        f"= env control step {mpc.env_control_dt*1e3:.2f} ms; "
-        f"MPC Ts = control_hold({cfg.control_hold}) x {mpc.env_control_dt*1e3:.2f} ms "
-        f"= {mpc.Ts*1e3:.2f} ms; horizon = Np*Ts = {mpc.Np*mpc.Ts*1e3:.1f} ms"
+        f"  env step={mpc.env_control_dt*1e3:.3f} ms, MPC update={mpc.Ts*1e3:.3f} ms, "
+        f"horizon={mpc.Np*mpc.Ts*1e3:.1f} ms, prediction RK4 h={mpc.env_control_dt/mpc.n_rk*1e3:.4f} ms"
     )
-    print(f"  spindle {omega_to_rpm(mpc.omega_min):.0f}-{omega_to_rpm(mpc.omega_max):.0f} rpm, "
-          f"ap {mpc.ap_min:g}-{mpc.ap_max:g} mm, w_limit={mpc.w_limit:g} m "
-          f"(safe-region threshold {mpc.w_lim_margin*mpc.w_limit:g} m)")
-    print(f"  engagement S0={mpc.S0:.4f} S1={mpc.S1:.4f}  (ae={mpc.ae_default:g} mm, "
-          f"{mpc.milling_mode} milling)")
+    print(
+        f"  spindle={omega_to_rpm(mpc.omega_min):.0f}-{omega_to_rpm(mpc.omega_max):.0f} rpm, "
+        f"ap={mpc.ap_min:g}-{mpc.ap_max:g} mm, hard |w|<={mpc.w_limit:g} m, "
+        f"soft margin={mpc.w_lim_margin*mpc.w_limit:g} m"
+    )
+    print(
+        f"  hard increments: domega<={cfg.omega_slew:g} rad/s/update, "
+        f"dap=[-{cfg.ap_down_slew:g}, +{cfg.ap_up_slew:g}] mm/update; "
+        f"wdot_limit={mpc.wdot_limit}, fz_limit={mpc.fz_limit}"
+    )
     print(f"  output -> {out_dir}")
 
     for seed in args.seeds:
+        if args.match_rl_dir:
+            scenarios = _load_reference_scenarios(Path(args.match_rl_dir), seed)
+            if args.n_episodes is not None:
+                scenarios = scenarios[: args.n_episodes]
+        else:
+            count = args.n_episodes if args.n_episodes is not None else 1
+            scenarios = [
+                {
+                    "episode": ep,
+                    "run_index": 0,
+                    "scenario_seed": int(seed * 1000 + ep),
+                    "reset_options": None,
+                    "reference_file": None,
+                }
+                for ep in range(count)
+            ]
+
         trajectories: list[dict[str, Any]] = []
-        for ep in range(args.n_episodes):
-            reset_options: dict[str, Any] = {}
+        for scenario in scenarios:
+            reset_options = dict(scenario.get("reset_options") or {})
             if args.y0 is not None:
                 reset_options["y0"] = float(np.clip(args.y0, 0.0, float(plant.L2)))
-            if (args.ap is not None) and (not mpc.control_ap):
+            if args.ap is not None and not mpc.control_ap:
                 reset_options["ap"] = float(args.ap)
-            run_seed = int(seed * 1000 + ep)
-            print(f"  [seed {seed} ep {ep}] solving...")
+            scenario_seed = int(scenario["scenario_seed"])
+            ep_idx = int(scenario["episode"])
+            run_idx = int(scenario.get("run_index", 0))
+            print(f"  [seed {seed} ep {ep_idx} run {run_idx}] solving matched scenario {scenario_seed}...")
             record = run_episode(
-                env, mpc,
-                seed=run_seed,
+                env,
+                mpc,
+                seed=scenario_seed,
                 reset_options=reset_options or None,
-                max_steps=args.max_steps,
+                max_steps=args.max_env_steps,
                 metadata=metadata,
             )
-            record["episode"] = int(ep)
+            record["episode"] = ep_idx
+            record["run_index"] = run_idx
             record["seed"] = int(seed)
+            record["reference_file"] = scenario.get("reference_file")
             trajectories.append(record)
 
         out_path = out_dir / f"trajectories_seed{seed}.json"
@@ -1459,8 +2365,10 @@ def main() -> int:
 
     env.close()
     print("MPC evaluation complete.")
-    print(f"Compare with RL: python scripts/compare_mpc_rl.py "
-          f"--rl-dir {DEFAULT_TRAJ_DIR} --mpc-dir {out_dir}")
+    print(
+        f"Compare with RL: python scripts/compare_mpc_rl.py "
+        f"--rl-dir {DEFAULT_TRAJ_DIR} --mpc-dir {out_dir}"
+    )
     return 0
 
 

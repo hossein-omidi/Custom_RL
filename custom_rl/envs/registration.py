@@ -229,6 +229,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         # Observation/path/RL options
         "sensor_points",
         "w_limit",
+        "w_limit_grace_steps",
         "w_obs_scale",
         "wdot_obs_scale",
         "wdot_limit",

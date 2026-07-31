@@ -282,6 +282,7 @@ class PlatePlant(ODEPlant):
         force_projection_mode: str = "z",
         sensor_points: Sequence[tuple[float, float]] = DEFAULT_SENSOR_POINTS,
         w_limit: float = 4.0e-3,
+        w_limit_grace_steps: int = 1,
         w_obs_scale: float = 4.0e-3,
         wdot_limit: float = 10.0,
         wdot_obs_scale: float = 1.0,
@@ -402,6 +403,13 @@ class PlatePlant(ODEPlant):
         self.obs_dim = 2 * self.n_sensors + 2
 
         self.w_limit = float(w_limit)
+        # Consecutive control steps |w| must exceed w_limit before the episode
+        # terminates.  1 (default) = terminate on the first crossing (previous
+        # behavior).  Setting 3-5 rides out single-sample transient spikes so an
+        # otherwise-recovering controller is not reset by one outlier while the
+        # physical limit itself is unchanged.
+        self.w_limit_grace_steps = max(int(w_limit_grace_steps), 1)
+        self._w_violation_streak = 0
         self.w_obs_scale = float(w_obs_scale)
         self.wdot_limit = float(wdot_limit)
         self.wdot_obs_scale = float(wdot_obs_scale)
@@ -889,6 +897,7 @@ class PlatePlant(ODEPlant):
 
         # 2. Reset force module history and internal kinematic states
         f_nonlinear2.reset_state_history()
+        self._w_violation_streak = 0
         self._last_omega = float(self.omega_min)
         self._last_ap = float(self._episode_ap) if not self.control_ap else float(self.ap_min)
         self._last_ac = self._last_ap  # compatibility alias for old diagnostics
@@ -935,12 +944,18 @@ class PlatePlant(ODEPlant):
             info["termination_reason"] = "invalid_state"
             return True, False, info
 
-        # 2. Check physical instability based SOLELY on displacement
+        # 2. Check physical instability based SOLELY on displacement.
+        # A violation must persist for w_limit_grace_steps consecutive checks
+        # before terminating (default 1 = immediate, the previous behavior).
         w_sensor, wdot_sensor = self.modal_to_physical(x)
         if np.any(np.abs(w_sensor) > self.w_limit):
-            info["termination_reason"] = "excessive_sensor_displacement"
-            info["max_displacement_m"] = float(np.max(np.abs(w_sensor)))
-            return True, False, info
+            self._w_violation_streak += 1
+            if self._w_violation_streak >= self.w_limit_grace_steps:
+                info["termination_reason"] = "excessive_sensor_displacement"
+                info["max_displacement_m"] = float(np.max(np.abs(w_sensor)))
+                return True, False, info
+        else:
+            self._w_violation_streak = 0
         
         # Note: Velocity termination removed. Displacement is the true physical 
         # limit for machining (chip thickness/tool crash). Velocity is implicitly bounded.

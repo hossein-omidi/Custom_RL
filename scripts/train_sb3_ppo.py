@@ -26,15 +26,15 @@ PPO_LEARNING_RATE = 3e-4
 PPO_N_STEPS = 2048
 PPO_BATCH_SIZE = 256
 PPO_N_EPOCHS = 10
-PPO_GAMMA = 0.999
-PPO_GAE_LAMBDA = 0.95
+PPO_GAMMA = 0.9999
+PPO_GAE_LAMBDA = 0.98
 PPO_CLIP_RANGE = 0.2
 PPO_ENT_COEF = 0.005
 PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.03
 PPO_NET_ARCH = [256, 256]
-PPO_LOG_STD_INIT = -1.0
+PPO_LOG_STD_INIT = -1
 
 # Fraction of the physical ap range used as the safe-start target.
 # 0.05 means 5% of (ap_max - ap_min) above ap_min.

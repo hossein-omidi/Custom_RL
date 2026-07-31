@@ -31,7 +31,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import warnings
 from pathlib import Path
 from typing import Any
 
@@ -150,112 +149,6 @@ def _summary(ep: dict[str, Any]) -> dict[str, Any]:
         "length": int(rec.get("length", 0)),
         "termination_reason": reason,
     }
-
-
-# ---------------------------------------------------------------------------
-# Monte Carlo mean +/- std bands (pooled across seeds/episodes)
-# ---------------------------------------------------------------------------
-MC_PANELS = [
-    ("max_abs_w", "max |w(t)|  [m]", True),
-    ("omega_rpm", "Spindle speed  [rpm]", False),
-    ("ap_mm", "Axial depth ap  [mm]", False),
-    ("Fz_N", "Axial force Fz  [N]", False),
-    ("cum_reward", "Cumulative reward", False),
-]
-
-
-def _resample_on_progress(ser: dict[str, np.ndarray], key: str, grid: np.ndarray) -> np.ndarray:
-    """Interpolate ser[key] against feed_progress onto a common progress grid.
-
-    Returns NaN outside the episode's own reached-progress range, so an
-    episode that terminated early (chatter) stops contributing to the mean/std
-    beyond the progress it actually reached, instead of being extrapolated.
-    """
-    prog = ser["feed_progress"]
-    y = ser[key]
-    good = np.isfinite(prog) & np.isfinite(y)
-    if np.count_nonzero(good) < 2:
-        return np.full_like(grid, np.nan)
-    prog_g, y_g = prog[good], y[good]
-    order = np.argsort(prog_g)
-    prog_u, idx_u = np.unique(prog_g[order], return_index=True)
-    y_u = y_g[order][idx_u]
-    return np.interp(grid, prog_u, y_u, left=np.nan, right=np.nan)
-
-
-def _mc_bands(eps: list[dict[str, Any]], grid: np.ndarray, key: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return (mean, std, n_valid) across pooled episodes at each grid point."""
-    if not eps:
-        z = np.zeros_like(grid, dtype=int)
-        return np.full_like(grid, np.nan), np.full_like(grid, np.nan), z
-    mat = np.stack([_resample_on_progress(_series(ep), key, grid) for ep in eps], axis=0)
-    n_valid = np.sum(np.isfinite(mat), axis=0)
-    # Grid points reached by zero episodes are all-NaN columns; nanmean/nanstd
-    # warn ("Mean of empty slice") for those, which is expected here (masked
-    # out by n_valid below), not a real numerical problem.
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", category=RuntimeWarning)
-        mean = np.nanmean(mat, axis=0)
-        std = np.nanstd(mat, axis=0)
-    return mean, std, n_valid
-
-
-def _plot_mc_bands(
-    rl_eps: list[dict[str, Any]],
-    mpc_eps: list[dict[str, Any]],
-    *,
-    out_path: Path,
-    grid_n: int = 200,
-) -> None:
-    """One figure: RL vs MPC mean +/- 1 std, pooled across all seeds/episodes,
-    plotted against feed progress (a common x-axis regardless of rpm/duration).
-    This REPLACES the old one-PNG-per-seed-per-episode overlay as the default
-    comparison output.
-    """
-    grid = np.linspace(0.0, 1.0, grid_n)
-
-    w_limit = None
-    for ep in (rl_eps[0] if rl_eps else None, mpc_eps[0] if mpc_eps else None):
-        if ep is not None:
-            w_limit = _meta(ep).get("w_limit", _meta(ep).get("w_limit_m"))
-            if w_limit is not None:
-                break
-
-    fig, axes = plt.subplots(3, 2, figsize=(13, 10))
-    axes = axes.reshape(-1)
-    for idx, (key, ylabel, is_w) in enumerate(MC_PANELS):
-        ax = axes[idx]
-        for eps, color, name in ((rl_eps, RL_COLOR, "RL"), (mpc_eps, MPC_COLOR, "MPC")):
-            if not eps:
-                continue
-            mean, std, n_valid = _mc_bands(eps, grid, key)
-            good = n_valid >= 1
-            if not np.any(good):
-                continue
-            ax.plot(grid[good], mean[good], color=color, lw=1.8, label=f"{name}  (n={len(eps)})")
-            ax.fill_between(grid[good], (mean - std)[good], (mean + std)[good], color=color, alpha=0.2)
-        if is_w and w_limit is not None and np.isfinite(float(w_limit)):
-            ax.axhline(float(w_limit), ls=":", lw=1.2, color="k", alpha=0.7,
-                       label=f"w_limit={float(w_limit):g} m")
-            ax.set_ylim(bottom=0.0)
-        ax.set_ylabel(ylabel)
-        ax.set_xlabel("Feed progress")
-        ax.grid(True, alpha=0.3)
-        if idx == 0:
-            ax.legend(loc="best", fontsize=9, framealpha=0.9)
-    axes[-1].axis("off")
-    axes[-1].text(
-        0.05, 0.5,
-        f"Monte Carlo pooled comparison\nRL episodes:  {len(rl_eps)}\nMPC episodes: {len(mpc_eps)}\n\n"
-        "Shaded band = +/-1 std across episodes.\nBand narrows/disappears past the progress\n"
-        "where fewer episodes survived (chatter).",
-        fontsize=10, va="center", transform=axes[-1].transAxes,
-    )
-    fig.suptitle("MPC vs RL — Monte Carlo mean +/- 1 std (pooled across seeds/episodes)", fontsize=12)
-    fig.tight_layout()
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
 
 
 # ---------------------------------------------------------------------------
@@ -391,13 +284,6 @@ def main() -> int:
     parser.add_argument("--out-dir", default="plots/mpc_vs_rl")
     parser.add_argument("--seeds", nargs="*", type=int, default=None,
                         help="Seeds to compare (default: intersection of both dirs).")
-    parser.add_argument(
-        "--per-episode-plots", action="store_true", default=False,
-        help="Also save one time-series overlay PNG per seed/episode (legacy "
-             "output). Off by default: the single pooled Monte Carlo mean+/-std "
-             "plot (mc_bands.png) is a clearer RL-vs-MPC comparison than many "
-             "per-seed plots.",
-    )
     args = parser.parse_args()
 
     rl = _load_seed_files(Path(args.rl_dir))
@@ -419,14 +305,10 @@ def main() -> int:
         seeds = sorted(set(rl) | set(mpc))
 
     summary_rows: list[dict[str, Any]] = []
-    rl_all_eps: list[dict[str, Any]] = []
-    mpc_all_eps: list[dict[str, Any]] = []
     n_plots = 0
     for seed in seeds:
         rl_eps = rl.get(seed, [])
         mpc_eps = mpc.get(seed, [])
-        rl_all_eps.extend(rl_eps)
-        mpc_all_eps.extend(mpc_eps)
         n_ep = max(len(rl_eps), len(mpc_eps))
         for ep_idx in range(n_ep):
             rl_ep = rl_eps[ep_idx] if ep_idx < len(rl_eps) else None
@@ -434,16 +316,15 @@ def main() -> int:
             if rl_ep is None and mpc_ep is None:
                 continue
 
-            if args.per_episode_plots:
-                title = f"seed {seed}  episode {ep_idx}"
-                ref = rl_ep if rl_ep is not None else mpc_ep
-                y_line = _primary(ref).get("y_line_m")
-                if y_line is not None and np.isfinite(float(y_line)):
-                    title += f"   (milling line y={float(y_line):.3f} m)"
+            title = f"seed {seed}  episode {ep_idx}"
+            ref = rl_ep if rl_ep is not None else mpc_ep
+            y_line = _primary(ref).get("y_line_m")
+            if y_line is not None and np.isfinite(float(y_line)):
+                title += f"   (milling line y={float(y_line):.3f} m)"
 
-                out_path = out_dir / f"compare_seed{seed}_ep{ep_idx}.png"
-                _plot_episode_overlay(rl_ep, mpc_ep, out_path=out_path, title=title)
-                n_plots += 1
+            out_path = out_dir / f"compare_seed{seed}_ep{ep_idx}.png"
+            _plot_episode_overlay(rl_ep, mpc_ep, out_path=out_path, title=title)
+            n_plots += 1
 
             w_limit = None
             for ep in (rl_ep, mpc_ep):
@@ -457,11 +338,6 @@ def main() -> int:
                 "mpc": _summary(mpc_ep) if mpc_ep is not None else None,
                 "w_limit": w_limit,
             })
-
-    mc_path = None
-    if rl_all_eps or mpc_all_eps:
-        mc_path = out_dir / "mc_bands.png"
-        _plot_mc_bands(rl_all_eps, mpc_all_eps, out_path=mc_path)
 
     if summary_rows:
         _plot_summary_bars(summary_rows, out_path=out_dir / "summary_bars.png")
@@ -480,11 +356,7 @@ def main() -> int:
                   f"{s['max_abs_w_m']:>10.2e} | {str(s['pass_completed']):>5} | "
                   f"{s['final_feed_progress']:>6.3f} | {s['termination_reason']}")
 
-    if mc_path is not None:
-        print(f"\nSaved Monte Carlo mean+/-std comparison to {mc_path}")
-    if args.per_episode_plots:
-        print(f"Saved {n_plots} per-episode overlay(s) to {out_dir}")
-    print(f"Saved summary bar chart to {out_dir / 'summary_bars.png'}")
+    print(f"\nSaved {n_plots} episode overlay(s) and a summary bar chart to {out_dir}")
     return 0
 
 

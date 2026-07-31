@@ -1,0 +1,48 @@
+{
+  "input_dir": "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\mpc_phase_trajectories",
+  "output_dir": "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only",
+  "episodes": [
+    {
+      "seed": 0,
+      "episode": 0,
+      "source": "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\mpc_phase_trajectories\\trajectories_seed0.json"
+    }
+  ],
+  "generated_files": [
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\01_overview.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\02_vibration.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\03_vibration_velocity.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\04_controls_time.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\05_controls_vs_progress.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\06_control_rates.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\07_forces.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\08_chip_load.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\09_tool_path_progress.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\10_modal_states.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\11_reward.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\12_mpc_solver.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\13_mhe_diagnostics.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\14_phase_sync.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\17_operating_map.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\18_phase_portrait.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\15_vibration_psd.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\16_vibration_spectrogram.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\19_episode_summary.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\mpc_mhe_report_seed0_ep0.pdf",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\seed0_ep0\\summary.json",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\episode_summary.csv",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\episode_summary.json",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\aggregate_episode_metrics.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\aggregate_reliability.png",
+    "C:\\Users\\ecer\\Desktop\\milling\\pure_Costum_RL\\Custom_RL\\plots\\mpc_only\\mpc_mhe_aggregate_report.pdf"
+  ],
+  "settings": {
+    "formats": [
+      "png"
+    ],
+    "dpi": 180,
+    "max_points": 15000,
+    "spectrogram": true,
+    "max_frequency": null
+  }
+}
