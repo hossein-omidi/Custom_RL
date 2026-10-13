@@ -1,0 +1,18 @@
+{
+  "n_cells": 189,
+  "K": 3,
+  "M": 26,
+  "dtheta_rad": 0.15707963267948966,
+  "dtheta_fraction_pitch": 0.1,
+  "chip_eps_mm": 0.002,
+  "n_quad": 2,
+  "command_type": "multistep",
+  "delay_max_abs_error": 3.0390451297866025e-07,
+  "force_map_relative_rms": 0.00611005907686722,
+  "sensor_displacement_relative_rms": 0.02822532509579443,
+  "cutter_displacement_relative_rms": 0.03184990200137708,
+  "overall_force_relative_rms_diagnostic": 0.05752965559174005,
+  "min_actual_plant_samples_per_cell": 28,
+  "max_phase_overshoot_rad": 0.0054624444834274755,
+  "legacy_dF_present": true
+}

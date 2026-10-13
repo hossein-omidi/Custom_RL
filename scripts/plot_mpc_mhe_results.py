@@ -9,6 +9,9 @@ The script reads the JSON files produced by ``mpc_mhe_dompc.py``:
 
 It does not import, load, or compare any RL policy or RL trajectory.
 
+Plotting note: the overview uses twin y-axes for spindle speed and axial depth.
+The axial-depth curve is dashed so it cannot be mistaken for a duplicate speed trace.
+
 Outputs
 -------
 For every episode, the script creates a dedicated directory containing:
@@ -644,12 +647,12 @@ def plot_overview(ref: EpisodeRef, max_points: int) -> plt.Figure:
     if actions.shape[1] >= 1:
         nn = _common_length(t, actions)
         idx = _peak_preserving_indices(actions[:nn], max_points)
-        ax.plot(t[:nn][idx], actions[:nn, 0][idx] * 60.0 / (2.0 * np.pi), label="spindle speed")
-        ax.set_ylabel("Speed [rpm]")
+        ax.plot(t[:nn][idx], actions[:nn, 0][idx] * 60.0 / (2.0 * np.pi), label="spindle speed", linewidth=1.1)
+        ax.set_ylabel("Spindle speed [rpm]")
         ax2 = ax.twinx()
         if actions.shape[1] >= 2:
-            ax2.plot(t[:nn][idx], actions[:nn, 1][idx], label="axial depth")
-            ax2.set_ylabel("Axial depth [mm]")
+            ax2.plot(t[:nn][idx], actions[:nn, 1][idx], label="axial depth", linestyle="--", linewidth=1.1)
+            ax2.set_ylabel("Axial depth $a_p$ [mm]")
         handles, labels = ax.get_legend_handles_labels()
         handles2, labels2 = ax2.get_legend_handles_labels()
         ax.legend(handles + handles2, labels + labels2, frameon=False, loc="best")
@@ -662,7 +665,7 @@ def plot_overview(ref: EpisodeRef, max_points: int) -> plt.Figure:
     if force.size:
         nn = _common_length(t, force)
         idx = _peak_preserving_indices(force[:nn], max_points)
-        ax.plot(t[:nn][idx], force[:nn][idx])
+        ax.plot(t[:nn][idx], force[:nn][idx], linewidth=0.55, alpha=0.75)
     else:
         _empty_axis(ax, "No force data")
     ax.set_ylabel("Force magnitude [N]"); ax.set_title("Cutting force"); _style_axes(ax)

@@ -1,0 +1,261 @@
+{
+  "configuration": {
+    "env_id": "CustomODEPlate-v0",
+    "full_modes": 6,
+    "retained_modes": [
+      0,
+      1,
+      3
+    ],
+    "retained_compliance_fraction": 0.9880048790904445,
+    "x_c_m": 0.5,
+    "y_c_m": 0.2,
+    "omega_rad_s": 230.3834612632515,
+    "omega_rpm": 2200.0,
+    "dt_s": 0.0001,
+    "dtheta_per_substep_rad": 0.02303834612632515,
+    "duration_s": 0.2,
+    "force_amplitude_N": 100.0,
+    "step_time_s": 0.02,
+    "sine_frequency_Hz": 17.093240847697558,
+    "sine_frequency_source": "dominant_compliance_mode",
+    "dominant_mode_index": 0,
+    "dominant_mode_frequency_Hz": 17.093240847697558,
+    "participation": [
+      0.8145591529001447,
+      0.15149133698624737,
+      0.0005117200985538009,
+      0.02195438920405245,
+      0.011352100871026874,
+      0.00013129993997503455
+    ],
+    "plant_acceleration_clip_m_s2": 100000000.0
+  },
+  "scope": "Prescribed external-force test of structural dynamics, modal reduction, sensor/cutter output reconstruction, and time-to-phase transformation. Regenerative delay and milling-force law are intentionally excluded.",
+  "cases": {
+    "step": {
+      "sensor_mode_reduction": {
+        "rmse": 1.3406241388124385e-06,
+        "ref_rms": 0.00017477884379139255,
+        "nrmse_rms": 0.0076704028344102195,
+        "nrmse_peak": 0.003934211460146262,
+        "max_abs_error": 3.0595334410668315e-06,
+        "reference_peak": 0.0003407605697845733,
+        "prediction_peak": 0.000341463895836019,
+        "relative_peak_error": 0.0020639889523905624,
+        "correlation": 0.9999269631689225
+      },
+      "sensor_phase_mapping": {
+        "rmse": 4.572263360572049e-20,
+        "ref_rms": 0.0001748288034726655,
+        "nrmse_rms": 2.6152803598446655e-16,
+        "nrmse_peak": 1.339018097177625e-16,
+        "max_abs_error": 1.6263032587282567e-19,
+        "reference_peak": 0.000341463895836019,
+        "prediction_peak": 0.000341463895836019,
+        "relative_peak_error": 0.0,
+        "correlation": 0.9999999999999998
+      },
+      "sensor_total": {
+        "rmse": 1.3406241388124393e-06,
+        "ref_rms": 0.00017477884379139255,
+        "nrmse_rms": 0.007670402834410225,
+        "nrmse_peak": 0.003934211460146265,
+        "max_abs_error": 3.0595334410668315e-06,
+        "reference_peak": 0.0003407605697845733,
+        "prediction_peak": 0.000341463895836019,
+        "relative_peak_error": 0.0020639889523905624,
+        "correlation": 0.9999269631689227
+      },
+      "velocity_mode_reduction": {
+        "rmse": 0.00031963717204644757,
+        "ref_rms": 0.010275336078244433,
+        "nrmse_rms": 0.0311072231226775,
+        "nrmse_peak": 0.012873624931826998,
+        "max_abs_error": 0.0014138934169949683,
+        "reference_peak": 0.0248288398752569,
+        "prediction_peak": 0.024737186729992682,
+        "relative_peak_error": 0.003691398620503189,
+        "correlation": 0.9995156564111817
+      },
+      "velocity_phase_mapping": {
+        "rmse": 9.581930772231251e-18,
+        "ref_rms": 0.01027048060162237,
+        "nrmse_rms": 9.329583632841532e-16,
+        "nrmse_peak": 3.8734925182957883e-16,
+        "max_abs_error": 3.122502256758253e-17,
+        "reference_peak": 0.024737186729992682,
+        "prediction_peak": 0.02473718672999268,
+        "relative_peak_error": 1.4025228453917405e-16,
+        "correlation": 0.9999999999999998
+      },
+      "velocity_total": {
+        "rmse": 0.00031963717204644757,
+        "ref_rms": 0.010275336078244433,
+        "nrmse_rms": 0.0311072231226775,
+        "nrmse_peak": 0.012873624931826998,
+        "max_abs_error": 0.0014138934169949683,
+        "reference_peak": 0.0248288398752569,
+        "prediction_peak": 0.02473718672999268,
+        "relative_peak_error": 0.0036913986205033287,
+        "correlation": 0.9995156564111817
+      },
+      "cutter_mode_reduction": {
+        "rmse": 4.384925114900346e-06,
+        "ref_rms": 9.973582648391706e-05,
+        "nrmse_rms": 0.043965396081692254,
+        "nrmse_peak": 0.02603741470083596,
+        "max_abs_error": 8.585023199081924e-06,
+        "reference_peak": 0.00016840862141200073,
+        "prediction_peak": 0.00016624920921305588,
+        "relative_peak_error": 0.012822456361435246,
+        "correlation": 0.9994982360344531
+      },
+      "cutter_phase_mapping": {
+        "rmse": 2.294748343367378e-20,
+        "ref_rms": 9.587571587917579e-05,
+        "nrmse_rms": 2.393461495775697e-16,
+        "nrmse_peak": 1.3803063209922124e-16,
+        "max_abs_error": 8.131516293641283e-20,
+        "reference_peak": 0.00016624920921305588,
+        "prediction_peak": 0.00016624920921305588,
+        "relative_peak_error": 0.0,
+        "correlation": 1.0
+      },
+      "cutter_total": {
+        "rmse": 4.384925114900344e-06,
+        "ref_rms": 9.973582648391706e-05,
+        "nrmse_rms": 0.04396539608169223,
+        "nrmse_peak": 0.02603741470083595,
+        "max_abs_error": 8.585023199081924e-06,
+        "reference_peak": 0.00016840862141200073,
+        "prediction_peak": 0.00016624920921305588,
+        "relative_peak_error": 0.012822456361435246,
+        "correlation": 0.9994982360344528
+      },
+      "retained_state_phase_mapping": {
+        "rmse": 2.4950847844148833e-18,
+        "ref_rms": 0.0027485642307759034,
+        "nrmse_rms": 9.077775066986648e-16,
+        "nrmse_peak": 2.28788528561997e-16,
+        "max_abs_error": 1.214306433183765e-17,
+        "reference_peak": 0.010905637621331904,
+        "prediction_peak": 0.010905637621331904,
+        "relative_peak_error": 0.0,
+        "correlation": 0.9999999999999999
+      }
+    },
+    "sine": {
+      "sensor_mode_reduction": {
+        "rmse": 9.9029418037703e-07,
+        "ref_rms": 0.0005903428633799432,
+        "nrmse_rms": 0.001677489882247766,
+        "nrmse_peak": 0.0007749098928377722,
+        "max_abs_error": 1.6499589740458354e-06,
+        "reference_peak": 0.0012779475259381526,
+        "prediction_peak": 0.0012785184348279538,
+        "relative_peak_error": 0.00044673891393315996,
+        "correlation": 0.999998593191754
+      },
+      "sensor_phase_mapping": {
+        "rmse": 5.453029609578279e-19,
+        "ref_rms": 0.0005903694702005198,
+        "nrmse_rms": 9.236638892804111e-16,
+        "nrmse_peak": 4.265116138362194e-16,
+        "max_abs_error": 1.5178830414797062e-18,
+        "reference_peak": 0.0012785184348279538,
+        "prediction_peak": 0.0012785184348279546,
+        "relative_peak_error": 6.784116007722029e-16,
+        "correlation": 1.0
+      },
+      "sensor_total": {
+        "rmse": 9.902941803769836e-07,
+        "ref_rms": 0.0005903428633799432,
+        "nrmse_rms": 0.0016774898822476876,
+        "nrmse_peak": 0.0007749098928377359,
+        "max_abs_error": 1.6499589740458422e-06,
+        "reference_peak": 0.0012779475259381526,
+        "prediction_peak": 0.0012785184348279546,
+        "relative_peak_error": 0.00044673891393383873,
+        "correlation": 0.999998593191754
+      },
+      "velocity_mode_reduction": {
+        "rmse": 0.00011051788871065739,
+        "ref_rms": 0.06640600169911338,
+        "nrmse_rms": 0.0016642756058618865,
+        "nrmse_peak": 0.0007609146495556164,
+        "max_abs_error": 0.00032218162951139337,
+        "reference_peak": 0.14524347609183397,
+        "prediction_peak": 0.1452509411455028,
+        "relative_peak_error": 5.139682600347199e-05,
+        "correlation": 0.9999986048194295
+      },
+      "velocity_phase_mapping": {
+        "rmse": 4.474298727979483e-17,
+        "ref_rms": 0.06641045111512532,
+        "nrmse_rms": 6.737341266095449e-16,
+        "nrmse_peak": 3.080392245787534e-16,
+        "max_abs_error": 1.3877787807814457e-16,
+        "reference_peak": 0.1452509411455028,
+        "prediction_peak": 0.14525094114550283,
+        "relative_peak_error": 1.9108706213356105e-16,
+        "correlation": 0.9999999999999998
+      },
+      "velocity_total": {
+        "rmse": 0.00011051788871065375,
+        "ref_rms": 0.06640600169911338,
+        "nrmse_rms": 0.0016642756058618316,
+        "nrmse_peak": 0.0007609146495555913,
+        "max_abs_error": 0.00032218162951139337,
+        "reference_peak": 0.14524347609183397,
+        "prediction_peak": 0.14525094114550283,
+        "relative_peak_error": 5.1396826003663086e-05,
+        "correlation": 0.9999986048194295
+      },
+      "cutter_mode_reduction": {
+        "rmse": 3.234571063741457e-06,
+        "ref_rms": 0.0002649417882038706,
+        "nrmse_rms": 0.012208610373130268,
+        "nrmse_peak": 0.005639414160246157,
+        "max_abs_error": 4.724613009695743e-06,
+        "reference_peak": 0.0005735650852783386,
+        "prediction_peak": 0.0005713390033090143,
+        "relative_peak_error": 0.003881132283782567,
+        "correlation": 0.9999292288980981
+      },
+      "cutter_phase_mapping": {
+        "rmse": 2.454688395101486e-19,
+        "ref_rms": 0.0002643166854470225,
+        "nrmse_rms": 9.28692182617992e-16,
+        "nrmse_peak": 4.2963781238191493e-16,
+        "max_abs_error": 6.505213034913027e-19,
+        "reference_peak": 0.0005713390033090143,
+        "prediction_peak": 0.0005713390033090147,
+        "relative_peak_error": 5.692953743081512e-16,
+        "correlation": 1.0
+      },
+      "cutter_total": {
+        "rmse": 3.2345710637413216e-06,
+        "ref_rms": 0.0002649417882038706,
+        "nrmse_rms": 0.012208610373129758,
+        "nrmse_peak": 0.00563941416024592,
+        "max_abs_error": 4.7246130096957365e-06,
+        "reference_peak": 0.0005735650852783386,
+        "prediction_peak": 0.0005713390033090147,
+        "relative_peak_error": 0.003881132283782,
+        "correlation": 0.9999292288980983
+      },
+      "retained_state_phase_mapping": {
+        "rmse": 1.1766732373996229e-17,
+        "ref_rms": 0.01768583689096194,
+        "nrmse_rms": 6.653195122482118e-16,
+        "nrmse_peak": 1.2497073266360197e-16,
+        "max_abs_error": 7.827939685345342e-17,
+        "reference_peak": 0.09415590453222428,
+        "prediction_peak": 0.09415590453222428,
+        "relative_peak_error": 0.0,
+        "correlation": 1.0
+      }
+    }
+  }
+}
