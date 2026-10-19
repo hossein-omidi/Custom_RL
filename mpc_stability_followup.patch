@@ -1,0 +1,240 @@
+--- a/scripts/MPC/mpc_face_milling_chatgpt_V3.py
++++ b/scripts/MPC/mpc_face_milling_chatgpt_V3.py
+@@ -599,7 +599,12 @@
+     mpc.set_rterm(omega=float(a.r_omega) / om_rng**2,
+                   ap=float(a.r_ap) / ap_rng**2)
+ 
+-    mpc.bounds["lower", "_u", "omega"] = pp.omega_min
++    # Optional MPC-only admissible operating subset for diagnostic trials.
++    # The true plant and model retain their original 400--4000 rpm range.
++    omega_floor = _mpc_speed_floor(pp, a)
++    if omega_floor > omega_hi:
++        raise ValueError("MPC-only speed floor exceeds the admissible spindle maximum.")
++    mpc.bounds["lower", "_u", "omega"] = omega_floor
+     mpc.bounds["upper", "_u", "omega"] = omega_hi
+     if ap_fixed is not None:
+         mpc.bounds["lower", "_u", "ap"] = float(ap_fixed)
+@@ -608,10 +613,11 @@
+         # Optional operational floor prevents the safety-first objective from
+         # completing a nominal "machining pass" at exactly zero depth.
+         ap_lower = max(pp.ap_min, float(a.minimum_cut_depth))
+-        if ap_lower > pp.ap_max:
+-            raise ValueError("--minimum-cut-depth exceeds the plant's maximum depth")
++        ap_upper = _mpc_depth_ceiling(pp, a)
++        if ap_lower > ap_upper:
++            raise ValueError("MPC-only depth ceiling is smaller than the required minimum depth.")
+         mpc.bounds["lower", "_u", "ap"] = ap_lower
+-        mpc.bounds["upper", "_u", "ap"] = pp.ap_max
++        mpc.bounds["upper", "_u", "ap"] = ap_upper
+ 
+     mpc.scaling["_x", "eta"] = 1e-3
+     mpc.scaling["_x", "v"] = 1e-1
+@@ -828,11 +834,34 @@
+     return np.concatenate([x[0::2], x[1::2]])
+ 
+ 
++def _mpc_speed_floor(pp: PhasePlant, a: argparse.Namespace) -> float:
++    """Experimental MPC-only floor; does not modify the Gym plant or MHE."""
++    rpm = getattr(a, "mpc_omega_floor_rpm", None)
++    floor = pp.omega_min if rpm is None else max(pp.omega_min, float(rpm) * (2.0 * np.pi / 60.0))
++    return float(floor)
++
++
++def _mpc_depth_ceiling(pp: PhasePlant, a: argparse.Namespace) -> float:
++    """Experimental MPC-only upper bound, leaving plant limits untouched."""
++    value = getattr(a, "mpc_ap_ceiling_mm", None)
++    return float(pp.ap_max if value is None else min(pp.ap_max, float(value)))
++
++
++def _interval_safety_ratio(current_w: np.ndarray, current_v: np.ndarray,
++                           dt: float, gain: float, last_interval_peak: float,
++                           w_limit: float) -> float:
++    """Conservative measured/first-order risk INDICATOR, not a future bound."""
++    predicted = float(np.max(np.abs(current_w) + gain * dt * np.abs(current_v)))
++    return max(predicted, float(last_interval_peak)) / max(float(w_limit), 1e-15)
++
++
+ def _project_realized_rate_limits(u_cmd: np.ndarray, u_prev: np.ndarray,
+                                   pp: PhasePlant, dtheta: float,
+                                   omega_hi: float, omega_rate: float,
+                                   ap_rate: float, ap_fixed: float | None,
+-                                  previous_dt: float | None = None) -> tuple[np.ndarray, int, float]:
++                                  previous_dt: float | None = None,
++                                  omega_floor: float | None = None,
++                                  ap_ceiling: float | None = None) -> tuple[np.ndarray, int, float]:
+     """Project onto sampled-command slew limits using the PREVIOUS hold duration.
+ 
+     A control change u_k-u_(k-1) occurs after the elapsed interval dt_(k-1).
+@@ -848,14 +877,20 @@
+     if not np.isfinite(dt_prev) or dt_prev <= 0.0:
+         raise ValueError("Previous actuator-hold duration must be positive and finite.")
+     om_step = max(float(omega_rate), 0.0) * dt_prev
+-    u[0] = np.clip(u[0], max(pp.omega_min, prev[0] - om_step),
++    lo = max(pp.omega_min, float(omega_floor) if omega_floor is not None else pp.omega_min)
++    if lo > min(omega_hi, prev[0] + om_step) + 1e-12:
++        raise ValueError("MPC speed floor cannot be reached under the actuator slew limit.")
++    u[0] = np.clip(u[0], max(lo, prev[0] - om_step),
+                    min(omega_hi, prev[0] + om_step))
+     if ap_fixed is not None:
+         u[1] = float(ap_fixed)
+     else:
+         ap_step = max(float(ap_rate), 0.0) * dt_prev
++        hi = min(pp.ap_max, float(ap_ceiling) if ap_ceiling is not None else pp.ap_max)
++        if hi < max(pp.ap_min, prev[1] - ap_step) - 1e-12:
++            raise ValueError("MPC depth ceiling cannot be reached under the actuator slew limit.")
+         u[1] = np.clip(u[1], max(pp.ap_min, prev[1] - ap_step),
+-                       min(pp.ap_max, prev[1] + ap_step))
++                       min(hi, prev[1] + ap_step))
+     n_hold = max(1, int(round(float(dtheta) / (max(u[0], 1e-12) * pp.env_dt))))
+     return u, n_hold, float(n_hold * pp.env_dt)
+ 
+@@ -906,6 +941,12 @@
+     # the plant sampling period -> omega <= dtheta/dt_env.
+     omega_cap = dtheta / pp.env_dt if a.omega_sampling_cap else float("inf")
+     omega_hi = float(min(pp.omega_max, omega_cap))
++    omega_floor = _mpc_speed_floor(pp, a)
++    ap_ceiling = _mpc_depth_ceiling(pp, a)
++    if omega_floor > omega_hi:
++        raise ValueError("MPC speed floor exceeds the maximum speed.")
++    if ap_fixed is not None and ap_ceiling < ap_fixed:
++        raise ValueError("MPC-only depth cap is below the episode-fixed cutting depth.")
+ 
+     sched = PhaseSchedule(pp, dtheta, a.sharp, a.n_quad)
+     xc, yc = pp.cutter_from_obs(oa)
+@@ -930,7 +971,7 @@
+     phi0 = pp.phi_at(xc, yc)
+     wc0 = float(phi0 @ z0m[:K])
+     x0 = np.concatenate([z0m[:K], z0m[K:], np.full(M, wc0), [0.0]]).reshape(-1, 1)
+-    u0 = np.array([[float(np.clip(0.5 * (pp.omega_min + omega_hi), pp.omega_min, omega_hi))],
++    u0 = np.array([[float(np.clip(0.5 * (pp.omega_min + omega_hi), omega_floor, omega_hi))],
+                    [ap_fixed if ap_fixed is not None else
+                     max(pp.ap_min, float(a.minimum_cut_depth))]])
+     mhe.x0 = x0
+@@ -942,6 +983,7 @@
+ 
+     u_prev = u0.reshape(-1).copy()
+     previous_hold_dt = None
++    previous_interval_peak = 0.0
+ 
+     logs = dict(times=[], observations=[], physical_signals=[], x_modal=[], actions=[],
+                 physical_actions=[], rewards=[], w_sensor=[], wdot_sensor=[],
+@@ -956,6 +998,7 @@
+              safety_guard_active=[], safety_guard_ratio=[],
+              delay_history_span_rad=[],
+              measured_w_ratio=[], measured_velocity_ratio=[],
++             previous_interval_peak_ratio=[],
+              cutter_reconstruction_error_over_wlimit=[])
+ 
+     reason = None
+@@ -1009,8 +1052,10 @@
+         w_now = meas_now[:pp.nS] * pp.w_obs
+         wd_now = meas_now[pp.nS:] * pp.wd_obs
+         dt_guard = dtheta / max(float(u[0]), 1e-12)
+-        guard = float(np.max(np.abs(w_now) + float(a.safety_guard_gain) * dt_guard * np.abs(wd_now)))
+-        guard_ratio = guard / max(pp.w_limit, 1e-15)
++        guard_ratio = _interval_safety_ratio(
++            w_now, wd_now, dt_guard, float(a.safety_guard_gain),
++            previous_interval_peak, pp.w_limit)
++        d["previous_interval_peak_ratio"].append(previous_interval_peak / pp.w_limit)
+         d["measured_w_ratio"].append(float(np.max(np.abs(w_now)) / max(pp.w_limit, 1e-15)))
+         d["measured_velocity_ratio"].append(float(
+             np.max(dt_guard * np.abs(wd_now)) / max(pp.w_limit, 1e-15)))
+@@ -1034,7 +1079,8 @@
+         u_raw = u.copy()
+         u, n_hold, dt_real = _project_realized_rate_limits(
+             u, u_prev, pp, dtheta, omega_hi, a.omega_rate, a.ap_rate,
+-            ap_fixed, previous_dt=previous_hold_dt
++            ap_fixed, previous_dt=previous_hold_dt,
++            omega_floor=omega_floor, ap_ceiling=ap_ceiling
+         )
+         tol = 1e-6 * np.maximum(1.0, np.abs(u_raw))
+         d["rate_clip_active"].append(bool(np.any(np.abs(u - u_raw) > tol)))
+@@ -1053,6 +1099,7 @@
+         d["dt_interval_s"].append(float(dt_real))
+         theta_before = theta_now
+         done = False
++        measured_peak_this_interval = 0.0
+         for _ in range(n_hold):
+             obs, rew, term, trunc, info = env.step(an)
+             oa = np.asarray(obs, dtype=np.float64).reshape(-1)
+@@ -1061,6 +1108,9 @@
+             logs["observations"].append(oa.tolist())
+             ws = np.asarray(info.get("w_sensor", np.zeros(pp.nS)), dtype=np.float64).reshape(-1)
+             wds = np.asarray(info.get("wdot_sensor", np.zeros(pp.nS)), dtype=np.float64).reshape(-1)
++            if ws.size and np.all(np.isfinite(ws)):
++                measured_peak_this_interval = max(
++                    measured_peak_this_interval, float(np.max(np.abs(ws))))
+             logs["w_sensor"].append(ws.tolist())
+             logs["wdot_sensor"].append(wds.tolist())
+             logs["physical_signals"].append(np.concatenate([ws, wds]).tolist())
+@@ -1084,6 +1134,10 @@
+                 reason = "max_env_steps"
+                 done = True
+                 break
++
++        # Guard for the NEXT optimization uses the largest observation from
++        # this hold, not merely its final potentially zero-crossing sample.
++        previous_interval_peak = measured_peak_this_interval
+ 
+         # ---- re-synchronise the schedule to the plant's OWN spindle phase ----
+         xc, yc = pp.cutter_from_obs(oa)
+@@ -1252,6 +1306,10 @@
+                                       if d["rate_clip_active"] else float("nan")),
+             "safety_guard_active_frac": (float(np.mean(d["safety_guard_active"]))
+                                           if d["safety_guard_active"] else 0.0),
++            "mpc_omega_floor_rpm": a.mpc_omega_floor_rpm,
++            "mpc_ap_ceiling_mm": a.mpc_ap_ceiling_mm,
++            "previous_hold_peak_max_ratio": (float(np.max(d["previous_interval_peak_ratio"]))
++                                               if d["previous_interval_peak_ratio"] else 0.0),
+             "max_safety_guard_ratio": (float(np.max(d["safety_guard_ratio"]))
+                                        if d["safety_guard_ratio"] else float("nan")),
+             "realized_max_omega_rate_rad_s2": om_rate,
+@@ -1645,6 +1703,12 @@
+     P.add_argument("--minimum-cut-depth", type=float, default=0.0,
+                    help="Optional nonzero axial depth floor (mm) for roughing only. "
+                         "Set according to machining requirements.")
++    P.add_argument("--mpc-omega-floor-rpm", type=float, default=None,
++                   help="DIAGNOSTIC ONLY: restrict MPC's speed decisions to rpm >= this "
++                        "value. Does not change plant range or sensor dynamics.")
++    P.add_argument("--mpc-ap-ceiling-mm", type=float, default=None,
++                   help="DIAGNOSTIC ONLY: upper bound for commanded depth in mm. "
++                        "Does not change the plant's permissible depth or reward.")
+     P.add_argument("--stability-first", action="store_true",
+                    help="Apply a conservative EXPERIMENTAL MPC-only tuning profile, "
+                         "without changing explicitly supplied CLI options, plant or RL.")
+@@ -1700,6 +1764,13 @@
+                 applied[field] = value
+         print("Stability-first MPC profile (experimental, override individual CLI flags):",
+               applied, flush=True)
++
++    if a.mpc_omega_floor_rpm is not None and (
++            not np.isfinite(a.mpc_omega_floor_rpm) or a.mpc_omega_floor_rpm <= 0):
++        P.error("--mpc-omega-floor-rpm must be a positive finite number.")
++    if a.mpc_ap_ceiling_mm is not None and (
++            not np.isfinite(a.mpc_ap_ceiling_mm) or a.mpc_ap_ceiling_mm < 0):
++        P.error("--mpc-ap-ceiling-mm must be a finite nonnegative number.")
+ 
+     for name in ("max_env_steps", "max_episode_steps"):
+         value = getattr(a, name)
+@@ -1799,6 +1870,10 @@
+         print("    WARNING: at low spindle speed one finite element spans more than one cycle "
+               "of the fastest retained structural mode. Low-speed predictions can have large "
+               "phase error; increase --coll-ni or reduce --dtheta-frac before trusting that region.")
++    if a.mpc_omega_floor_rpm is not None or a.mpc_ap_ceiling_mm is not None:
++        print(f"  DIAGNOSTIC ONLY controller bounds: rpm >= "
++              f"{omega_to_rpm(_mpc_speed_floor(pp,a)):.0f}; "
++              f"ap <= {_mpc_depth_ceiling(pp,a):.2f} mm (PLANT UNCHANGED)")
+     print(f"  spindle {omega_to_rpm(pp.omega_min):.0f}-{omega_to_rpm(pp.omega_max):.0f} rpm, "
+           f"ap {pp.ap_min:g}-{pp.ap_max:g} mm, |w|<={pp.w_limit:g} m (hard/termination)")
+     print(f"  vibration target: soft {a.w_margin:g}*w_limit = {a.w_margin*pp.w_limit:g} m; "
+@@ -1888,7 +1963,9 @@
+                    "minimum_cut_depth": a.minimum_cut_depth,
+                    "prod_gate_disp": a.prod_gate_disp,
+                    "prod_gate_vel": a.prod_gate_vel,
+-                   "stability_first": a.stability_first}
++                   "stability_first": a.stability_first,
++                   "mpc_omega_floor_rpm": a.mpc_omega_floor_rpm,
++                   "mpc_ap_ceiling_mm": a.mpc_ap_ceiling_mm}
+ 
+     with tempfile.TemporaryDirectory(prefix="milling_mpc_nlp_") as compiled_dir:
+         a.nlp_compile_dir = compiled_dir

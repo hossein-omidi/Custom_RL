@@ -21,6 +21,7 @@ is differentiable (CasADi) for use in gradient-based NMPC and MHE.
 from __future__ import annotations
 
 import argparse
+import tempfile
 import json
 import sys
 import time
@@ -463,10 +464,14 @@ def build_mpc(model, pp: PhasePlant, sched: PhaseSchedule, M: int, a: argparse.N
     A constant reference speed is multiplied into this Jacobian only to keep
     the stage cost dimensionless; it does not change the optimum.
 
-    Physical actuator slew limits are also transformed consistently. For a
-    zero-order-held command over one phase interval dtheta,
+    A discrete actuator slew limit is defined over the PRECEDING hold interval:
 
-        |du/dt| <= r  =>  |u_k-u_{k-1}| * omega_k <= r*dtheta.
+        |u_k-u_{k-1}| <= r * dt_{k-1},  dt_{k-1} ~= dtheta/omega_{k-1}.
+
+    The online actuator projection uses the previous interval's measured
+    duration, removing the phase-grid rounding approximation from the applied
+    command. Zero-order holds imply these are sampled-command slew limits,
+    not instantaneous continuous actuator-velocity limits.
 
     These inequalities are appended directly to the NLP for every prediction
     stage (not only for the first move).
@@ -566,8 +571,19 @@ def build_mpc(model, pp: PhasePlant, sched: PhaseSchedule, M: int, a: argparse.N
     # still rewards shorter physical cutting time.  A *preferred-speed* penalty
     # prevents the optimizer from jumping between distant nonconvex speed minima
     # unless vibration reduction justifies it.
-    mrr_norm = (omega / omega_hi) * ap_norm
-    L_time = (-float(a.prod_weight) * mrr_norm
+    # With fixed feed per tooth, physical MRR scales with omega * ap.
+    # Using (ap-ap_min) would misrepresent MRR if ap_min is nonzero.
+    mrr_norm = (omega / omega_hi) * (ap / max(pp.ap_max, 1e-12))
+    # Smooth vibration-gated productivity, inspired by the reward's protective
+    # gate but deliberately computed from the MPC's own normalized outputs.
+    # Unlike a separate vibration cost, it reduces the incentive to INCREASE
+    # depth when predicted vibration is already significant. It does not
+    # change the physical cutting model or the plant's displacement threshold.
+    gate_d = float(a.prod_gate_disp)
+    gate_v = float(a.prod_gate_vel)
+    productivity_gate = 1.0 / (1.0 + gate_d * disp_metric + gate_v * vel_metric)
+    prod_weight = float(a.q_mrr) if a.q_mrr > 0.0 else float(a.prod_weight)
+    L_time = (-prod_weight * mrr_norm * productivity_gate
               + float(a.q_omega) * omega_dev**2
               + float(a.speed_cost) * omega_norm**2
               + float(a.q_energy) * vibration_metric
@@ -583,14 +599,25 @@ def build_mpc(model, pp: PhasePlant, sched: PhaseSchedule, M: int, a: argparse.N
     mpc.set_rterm(omega=float(a.r_omega) / om_rng**2,
                   ap=float(a.r_ap) / ap_rng**2)
 
-    mpc.bounds["lower", "_u", "omega"] = pp.omega_min
+    # Optional MPC-only admissible operating subset for diagnostic trials.
+    # The true plant and model retain their original 400--4000 rpm range.
+    omega_floor = _mpc_speed_floor(pp, a)
+    if omega_floor > omega_hi:
+        raise ValueError("MPC-only speed floor exceeds the admissible spindle maximum.")
+    mpc.bounds["lower", "_u", "omega"] = omega_floor
     mpc.bounds["upper", "_u", "omega"] = omega_hi
     if ap_fixed is not None:
         mpc.bounds["lower", "_u", "ap"] = float(ap_fixed)
         mpc.bounds["upper", "_u", "ap"] = float(ap_fixed)
     else:
-        mpc.bounds["lower", "_u", "ap"] = pp.ap_min
-        mpc.bounds["upper", "_u", "ap"] = pp.ap_max
+        # Optional operational floor prevents the safety-first objective from
+        # completing a nominal "machining pass" at exactly zero depth.
+        ap_lower = max(pp.ap_min, float(a.minimum_cut_depth))
+        ap_upper = _mpc_depth_ceiling(pp, a)
+        if ap_lower > ap_upper:
+            raise ValueError("MPC-only depth ceiling is smaller than the required minimum depth.")
+        mpc.bounds["lower", "_u", "ap"] = ap_lower
+        mpc.bounds["upper", "_u", "ap"] = ap_upper
 
     mpc.scaling["_x", "eta"] = 1e-3
     mpc.scaling["_x", "v"] = 1e-1
@@ -622,12 +649,30 @@ def build_mpc(model, pp: PhasePlant, sched: PhaseSchedule, M: int, a: argparse.N
                         penalty_term_cons=float(a.rho_slack),
                         maximum_violation=float(a.slack_max))
 
+    # Anticipatory soft constraints. A short constant-velocity extrapolation
+    # penalizes states that are currently inside the envelope but have a large
+    # outward velocity. It is a FIRST-ORDER HEURISTIC, not a certified upper
+    # bound on future displacement; the unmodified hard constraints remain.
+    # Unlike a longer NMPC horizon, the extra algebra is inexpensive.
+    if float(a.preview_gain) > 0.0:
+        preview_dt = float(a.preview_gain) * float(sched.dtheta) / omega
+        w_next = (ca.mtimes(Phi, eta) + preview_dt * ca.mtimes(Phi, v)) / pp.w_limit
+        wc_next = (ca.mtimes(model.tvp["phi"].T, eta)
+                   + preview_dt * ca.mtimes(model.tvp["phi"].T, v)) / pp.w_limit
+        for nm, ex in (("w_preview_up", w_next), ("w_preview_dn", -w_next),
+                       ("wc_preview_up", wc_next), ("wc_preview_dn", -wc_next)):
+            mpc.set_nl_cons(nm, ex, ub=marg, soft_constraint=True,
+                            penalty_term_cons=float(a.rho_slack),
+                            maximum_violation=float(a.slack_max))
+
     mpc.set_tvp_fun(mpc_tvp_fun(sched, mpc))
 
     # ------------------------------------------------------------------
-    # Full-horizon physical slew-rate constraints in phase coordinates.
+    # Full-horizon sampled-command slew limits, timed by the PREVIOUS hold.
     # do-mpc's ordinary set_nl_cons cannot couple u_k and u_{k-1}; use the
     # documented low-level NLP extension after prepare_nlp().
+    # Also penalize SECOND differences to discourage repeated control reversals
+    # without imposing extra hard constraints or changing the plant model.
     # ------------------------------------------------------------------
     mpc.prepare_nlp()
     A_om = float(a.omega_rate) * float(sched.dtheta)
@@ -644,20 +689,34 @@ def build_mpc(model, pp: PhasePlant, sched: PhaseSchedule, M: int, a: argparse.N
             om_prev = mpc.opt_x["_u", k - 1, 0, "omega"]
             ap_prev = mpc.opt_x["_u", k - 1, 0, "ap"]
 
-        # Equivalent to |Delta omega| <= omega_rate*(dtheta/omega_k)
-        # and |Delta ap| <= ap_rate*(dtheta/omega_k), with omega_k>0.
-        c_om = ca.vertcat((om_k - om_prev) * om_k,
-                          (om_prev - om_k) * om_k)
+        # |Delta u_k| <= rate * dtheta/omega_(k-1), omega_(k-1)>0.
+        # Using the previous speed is consistent with the interval elapsed
+        # between consecutive command applications (not the future hold).
+        c_om = ca.vertcat((om_k - om_prev) * om_prev,
+                          (om_prev - om_k) * om_prev)
         mpc.nlp_cons.append(c_om)
         mpc.nlp_cons_lb.append(np.full(c_om.shape, -np.inf))
         mpc.nlp_cons_ub.append(np.full(c_om.shape, A_om))
 
         if ap_fixed is None:
-            c_ap = ca.vertcat((ap_k - ap_prev) * om_k,
-                              (ap_prev - ap_k) * om_k)
+            c_ap = ca.vertcat((ap_k - ap_prev) * om_prev,
+                              (ap_prev - ap_k) * om_prev)
             mpc.nlp_cons.append(c_ap)
             mpc.nlp_cons_lb.append(np.full(c_ap.shape, -np.inf))
             mpc.nlp_cons_ub.append(np.full(c_ap.shape, A_ap))
+
+        # Optional curvature regularization: Delta^2 u_k = u_k-2u_(k-1)+u_(k-2).
+        # There is no u_(-2) at the first step, so start from k=1.
+        if k >= 1:
+            om_old = (mpc.opt_p["_u_prev", "omega"] if k == 1 else
+                      mpc.opt_x["_u", k - 2, 0, "omega"])
+            om_curv = (om_k - 2.0 * om_prev + om_old) / om_rng
+            mpc.nlp_obj += float(a.curvature_omega) * om_curv**2
+            if ap_fixed is None:
+                ap_old = (mpc.opt_p["_u_prev", "ap"] if k == 1 else
+                          mpc.opt_x["_u", k - 2, 0, "ap"])
+                ap_curv = (ap_k - 2.0 * ap_prev + ap_old) / ap_rng
+                mpc.nlp_obj += float(a.curvature_ap) * ap_curv**2
 
     mpc.create_nlp()
     return mpc
@@ -775,96 +834,65 @@ def _deint(xm, Kf):
     return np.concatenate([x[0::2], x[1::2]])
 
 
-def _phase_rate_bounds_omega(prev_omega: float, rate: float, dtheta: float,
-                             omega_lo: float, omega_hi: float) -> tuple[float, float]:
-    """Exact one-step bounds implied by |Delta omega|*omega <= rate*dtheta.
+def _mpc_speed_floor(pp: PhasePlant, a: argparse.Namespace) -> float:
+    """Experimental MPC-only floor; does not modify the Gym plant or MHE."""
+    rpm = getattr(a, "mpc_omega_floor_rpm", None)
+    floor = pp.omega_min if rpm is None else max(pp.omega_min, float(rpm) * (2.0 * np.pi / 60.0))
+    return float(floor)
 
-    This matches a zero-order-held phase interval of duration dtheta/omega.
-    The bound is used only as an external emergency net; the same inequality
-    is already imposed symbolically at every MPC prediction stage.
-    """
-    p = max(float(prev_omega), 1e-12)
-    A = max(float(rate) * float(dtheta), 0.0)
-    upper = 0.5 * (p + np.sqrt(p * p + 4.0 * A))
-    if A >= 0.25 * p * p:
-        lower = float(omega_lo)
-    else:
-        lower = 0.5 * (p + np.sqrt(max(p * p - 4.0 * A, 0.0)))
-    return float(max(omega_lo, lower)), float(min(omega_hi, upper))
+
+def _mpc_depth_ceiling(pp: PhasePlant, a: argparse.Namespace) -> float:
+    """Experimental MPC-only upper bound, leaving plant limits untouched."""
+    value = getattr(a, "mpc_ap_ceiling_mm", None)
+    return float(pp.ap_max if value is None else min(pp.ap_max, float(value)))
+
+
+def _interval_safety_ratio(current_w: np.ndarray, current_v: np.ndarray,
+                           dt: float, gain: float, last_interval_peak: float,
+                           w_limit: float) -> float:
+    """Conservative measured/first-order risk INDICATOR, not a future bound."""
+    predicted = float(np.max(np.abs(current_w) + gain * dt * np.abs(current_v)))
+    return max(predicted, float(last_interval_peak)) / max(float(w_limit), 1e-15)
 
 
 def _project_realized_rate_limits(u_cmd: np.ndarray, u_prev: np.ndarray,
                                   pp: PhasePlant, dtheta: float,
                                   omega_hi: float, omega_rate: float,
                                   ap_rate: float, ap_fixed: float | None,
-                                  n_iter: int = 8) -> tuple[np.ndarray, int, float]:
-    """Project a command onto actuator-rate limits using the *realized* hold time.
+                                  previous_dt: float | None = None,
+                                  omega_floor: float | None = None,
+                                  ap_ceiling: float | None = None) -> tuple[np.ndarray, int, float]:
+    """Project onto sampled-command slew limits using the PREVIOUS hold duration.
 
-    The OCP uses the nominal phase duration dtheta/omega, while the simulator
-    realizes an integer number of environment steps.  Iterating the projection
-    to a self-consistent n_hold removes the small rate-limit overshoot caused by
-    rounding the hold duration.
+    A control change u_k-u_(k-1) occurs after the elapsed interval dt_(k-1).
+    In the first step, where no preceding controlled interval exists, use
+    dtheta/omega_prev as the nominal initialization interval. This matches
+    the MPC horizon constraint and avoids self-referential (future-duration)
+    rate bounds. The plant's actual dt remains unchanged.
     """
     u = np.asarray(u_cmd, dtype=np.float64).reshape(-1).copy()
     prev = np.asarray(u_prev, dtype=np.float64).reshape(-1)
-    u[0] = float(np.clip(u[0], pp.omega_min, omega_hi))
-    u[1] = float(ap_fixed) if ap_fixed is not None else float(np.clip(u[1], pp.ap_min, pp.ap_max))
-
-    last_n = None
-    for _ in range(max(2, int(n_iter))):
-        n_hold = max(1, int(round((float(dtheta) / max(u[0], 1e-12)) / pp.env_dt)))
-        dt_real = float(n_hold * pp.env_dt)
-        du_om = max(float(omega_rate), 0.0) * dt_real
-        new_om = float(np.clip(u[0],
-                               max(pp.omega_min, prev[0] - du_om),
-                               min(omega_hi, prev[0] + du_om)))
-        if ap_fixed is not None:
-            new_ap = float(ap_fixed)
-        else:
-            du_ap = max(float(ap_rate), 0.0) * dt_real
-            new_ap = float(np.clip(u[1],
-                                   max(pp.ap_min, prev[1] - du_ap),
-                                   min(pp.ap_max, prev[1] + du_ap)))
-        u_new = np.array([new_om, new_ap], dtype=np.float64)
-        n_new = max(1, int(round((float(dtheta) / max(u_new[0], 1e-12)) / pp.env_dt)))
-        if last_n == n_new and np.allclose(u_new, u, rtol=0.0, atol=1e-12):
-            u = u_new
-            break
-        last_n = n_new
-        u = u_new
-
-    # One conservative final pass using the duration that will actually be used.
-    n_hold = max(1, int(round((float(dtheta) / max(u[0], 1e-12)) / pp.env_dt)))
-    dt_real = float(n_hold * pp.env_dt)
-    du_om = max(float(omega_rate), 0.0) * dt_real
-    u[0] = float(np.clip(u[0],
-                         max(pp.omega_min, prev[0] - du_om),
-                         min(omega_hi, prev[0] + du_om)))
+    dt_prev = (float(previous_dt) if previous_dt is not None else
+               float(dtheta) / max(float(prev[0]), 1e-12))
+    if not np.isfinite(dt_prev) or dt_prev <= 0.0:
+        raise ValueError("Previous actuator-hold duration must be positive and finite.")
+    om_step = max(float(omega_rate), 0.0) * dt_prev
+    lo = max(pp.omega_min, float(omega_floor) if omega_floor is not None else pp.omega_min)
+    if lo > min(omega_hi, prev[0] + om_step) + 1e-12:
+        raise ValueError("MPC speed floor cannot be reached under the actuator slew limit.")
+    u[0] = np.clip(u[0], max(lo, prev[0] - om_step),
+                   min(omega_hi, prev[0] + om_step))
     if ap_fixed is not None:
         u[1] = float(ap_fixed)
     else:
-        du_ap = max(float(ap_rate), 0.0) * dt_real
-        u[1] = float(np.clip(u[1],
-                             max(pp.ap_min, prev[1] - du_ap),
-                             min(pp.ap_max, prev[1] + du_ap)))
-    # If the last omega projection changed the integer hold, use the smaller of
-    # the two durations for a final conservative rate bound.
-    n2 = max(1, int(round((float(dtheta) / max(u[0], 1e-12)) / pp.env_dt)))
-    dt2 = float(n2 * pp.env_dt)
-    dt_bound = min(dt_real, dt2)
-    du_om = max(float(omega_rate), 0.0) * dt_bound
-    u[0] = float(np.clip(u[0],
-                         max(pp.omega_min, prev[0] - du_om),
-                         min(omega_hi, prev[0] + du_om)))
-    if ap_fixed is None:
-        du_ap = max(float(ap_rate), 0.0) * dt_bound
-        u[1] = float(np.clip(u[1],
-                             max(pp.ap_min, prev[1] - du_ap),
-                             min(pp.ap_max, prev[1] + du_ap)))
-    n_hold = max(1, int(round((float(dtheta) / max(u[0], 1e-12)) / pp.env_dt)))
-    dt_real = float(n_hold * pp.env_dt)
-    return u, n_hold, dt_real
-
+        ap_step = max(float(ap_rate), 0.0) * dt_prev
+        hi = min(pp.ap_max, float(ap_ceiling) if ap_ceiling is not None else pp.ap_max)
+        if hi < max(pp.ap_min, prev[1] - ap_step) - 1e-12:
+            raise ValueError("MPC depth ceiling cannot be reached under the actuator slew limit.")
+        u[1] = np.clip(u[1], max(pp.ap_min, prev[1] - ap_step),
+                       min(hi, prev[1] + ap_step))
+    n_hold = max(1, int(round(float(dtheta) / (max(u[0], 1e-12) * pp.env_dt))))
+    return u, n_hold, float(n_hold * pp.env_dt)
 
 def _delay_history_state(theta_now: float, pp: PhasePlant, M: int,
                          theta_hist: list[float], wc_hist: list[float]) -> np.ndarray:
@@ -889,6 +917,43 @@ def _delay_history_state(theta_now: float, pp: PhasePlant, M: int,
     return np.interp(targets, th, wc, left=wc[0], right=wc[-1]).astype(np.float64)
 
 
+def _hysteretic_guard_active(latched: bool, risk: float, entry: float,
+                             release: float, enabled: bool) -> bool:
+    """Pure Schmitt-trigger decision; 0 <= release <= entry <= 1."""
+    if not enabled:
+        return False
+    return bool(risk >= (release if latched else entry))
+
+
+def _apply_mhe_delay_policy(x_hat: np.ndarray, *, policy: str, mhe_ready: bool,
+                            K: int, M: int, theta_now: float, pp: PhasePlant,
+                            theta_hist: list[float], wc_hist: list[float],
+                            qh_pinv: np.ndarray, phi_now: np.ndarray) -> tuple[np.ndarray, str]:
+    """Construct a coherent MPC initial delay state without reading plant truth.
+
+    ``estimated`` trusts the MHE's internally constrained delay-transport state
+    when the MHE horizon is populated and the optimization succeeded.  Unlike
+    the older logic, it does NOT discard the successful MHE delay estimate.
+    ``modal-history`` interpolates the past MHE-reconstructed cutter displacement
+    to form the delay line; it is an alternative approximation for A/B testing.
+    ``pinv`` exactly preserves the legacy sensor pseudoinverse history.
+
+    Pseudoinverse history is unavoidable during initial MHE warm-up or failure.
+    Both output and delay-channel accuracy must be checked against ground truth
+    *only in evaluation diagnostics*, never inside this helper.
+    """
+    out = np.asarray(x_hat, dtype=np.float64).reshape(-1, 1).copy()
+    if policy == "estimated" and mhe_ready:
+        return out, "estimated"
+    if policy == "modal-history" and mhe_ready:
+        wc_hist[-1] = float(np.asarray(phi_now).reshape(-1) @ out[:K, 0])
+        out[2*K:2*K+M, 0] = _delay_history_state(
+            theta_now, pp, M, theta_hist, wc_hist)
+        return out, "modal-history"
+    out[2*K:2*K+M, 0] = np.asarray(qh_pinv).reshape(-1)
+    return out, "pinv-fallback" if policy != "pinv" else "pinv"
+
+
 def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metadata):
     plant = env.unwrapped.plant
     K = pp.K
@@ -905,6 +970,12 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
     # the plant sampling period -> omega <= dtheta/dt_env.
     omega_cap = dtheta / pp.env_dt if a.omega_sampling_cap else float("inf")
     omega_hi = float(min(pp.omega_max, omega_cap))
+    omega_floor = _mpc_speed_floor(pp, a)
+    ap_ceiling = _mpc_depth_ceiling(pp, a)
+    if omega_floor > omega_hi:
+        raise ValueError("MPC speed floor exceeds the maximum speed.")
+    if ap_fixed is not None and ap_ceiling < ap_fixed:
+        raise ValueError("MPC-only depth cap is below the episode-fixed cutting depth.")
 
     sched = PhaseSchedule(pp, dtheta, a.sharp, a.n_quad)
     xc, yc = pp.cutter_from_obs(oa)
@@ -913,13 +984,25 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
 
     mpc = build_mpc(model, pp, sched, M, a, ap_fixed, omega_cap)
     mhe = build_mhe(model, pp, sched, M, a)
+    if a.compile_nlp:
+        # Compilation is optional: it does not change the NLP or discretization.
+        # Keep generated C/shared libraries in a temporary directory, not the repo.
+        lib_suffix = (".dll" if sys.platform == "win32" else
+                      ".dylib" if sys.platform == "darwin" else ".so")
+        prefix = Path(a.nlp_compile_dir) / f"seed{seed}_mpc"
+        mpc.compile_nlp(cname=str(prefix) + ".c", libname=str(prefix) + lib_suffix,
+                        overwrite=True)
+        prefix = Path(a.nlp_compile_dir) / f"seed{seed}_mhe"
+        mhe.compile_nlp(cname=str(prefix) + ".c", libname=str(prefix) + lib_suffix,
+                        overwrite=True)
 
     z0m = pp.modal_from_obs(oa)
     phi0 = pp.phi_at(xc, yc)
     wc0 = float(phi0 @ z0m[:K])
     x0 = np.concatenate([z0m[:K], z0m[K:], np.full(M, wc0), [0.0]]).reshape(-1, 1)
-    u0 = np.array([[float(np.clip(0.5 * (pp.omega_min + omega_hi), pp.omega_min, omega_hi))],
-                   [ap_fixed if ap_fixed is not None else pp.ap_min]])
+    u0 = np.array([[float(np.clip(0.5 * (pp.omega_min + omega_hi), omega_floor, omega_hi))],
+                   [ap_fixed if ap_fixed is not None else
+                    max(pp.ap_min, float(a.minimum_cut_depth))]])
     mhe.x0 = x0
     mhe.u0 = u0
     mhe.set_initial_guess()
@@ -928,6 +1011,8 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
     mpc.set_initial_guess()
 
     u_prev = u0.reshape(-1).copy()
+    previous_hold_dt = None
+    previous_interval_peak = 0.0
 
     logs = dict(times=[], observations=[], physical_signals=[], x_modal=[], actions=[],
                 physical_actions=[], rewards=[], w_sensor=[], wdot_sensor=[],
@@ -940,7 +1025,12 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
              mpc_solver_success=[], mpc_return_status=[],
              mhe_solver_success=[], mhe_return_status=[],
              safety_guard_active=[], safety_guard_ratio=[],
-             delay_history_span_rad=[])
+             delay_history_span_rad=[],
+             measured_w_ratio=[], measured_velocity_ratio=[],
+             previous_interval_peak_ratio=[],
+             cutter_reconstruction_error_over_wlimit=[],
+             mhe_history_disagreement_rms=[], mhe_meas_residual_rms=[],
+             mhe_history_policy_used=[], mhe_disturbance_accel=[])
 
     reason = None
     term_f = trunc_f = passed = False
@@ -948,6 +1038,7 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
     n_ctrl = 0
     t0 = time.time()
     x_hat = x0.copy()
+    guard_latched = False
 
     # The regenerative transport state is exactly a phase history of cutter
     # displacement.  Maintain that history independently of the MHE so the MPC
@@ -981,7 +1072,8 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
             u = u_prev.copy()
             if ap_fixed is None:
                 dt_nom = dtheta / max(u_prev[0], 1e-12)
-                u[1] = max(pp.ap_min, u_prev[1] - float(a.ap_rate) * dt_nom)
+                u[1] = max(max(pp.ap_min, float(a.minimum_cut_depth)),
+                           u_prev[1] - float(a.ap_rate) * dt_nom)
 
         # Measured one-interval safety guard.  It is the first-order envelope
         # |w(t+dt)| <= |w(t)| + dt*|wdot(t)|, evaluated with the candidate hold
@@ -991,12 +1083,24 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
         w_now = meas_now[:pp.nS] * pp.w_obs
         wd_now = meas_now[pp.nS:] * pp.wd_obs
         dt_guard = dtheta / max(float(u[0]), 1e-12)
-        guard = float(np.max(np.abs(w_now) + float(a.safety_guard_gain) * dt_guard * np.abs(wd_now)))
-        guard_ratio = guard / max(pp.w_limit, 1e-15)
-        guard_active = bool(a.safety_guard and guard_ratio >= float(a.safety_guard_margin))
+        guard_ratio = _interval_safety_ratio(
+            w_now, wd_now, dt_guard, float(a.safety_guard_gain),
+            previous_interval_peak, pp.w_limit)
+        d["previous_interval_peak_ratio"].append(previous_interval_peak / pp.w_limit)
+        d["measured_w_ratio"].append(float(np.max(np.abs(w_now)) / max(pp.w_limit, 1e-15)))
+        d["measured_velocity_ratio"].append(float(
+            np.max(dt_guard * np.abs(wd_now)) / max(pp.w_limit, 1e-15)))
+        # Schmitt-trigger-like safety state: enter early, stay in retreat mode
+        # until the measured envelope has clearly returned below the lower
+        # threshold. This removes noisy switching of the emergency intervention.
+        guard_latched = _hysteretic_guard_active(
+            guard_latched, guard_ratio, float(a.safety_guard_margin),
+            float(a.guard_release_margin), bool(a.safety_guard))
+        guard_active = guard_latched
         if guard_active and ap_fixed is None:
             u[1] = min(float(u[1]),
-                       max(pp.ap_min, u_prev[1] - float(a.ap_rate) * dt_guard))
+                       max(max(pp.ap_min, float(a.minimum_cut_depth)),
+                           u_prev[1] - float(a.ap_rate) * dt_guard))
         d["safety_guard_active"].append(guard_active)
         d["safety_guard_ratio"].append(guard_ratio)
 
@@ -1005,7 +1109,9 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
         # visible with nominal phase-time clipping.
         u_raw = u.copy()
         u, n_hold, dt_real = _project_realized_rate_limits(
-            u, u_prev, pp, dtheta, omega_hi, a.omega_rate, a.ap_rate, ap_fixed
+            u, u_prev, pp, dtheta, omega_hi, a.omega_rate, a.ap_rate,
+            ap_fixed, previous_dt=previous_hold_dt,
+            omega_floor=omega_floor, ap_ceiling=ap_ceiling
         )
         tol = 1e-6 * np.maximum(1.0, np.abs(u_raw))
         d["rate_clip_active"].append(bool(np.any(np.abs(u - u_raw) > tol)))
@@ -1024,6 +1130,7 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
         d["dt_interval_s"].append(float(dt_real))
         theta_before = theta_now
         done = False
+        measured_peak_this_interval = 0.0
         for _ in range(n_hold):
             obs, rew, term, trunc, info = env.step(an)
             oa = np.asarray(obs, dtype=np.float64).reshape(-1)
@@ -1032,6 +1139,9 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
             logs["observations"].append(oa.tolist())
             ws = np.asarray(info.get("w_sensor", np.zeros(pp.nS)), dtype=np.float64).reshape(-1)
             wds = np.asarray(info.get("wdot_sensor", np.zeros(pp.nS)), dtype=np.float64).reshape(-1)
+            if ws.size and np.all(np.isfinite(ws)):
+                measured_peak_this_interval = max(
+                    measured_peak_this_interval, float(np.max(np.abs(ws))))
             logs["w_sensor"].append(ws.tolist())
             logs["wdot_sensor"].append(wds.tolist())
             logs["physical_signals"].append(np.concatenate([ws, wds]).tolist())
@@ -1056,6 +1166,10 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
                 done = True
                 break
 
+        # Guard for the NEXT optimization uses the largest observation from
+        # this hold, not merely its final potentially zero-crossing sample.
+        previous_interval_peak = measured_peak_this_interval
+
         # ---- re-synchronise the schedule to the plant's OWN spindle phase ----
         xc, yc = pp.cutter_from_obs(oa)
         theta_now = float(_sf(info.get("spindle_phase_rad"), theta_before + dtheta))
@@ -1067,6 +1181,15 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
         zm_direct = pp.modal_from_obs(oa)
         phi_direct = pp.phi_at(xc, yc)
         wc_direct = float(phi_direct @ zm_direct[:K])
+        # Evaluation-only diagnostic: the simulator exposes its full modal
+        # state in info, but this quantity NEVER feeds the controller.
+        # A large error here identifies the 2-sensor -> 3-mode pseudoinverse
+        # as a likely source of wrong regenerative-delay predictions.
+        if "x_modal" in info:
+            full_eta = _deint(info["x_modal"], pp.K_full)[:pp.K_full]
+            wc_true = float(pp._phi_full(xc, yc) @ full_eta)
+            d["cutter_reconstruction_error_over_wlimit"].append(
+                abs(wc_direct - wc_true) / max(pp.w_limit, 1e-15))
         delay_theta_hist.append(float(theta_now))
         delay_wc_hist.append(wc_direct)
         # Retain a little more than one tooth pitch for interpolation.
@@ -1101,12 +1224,31 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
             # modes.  The delay line is supplied separately from phase history.
             x_hat = np.concatenate([zm_direct[:K], zm_direct[K:],
                                     qh_hist, [0.0]]).reshape(-1, 1)
-        # qh is not an arbitrary hidden state: q(xi,theta)=wc(theta-p*xi).
-        # Enforce this identity for the state passed to the MPC even when MHE is
-        # otherwise accepted.  This removes a common source of regenerative-force
-        # prediction error without altering the structural model.
-        x_hat[2*K:2*K + M, 0] = qh_hist
-        d["mhe_solve_ok"].append(bool(eok and not warm))
+        # A solved MHE includes a dynamically constrained estimate of the
+        # transport history. Overwriting it with two-sensor pseudoinverse data
+        # discards information from its time-window and can corrupt regeneration.
+        # Keep legacy behavior selectable for an exact A/B comparison.
+        mhe_ready = bool(eok and not warm)
+        if mhe_ready:
+            disagreement = float(np.sqrt(np.mean(
+                (x_hat[2*K:2*K+M, 0] - qh_hist)**2))
+                / max(pp.w_limit, 1e-15))
+        else:
+            disagreement = float("nan")
+        d["mhe_history_disagreement_rms"].append(disagreement)
+        x_hat, policy_used = _apply_mhe_delay_policy(
+            x_hat, policy=a.mhe_history_policy, mhe_ready=mhe_ready,
+            K=K, M=M, theta_now=theta_now, pp=pp,
+            theta_hist=delay_theta_hist, wc_hist=delay_wc_hist,
+            qh_pinv=qh_hist, phi_now=phi_direct)
+        d["mhe_history_policy_used"].append(policy_used)
+        # Residual in the actual normalized measurement channels (not truth).
+        est_ob = np.concatenate([pp.Phi @ x_hat[:K, 0] / pp.w_obs,
+                                 pp.Phi @ x_hat[K:2*K, 0] / pp.wd_obs])
+        d["mhe_meas_residual_rms"].append(float(np.sqrt(
+            np.mean((est_ob - pp.meas_from_obs(oa))**2))))
+        d["mhe_disturbance_accel"].append(float(x_hat[-1, 0]))
+        d["mhe_solve_ok"].append(mhe_ready)
 
         if "x_modal" in info:
             zt = _deint(info["x_modal"], pp.K_full)[np.concatenate([pp.sel, pp.K_full + pp.sel])]
@@ -1120,6 +1262,7 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
             d["ekf_modal_err"].append(me)
 
         u_prev = u.copy()
+        previous_hold_dt = dt_real
         if a.progress_every and n_ctrl % int(a.progress_every) == 0:
             el = time.time() - t0
             wmax = float(np.max(np.abs(np.asarray(logs["w_sensor"])))) if logs["w_sensor"] else 0.0
@@ -1143,8 +1286,9 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
     ua = np.asarray(d["u_applied_ap"], dtype=np.float64)
     dti = np.asarray(d["dt_interval_s"], dtype=np.float64)
     if uo.size > 1:
-        om_rate = float(np.max(np.abs(np.diff(uo)) / np.maximum(dti[1:], 1e-30)))
-        ap_rate = float(np.max(np.abs(np.diff(ua)) / np.maximum(dti[1:], 1e-30)))
+        # Commands changed after the preceding hold interval (dt_i, not dt_(i+1)).
+        om_rate = float(np.max(np.abs(np.diff(uo)) / np.maximum(dti[:-1], 1e-30)))
+        ap_rate = float(np.max(np.abs(np.diff(ua)) / np.maximum(dti[:-1], 1e-30)))
     else:
         om_rate = ap_rate = float("nan")
     print(f"    seed {seed}: env_steps={len(logs['rewards'])} return={sum(logs['rewards']):.1f} "
@@ -1212,6 +1356,10 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
                                       if d["rate_clip_active"] else float("nan")),
             "safety_guard_active_frac": (float(np.mean(d["safety_guard_active"]))
                                           if d["safety_guard_active"] else 0.0),
+            "mpc_omega_floor_rpm": a.mpc_omega_floor_rpm,
+            "mpc_ap_ceiling_mm": a.mpc_ap_ceiling_mm,
+            "previous_hold_peak_max_ratio": (float(np.max(d["previous_interval_peak_ratio"]))
+                                               if d["previous_interval_peak_ratio"] else 0.0),
             "max_safety_guard_ratio": (float(np.max(d["safety_guard_ratio"]))
                                        if d["safety_guard_ratio"] else float("nan")),
             "realized_max_omega_rate_rad_s2": om_rate,
@@ -1219,7 +1367,15 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
             "omega_rate_limit_rad_s2": float(a.omega_rate),
             "ap_rate_limit_mm_s": float(a.ap_rate),
             "omega_span_rad_s": float(oms.max() - oms.min()) if oms.size else float("nan"),
-            "modal_participation_kept": float(pp.participation_kept)},
+            "modal_participation_kept": float(pp.participation_kept),
+            "mhe_history_policy": str(a.mhe_history_policy),
+            "mhe_meas_residual_rms_mean": float(np.nanmean(d["mhe_meas_residual_rms"])),
+            "mhe_history_disagreement_rms_mean": (
+                float(np.nanmean(d["mhe_history_disagreement_rms"]))
+                if np.any(np.isfinite(d["mhe_history_disagreement_rms"]))
+                else float("nan")),
+            "mhe_disturbance_accel_abs_p95": float(np.nanpercentile(
+                np.abs(d["mhe_disturbance_accel"]), 95))},
     }
 
 
@@ -1540,8 +1696,9 @@ def main() -> int:
                    help="Physical-time penalty in the phase-domain objective. Because "
                         "dt=dtheta/omega, this term appears as q_time/omega and provides "
                         "the explicit throughput incentive for higher spindle speed.")
-    P.add_argument("--q-mrr", type=float, default=0,
-                   help="Weight on removed volume (rewards higher axial depth).")
+    P.add_argument("--q-mrr", type=float, default=0.0,
+                   help="Optional override of --prod-weight (positive values only); "
+                        "normalized physical MRR is proportional to omega*ap.")
     P.add_argument("--q-omega", type=float, default=10.0,
                    help="Quadratic preference for --omega-ref/--omega-pref-frac.  It regularizes "
                         "speed selection without preventing NMPC from moving speed for chatter suppression.")
@@ -1551,6 +1708,12 @@ def main() -> int:
                    help="Normalized spindle-speed move penalty; larger values suppress one-step rpm notches.")
     P.add_argument("--r-ap", type=float, default=1.0,
                    help="Normalized axial-depth move penalty for smoother depth commands.")
+    P.add_argument("--curvature-omega", type=float, default=8.0,
+                   help="Nonnegative second-difference penalty on normalized speed; "
+                        "use 0 for the original formulation.")
+    P.add_argument("--curvature-ap", type=float, default=2.0,
+                   help="Nonnegative second-difference penalty on normalized depth; "
+                        "use 0 for the original formulation.")
     P.add_argument("--omega-ref", type=float, default=None,
                    help="Optional preferred spindle speed [rad/s].  If omitted, --omega-pref-frac is used.")
     P.add_argument("--omega-pref-frac", type=float, default=0.85,
@@ -1573,6 +1736,12 @@ def main() -> int:
 
     P.add_argument("--prod-weight", type=float, default=60.0,
                 help="Weight on productivity (omega_norm * ap_norm).")
+    P.add_argument("--prod-gate-disp", type=float, default=0.0,
+                   help="Coefficient of output-displacement penalty inside a smooth "
+                        "productivity gate 1/(1+q_d*disp_metric+q_v*vel_metric); "
+                        "0 preserves the original ungated economic reward.")
+    P.add_argument("--prod-gate-vel", type=float, default=0.0,
+                   help="Coefficient of output-velocity penalty in the productivity gate.")
     P.add_argument("--speed-cost", type=float, default=0.0,
                 help="Optional legacy quadratic cost on absolute normalized spindle speed. "
                      "Normally leave at 0 and use --q-omega for a preferred-speed regularizer.")
@@ -1583,6 +1752,34 @@ def main() -> int:
                    help="Trigger the safety guard when |w|+dt|wdot| exceeds this fraction of w_limit.")
     P.add_argument("--safety-guard-gain", type=float, default=1.0,
                    help="Multiplier on the dt*|wdot| term in the measured safety envelope.")
+    P.add_argument("--guard-release-margin", type=float, default=0.75,
+                   help="Lower normalized-vibration threshold for ending a depth-retreat "
+                        "episode; use a value below --safety-guard-margin for hysteresis.")
+    P.add_argument("--preview-gain", type=float, default=0.0,
+                   help="Soft prediction-envelope preview in units of one phase-cell time; "
+                        "0 disables, 1 enables w + (dtheta/omega)*wdot. Not a robust guarantee.")
+    P.add_argument("--minimum-cut-depth", type=float, default=0.0,
+                   help="Optional nonzero axial depth floor (mm) for roughing only. "
+                        "Set according to machining requirements.")
+    P.add_argument("--mpc-omega-floor-rpm", type=float, default=None,
+                   help="DIAGNOSTIC ONLY: restrict MPC's speed decisions to rpm >= this "
+                        "value. Does not change plant range or sensor dynamics.")
+    P.add_argument("--mpc-ap-ceiling-mm", type=float, default=None,
+                   help="DIAGNOSTIC ONLY: upper bound for commanded depth in mm. "
+                        "Does not change the plant's permissible depth or reward.")
+    P.add_argument("--mhe-history-policy", choices=("pinv", "estimated", "modal-history"),
+                   default="pinv", help="How the MPC receives the regenerative delay state: "
+                   "'pinv' reproduces V3, 'estimated' preserves the successful MHE "
+                   "transport estimate, and 'modal-history' interpolates past MHE "
+                   "modal predictions. During MHE warm-up/failure use pinv fallback. "
+                   "Compare on the same seed; neither policy uses plant truth.")
+    P.add_argument("--balanced-pass", action="store_true",
+                   help="Experimental joint speed/depth economic NMPC profile between "
+                   "the aggressive baseline and overly conservative stability-first "
+                   "profile; preserves the original plant and action bounds.")
+    P.add_argument("--stability-first", action="store_true",
+                   help="Apply a conservative EXPERIMENTAL MPC-only tuning profile, "
+                        "without changing explicitly supplied CLI options, plant or RL.")
 
 
     # MHE weights
@@ -1597,6 +1794,9 @@ def main() -> int:
     # solver
     P.add_argument("--max-iter", type=int, default=200)
     P.add_argument("--max-wall-time-s", type=float, default=4.0)
+    P.add_argument("--compile-nlp", action=argparse.BooleanOptionalAction, default=False,
+                   help="Compile unchanged MPC and MHE CasADi NLPs to temporary shared "
+                        "libraries (requires working C compiler; benchmark before using).")
     P.add_argument("--progress-every", type=int, default=100,
                    help="Print a closed-loop progress line every N control steps (0 = off).")
     # verification
@@ -1607,6 +1807,71 @@ def main() -> int:
     P.add_argument("--verify-only", action="store_true")
     a = P.parse_args()
 
+    if a.balanced_pass and a.stability_first:
+        P.error("Choose either --balanced-pass or --stability-first, not both.")
+    if a.balanced_pass:
+        # These are trial weights, NOT identified optima or safety guarantees.
+        # At a fixed modal state q_energy/w_margin^2 ~= the original baseline;
+        # this avoids the ~3.5x energy reweighting of --stability-first.
+        # Do not favor a fixed spindle speed and do not restrict action bounds.
+        trial = {
+            "q_energy": 10.0, "q_terminal": 8.0,
+            "prod_weight": 55.0, "q_omega": 8.0,
+            "r_omega": 8.0, "r_ap": 2.0,
+            "curvature_omega": 10.0, "curvature_ap": 4.0,
+            "w_margin": 0.55, "hard_w_margin": 0.80,
+            "safety_guard_margin": 0.68, "guard_release_margin": 0.58,
+            "safety_guard_gain": 1.25, "preview_gain": 1.0,
+            "omega_rate": 6000.0,
+            "minimum_cut_depth": 0.0,
+            "prod_gate_disp": 1.0, "prod_gate_vel": 0.15,
+            "mhe_history_policy": "estimated",
+        }
+        cli = sys.argv[1:]
+        def provided(k):
+            flag = "--" + k.replace("_", "-")
+            return any(v == flag or v.startswith(flag + "=") for v in cli)
+        activated = {}
+        for name, value in trial.items():
+            if not provided(name):
+                setattr(a, name, value)
+                activated[name] = value
+        print("Balanced-pass NMPC/MHE experiment (parameters may be overridden):",
+              activated, flush=True)
+
+    if a.stability_first:
+        # Tune only non-explicit arguments. This is a reproducible starting
+        # configuration, not a certified safe controller or a fitted optimum.
+        # Plant, estimator, control sampling, delay order and solver unchanged.
+        profile = {
+            "q_energy": 18.0, "q_terminal": 10.0,
+            "prod_weight": 45.0, "q_omega": 14.0,
+            "r_omega": 16.0, "r_ap": 5.0,
+            "curvature_omega": 20.0, "curvature_ap": 6.0,
+            "w_margin": 0.40, "hard_w_margin": 0.72,
+            "safety_guard_margin": 0.62, "guard_release_margin": 0.52,
+            "safety_guard_gain": 1.5, "preview_gain": 1.0,
+            "omega_rate": 3000.0, "minimum_cut_depth": 0.5,
+            "prod_gate_disp": 1.0, "prod_gate_vel": 0.1,
+        }
+        supplied = sys.argv[1:]
+        def supplied_flag(flag: str) -> bool:
+            return any(v == flag or v.startswith(flag + "=") for v in supplied)
+        applied = {}
+        for field, value in profile.items():
+            if not supplied_flag("--" + field.replace("_", "-")):
+                setattr(a, field, value)
+                applied[field] = value
+        print("Stability-first MPC profile (experimental, override individual CLI flags):",
+              applied, flush=True)
+
+    if a.mpc_omega_floor_rpm is not None and (
+            not np.isfinite(a.mpc_omega_floor_rpm) or a.mpc_omega_floor_rpm <= 0):
+        P.error("--mpc-omega-floor-rpm must be a positive finite number.")
+    if a.mpc_ap_ceiling_mm is not None and (
+            not np.isfinite(a.mpc_ap_ceiling_mm) or a.mpc_ap_ceiling_mm < 0):
+        P.error("--mpc-ap-ceiling-mm must be a finite nonnegative number.")
+
     for name in ("max_env_steps", "max_episode_steps"):
         value = getattr(a, name)
         if value is not None and value <= 0:
@@ -1614,12 +1879,24 @@ def main() -> int:
 
     if not (0.0 < a.safety_guard_margin <= 1.0):
         P.error("--safety-guard-margin must lie in (0,1].")
+    if not (0.0 <= a.guard_release_margin <= a.safety_guard_margin):
+        P.error("Require 0 <= --guard-release-margin <= --safety-guard-margin.")
+    if not (0.0 <= a.preview_gain <= 2.0):
+        P.error("--preview-gain must lie in [0,2] for this local approximation.")
+    if a.minimum_cut_depth < 0.0:
+        P.error("--minimum-cut-depth must be nonnegative.")
     if a.safety_guard_margin > a.hard_w_margin:
         P.error("--safety-guard-margin must not exceed --hard-w-margin.")
     if a.safety_guard_gain < 0.0:
         P.error("--safety-guard-gain must be non-negative.")
     if not (0.0 <= a.omega_pref_frac <= 1.0):
         P.error("--omega-pref-frac must lie in [0,1].")
+    if a.curvature_omega < 0 or a.curvature_ap < 0:
+        P.error("Second-difference penalties must be nonnegative.")
+    if a.q_mrr < 0 or a.prod_weight < 0:
+        P.error("Productivity weights must be nonnegative.")
+    if a.prod_gate_disp < 0 or a.prod_gate_vel < 0:
+        P.error("Productivity-gate weights must be nonnegative.")
 
     register_envs()
     out = Path(a.out_dir).resolve()
@@ -1693,6 +1970,10 @@ def main() -> int:
         print("    WARNING: at low spindle speed one finite element spans more than one cycle "
               "of the fastest retained structural mode. Low-speed predictions can have large "
               "phase error; increase --coll-ni or reduce --dtheta-frac before trusting that region.")
+    if a.mpc_omega_floor_rpm is not None or a.mpc_ap_ceiling_mm is not None:
+        print(f"  DIAGNOSTIC ONLY controller bounds: rpm >= "
+              f"{omega_to_rpm(_mpc_speed_floor(pp,a)):.0f}; "
+              f"ap <= {_mpc_depth_ceiling(pp,a):.2f} mm (PLANT UNCHANGED)")
     print(f"  spindle {omega_to_rpm(pp.omega_min):.0f}-{omega_to_rpm(pp.omega_max):.0f} rpm, "
           f"ap {pp.ap_min:g}-{pp.ap_max:g} mm, |w|<={pp.w_limit:g} m (hard/termination)")
     print(f"  vibration target: soft {a.w_margin:g}*w_limit = {a.w_margin*pp.w_limit:g} m; "
@@ -1766,33 +2047,46 @@ def main() -> int:
                    "w_hard_limit": a.hard_w_margin * pp.w_limit,
                    "q_energy": a.q_energy, "q_time": a.q_time, "q_omega": a.q_omega,
                    "omega_pref_frac": a.omega_pref_frac,
-                   "prod_weight": a.prod_weight, "speed_cost": a.speed_cost,
+                   "prod_weight": a.q_mrr if a.q_mrr > 0.0 else a.prod_weight,
+                   "speed_cost": a.speed_cost,
                    "r_omega": a.r_omega, "r_ap": a.r_ap,
+                   "curvature_omega": a.curvature_omega,
+                   "curvature_ap": a.curvature_ap,
                    "objective_measure": "physical-time running cost transformed by dt=dtheta/omega",
-                   "rate_constraints": "hard full-horizon phase-transformed physical slew limits",
-                   "revision": "robust-history-output-guard-v4",
+                   "rate_constraints": "sampled-command slew limits timed by preceding phase hold",
+                   "revision": "mpc-slew-curvature-compiled-optional-v5",
                    "solver_acceptance": "finite+success; failed solve triggers rate-limited depth retreat",
                    "delay_feedback": "phase-history reconstruction q(xi)=wc(theta-p*xi)",
-                   "safety_guard_margin": a.safety_guard_margin}
+                   "safety_guard_margin": a.safety_guard_margin,
+                   "guard_release_margin": a.guard_release_margin,
+                   "preview_gain": a.preview_gain,
+                   "minimum_cut_depth": a.minimum_cut_depth,
+                   "prod_gate_disp": a.prod_gate_disp,
+                   "prod_gate_vel": a.prod_gate_vel,
+                   "stability_first": a.stability_first,
+                   "mpc_omega_floor_rpm": a.mpc_omega_floor_rpm,
+                   "mpc_ap_ceiling_mm": a.mpc_ap_ceiling_mm}
 
-    for seed in a.seeds:
-        trajs = []
-        for ep in range(a.n_episodes):
-            ro: dict[str, Any] = {}
-            if a.y0 is not None:
-                ro["y0"] = float(np.clip(a.y0, 0.0, pp.L2))
-            if a.ap is not None and not pp.control_ap:
-                ro["ap"] = float(a.ap)
-            print(f"  [seed {seed} ep {ep}] phase-domain closed loop...")
-            r = run_episode(env, pp, model, M, a, seed=int(seed * 1000 + ep),
-                            reset_options=ro or None, metadata=meta)
-            r["episode"] = int(ep)
-            r["seed"] = int(seed)
-            trajs.append(r)
-        p = out / f"trajectories_seed{seed}.json"
-        with open(p, "w", encoding="utf-8") as f:
-            json.dump(_json(trajs), f, indent=2)
-        print(f"  saved -> {p}")
+    with tempfile.TemporaryDirectory(prefix="milling_mpc_nlp_") as compiled_dir:
+        a.nlp_compile_dir = compiled_dir
+        for seed in a.seeds:
+            trajs = []
+            for ep in range(a.n_episodes):
+                ro: dict[str, Any] = {}
+                if a.y0 is not None:
+                    ro["y0"] = float(np.clip(a.y0, 0.0, pp.L2))
+                if a.ap is not None and not pp.control_ap:
+                    ro["ap"] = float(a.ap)
+                print(f"  [seed {seed} ep {ep}] phase-domain closed loop...")
+                r = run_episode(env, pp, model, M, a, seed=int(seed * 1000 + ep),
+                                reset_options=ro or None, metadata=meta)
+                r["episode"] = int(ep)
+                r["seed"] = int(seed)
+                trajs.append(r)
+            p = out / f"trajectories_seed{seed}.json"
+            with open(p, "w", encoding="utf-8") as f:
+                json.dump(_json(trajs), f, indent=2)
+            print(f"  saved -> {p}")
 
     env.close()
     print("Done.")

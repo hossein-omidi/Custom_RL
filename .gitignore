@@ -49,3 +49,6 @@ Thumbs.db
 .pytest_cache/
 .coverage
 htmlcov/
+mpc_phase_trajectories/trajectories_seed0.json
+mpc_phase_trajectories/trajectories_seed0.json
+mpc_phase_trajectories/trajectories_seed0.json
