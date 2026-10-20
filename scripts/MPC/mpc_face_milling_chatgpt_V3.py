@@ -1266,9 +1266,10 @@ def run_episode(env, pp: PhasePlant, model, M, a, *, seed, reset_options, metada
         if a.progress_every and n_ctrl % int(a.progress_every) == 0:
             el = time.time() - t0
             wmax = float(np.max(np.abs(np.asarray(logs["w_sensor"])))) if logs["w_sensor"] else 0.0
-            print(f"      [{n_ctrl:5d} ctrl / {step:6d} env steps] {el:6.1f}s "
-                  f"({1e3*el/max(n_ctrl,1):.0f} ms/ctrl) omega={u[0]:7.1f} ap={u[1]:6.3f} "
-                  f"max|w|={wmax:.2e} mpc_ok={100*np.mean(d['feasible']):.0f}% "
+            simulated_seconds = float(logs["times"][-1]) if logs["times"] else float(step * pp.env_dt)
+            print(f"      [{n_ctrl:5d} ctrl / {step:6d} env steps] wall={el:6.1f}s sim={simulated_seconds:.3f}s "
+                  f"({1e3*el/max(n_ctrl,1):.0f} wall-ms/ctrl) omega={u[0]:7.1f} ap={u[1]:6.3f} "
+                  f"peak|w|_so_far={wmax:.2e} mpc_ok={100*np.mean(d['feasible']):.0f}% "
                   f"guard={d['safety_guard_ratio'][-1] if d['safety_guard_ratio'] else float('nan'):.2f}", flush=True)
         if done:
             break
@@ -1645,6 +1646,8 @@ def main() -> int:
                    choices=["dense", "productive", "quadratic", "sparse"])
     P.add_argument("--dynamics-uncertainty-std", type=float, default=0.0)
     P.add_argument("--randomize-y0", action=argparse.BooleanOptionalAction, default=True)
+    P.add_argument("--reset-seed-offset", type=int, default=None,
+                   help="Optional paired-evaluation seed offset. Without this flag retain historical MPC episode seeds.")
     P.add_argument("--plant-override", default=None,
                    help="JSON dict of plant kwargs (e.g. '{\"omega_max\":418.879,"
                         "\"w_limit\":0.003}') for reproducing another machine's setup.")
@@ -2039,6 +2042,10 @@ def main() -> int:
 
     model, _ = build_model(pp, M, a.chip_eps, a.n_quad)
     meta = plant_plot_metadata(env)
+    meta["initial_eta_std"] = float(pp.plant.initial_eta_std)
+    meta["initial_etad_std"] = float(pp.plant.initial_etad_std)
+    meta["process_noise_std"] = float(env.unwrapped.process_noise_std)
+    meta["obs_noise_std"] = float(env.unwrapped.obs_noise_std)
     meta.update(controller="mpc", estimator="mhe-phase", reward_id=a.reward)
     meta["mpc"] = {"framework": "do-mpc phase-domain pseudospectral",
                    "n_modes": pp.K, "n_delay": M, "mpc_horizon": a.mpc_horizon,
@@ -2078,7 +2085,8 @@ def main() -> int:
                 if a.ap is not None and not pp.control_ap:
                     ro["ap"] = float(a.ap)
                 print(f"  [seed {seed} ep {ep}] phase-domain closed loop...")
-                r = run_episode(env, pp, model, M, a, seed=int(seed * 1000 + ep),
+                actual_seed = int(seed * 1000 + ep) if a.reset_seed_offset is None else int(seed + a.reset_seed_offset + ep)
+                r = run_episode(env, pp, model, M, a, seed=actual_seed,
                                 reset_options=ro or None, metadata=meta)
                 r["episode"] = int(ep)
                 r["seed"] = int(seed)
@@ -2097,3 +2105,4 @@ def main() -> int:
 if __name__ == "__main__":
     sys.exit(main())
     
+# FAIR_EVAL_2026_10

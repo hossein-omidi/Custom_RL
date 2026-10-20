@@ -365,6 +365,12 @@ def main() -> int:
 
     parser.add_argument("--dt", type=float, default=EVAL_DEFAULT_DT, help="Must match training RK4 substep [s]")
     parser.add_argument("--n-substeps", type=int, default=EVAL_DEFAULT_N_SUBSTEPS)
+    parser.add_argument("--policy-hold-env-steps", type=int, default=1,
+                        help="Hold one RL policy action for this many environment steps; physical safety is checked every environment step.")
+    parser.add_argument("--reset-seed-offset", type=int, default=1000,
+                        help="Offset used for actual environment reset seed (default preserves historical RL evaluation).")
+    parser.add_argument("--plant-override", default=None,
+                        help="JSON object limited to initial_eta_std, initial_etad_std, process_noise_std, obs_noise_std.")
 
     parser.add_argument(
         "--reward",
@@ -434,6 +440,8 @@ def main() -> int:
         raise SystemExit("--n-mc must be positive.")
     if args.dt <= 0.0:
         raise SystemExit("--dt must be positive.")
+    if args.policy_hold_env_steps <= 0:
+        raise SystemExit("--policy-hold-env-steps must be positive.")
     if args.n_substeps <= 0:
         raise SystemExit("--n-substeps must be positive.")
     if args.y0 is not None and args.y_position:
@@ -493,6 +501,13 @@ def main() -> int:
             dynamics_uncertainty_std=args.dynamics_uncertainty_std,
             randomize_y0=args.randomize_y0,
         )
+        if args.plant_override:
+            import json as _fair_json
+            overrides = _fair_json.loads(args.plant_override)
+            allowed = {"initial_eta_std", "initial_etad_std", "process_noise_std", "obs_noise_std"}
+            if not isinstance(overrides, dict) or not set(overrides).issubset(allowed):
+                raise ValueError(f"Fair evaluation --plant-override accepts only {sorted(allowed)}")
+            env_kwargs.update(overrides)
 
         env = make_registered_plate_env(_env_id=args.env_id, **env_kwargs)
 
@@ -500,6 +515,11 @@ def main() -> int:
         metadata = _get_metadata(env, max_steps, args.reward)
 
         plant = env.unwrapped.plant
+        # Record the complete stochastic/initialization protocol for paired audit.
+        metadata["initial_eta_std"] = float(plant.initial_eta_std)
+        metadata["initial_etad_std"] = float(plant.initial_etad_std)
+        metadata["process_noise_std"] = float(env.unwrapped.process_noise_std)
+        metadata["obs_noise_std"] = float(env.unwrapped.obs_noise_std)
         tau_min = 2.0 * np.pi / (max(int(getattr(plant, "N", 1)), 1) * max(float(plant.omega_max), 1e-12))
         if float(args.dt) >= tau_min:
             env.close()
@@ -512,7 +532,10 @@ def main() -> int:
         control_dt = float(args.dt) * int(args.n_substeps)
         metadata["eval_dt"] = float(args.dt)
         metadata["eval_n_substeps"] = int(args.n_substeps)
-        metadata["eval_control_step_s"] = float(control_dt)
+        metadata["eval_control_step_s"] = float(control_dt * args.policy_hold_env_steps)
+        metadata["eval_environment_step_s"] = float(control_dt)
+        metadata["eval_policy_hold_env_steps"] = int(args.policy_hold_env_steps)
+        metadata["eval_reset_seed_offset"] = int(args.reset_seed_offset)
         metadata["eval_dynamics_uncertainty_std"] = float(args.dynamics_uncertainty_std)
         metadata["eval_randomize_y0"] = bool(args.randomize_y0)
         metadata["eval_tau_min_s"] = float(tau_min)
@@ -545,7 +568,7 @@ def main() -> int:
                 reset_options["ap"] = float(args.ap)
 
             for mc in range(args.n_mc):
-                run_seed = seed + 1000 + ep * args.n_mc + mc
+                run_seed = seed + args.reset_seed_offset + ep * args.n_mc + mc
                 obs, reset_info = env.reset(seed=run_seed, options=reset_options)
 
                 observations: list[list[float]] = []
@@ -565,9 +588,14 @@ def main() -> int:
                 truncated_final = False
                 pass_completed_final = False
 
+                # Policy decisions retain the training-time cadence; the plant is
+                # stepped and safety-tested at every (possibly finer) env interval.
+                fair_eval_step = 0
                 while True:
-                    action, _ = model.predict(obs, deterministic=True)
+                    if fair_eval_step % args.policy_hold_env_steps == 0:
+                        action, _ = model.predict(obs, deterministic=True)
                     action_arr = np.asarray(action, dtype=np.float64).reshape(-1)
+                    fair_eval_step += 1
                     if not np.all(np.isfinite(action_arr)):
                         raise RuntimeError(f"Policy produced non-finite action at episode {ep}, MC {mc}.")
 
@@ -728,3 +756,5 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# FAIR_EVAL_2026_10
