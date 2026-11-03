@@ -102,6 +102,96 @@ def check_stochastic_differs_with_uncertainty() -> None:
     print("[ok] stochastic dynamics produce different rollouts")
 
 
+def check_disturbance_is_sampled_once_per_control_step() -> None:
+    # One Gaussian acceleration offset must span every RK4 stage/substep.
+    register_envs()
+    env = gym.make(
+        ENV_ID,
+        reward_id="sparse",
+        randomize_y0=False,
+        dynamics_uncertainty_std=0.1,
+        dt=1.0e-4,
+        n_substeps=3,
+        max_episode_steps=10,
+    )
+
+    class CountingRNG:
+        def __init__(self, generator):
+            self.generator = generator
+            self.draws = 0
+
+        def standard_normal(self, size=None):
+            self.draws += 1
+            return self.generator.standard_normal(size)
+
+    env.reset(seed=13)
+    plant = env.unwrapped.plant
+    counter = CountingRNG(env.unwrapped.np_random)
+    # Preserve the counting wrapper when ODEControlEnv re-binds the Gym RNG.
+    plant.bind_rng = lambda _rng: setattr(plant, "_rng", counter)
+
+    action = np.full(env.action_space.shape, -1.0, dtype=np.float64)
+    samples = []
+    for expected_draws in (1, 2):
+        _, _, terminated, truncated, _ = env.step(action)
+        assert counter.draws == expected_draws, (
+            f"expected one disturbance draw per env step, got {counter.draws}"
+        )
+        sample = plant._step_acceleration_disturbance.copy()
+        assert np.all(np.isfinite(sample))
+        assert np.any(sample != 0.0)
+        samples.append(sample)
+        if terminated or truncated:
+            break
+
+    assert len(samples) == 2, "the test needs two non-terminal environment steps"
+    assert not np.array_equal(samples[0], samples[1])
+    env.close()
+    print("[ok] one sample-and-hold acceleration disturbance per environment step")
+
+
+def check_observation_noise_excludes_path_coordinates() -> None:
+    register_envs()
+    clean = gym.make(
+        ENV_ID, reward_id="sparse", randomize_y0=False,
+        dynamics_uncertainty_std=0.0, obs_noise_std=0.0, max_episode_steps=5,
+    )
+    noisy = gym.make(
+        ENV_ID, reward_id="sparse", randomize_y0=False,
+        dynamics_uncertainty_std=0.0, obs_noise_std=0.2, max_episode_steps=5,
+    )
+    try:
+        obs_clean, _ = clean.reset(seed=23)
+        obs_noisy, _ = noisy.reset(seed=23)
+        sensor_channels = 2 * noisy.unwrapped.plant.n_sensors
+        assert 0 < sensor_channels < obs_noisy.size
+        assert np.allclose(obs_clean[sensor_channels:], obs_noisy[sensor_channels:])
+        assert not np.allclose(obs_clean[:sensor_channels], obs_noisy[:sensor_channels])
+    finally:
+        clean.close()
+        noisy.close()
+    print("[ok] observation noise affects sensor channels, not cutter-path coordinates")
+
+
+def check_noise_parameter_validation() -> None:
+    register_envs()
+    invalid_kwargs = (
+        {"dynamics_uncertainty_std": np.nan},
+        {"process_noise_std": -0.1},
+        {"obs_noise_std": np.inf},
+    )
+    for kwargs in invalid_kwargs:
+        try:
+            gym.make(
+                ENV_ID, reward_id="sparse", randomize_y0=False,
+                max_episode_steps=5, **kwargs,
+            )
+        except ValueError:
+            continue
+        raise AssertionError(f"invalid noise setting was accepted: {kwargs}")
+    print("[ok] non-finite/negative noise standard deviations are rejected")
+
+
 def check_reward_terms() -> None:
     reward = DenseProductivePlateReward()
     info = {"w_sensor": np.array([0.001, 0.0005]), "wdot_sensor": np.array([0.01, 0.005])}
@@ -164,6 +254,13 @@ def check_pipeline_env_kwargs() -> None:
     assert np.isclose(meta["rpm_max"], RPM_MAX)
     assert meta["physical_actions_are_rad_s_mm"] is True
     assert kwargs["dynamics_uncertainty_std"] == 0.0
+    for bad_std in (-1.0, np.nan, np.inf):
+        try:
+            plate_env_kwargs(dynamics_uncertainty_std=bad_std)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid dynamics uncertainty accepted: {bad_std}")
     assert resolve_ppo_model_path(Path("models/ppo_plate"), 99) is None
     assert discover_model_seeds(Path("models/ppo_plate_missing")) == []
     env.close()
@@ -175,6 +272,9 @@ def main() -> int:
     check_pipeline_env_kwargs()
     check_deterministic_without_uncertainty()
     check_stochastic_differs_with_uncertainty()
+    check_disturbance_is_sampled_once_per_control_step()
+    check_observation_noise_excludes_path_coordinates()
+    check_noise_parameter_validation()
     check_reward_terms()
     check_y0_randomization()
     print("\nAll validation checks passed.")

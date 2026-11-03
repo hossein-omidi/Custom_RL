@@ -437,7 +437,9 @@ class PlatePlant(ODEPlant):
         self._kinematic_step_feed0_m = 0.0
         self._kinematic_step_phase0_rad = 0.0
 
-        self.dynamics_uncertainty_std = float(max(dynamics_uncertainty_std, 0.0))
+        self.dynamics_uncertainty_std = float(dynamics_uncertainty_std)
+        if not np.isfinite(self.dynamics_uncertainty_std) or self.dynamics_uncertainty_std < 0.0:
+            raise ValueError("dynamics_uncertainty_std must be finite and non-negative.")
         self.y0_min = float(np.clip(y0_min, 0.0, self.L2))
         self.y0_max = float(np.clip(y0_max, 0.0, self.L2))
         if self.y0_max <= self.y0_min:
@@ -454,6 +456,8 @@ class PlatePlant(ODEPlant):
                 f"modal_damping_ratio must be finite and non-negative, got {modal_damping_ratio!r}."
             )
         self._rng: np.random.Generator | None = None
+        # One zero-order-held modal-acceleration disturbance per environment step.
+        self._step_acceleration_disturbance = np.zeros(self.K, dtype=np.float64)
 
         # Explicit regenerative-history module handle.  ODEControlEnv can use
         # this to pass history_module=f_nonlinear2_face_milling into RK4.
@@ -710,14 +714,21 @@ class PlatePlant(ODEPlant):
             )
 
     def begin_step(self, t: float, u: np.ndarray) -> None:
-        """Prepare continuous path/phase kinematics before RK integration.
+        """Prepare continuous path/phase kinematics and sample this env-step disturbance.
 
         ODEControlEnv calls this once per accepted environment step. The action
-        is still held constant during the RK substeps, but the cutter position
-        and tooth phase are propagated from the last accepted values instead of
-        recomputing them as omega*t from the start of the episode.
+        is held constant during RK substeps, and accepted cutter kinematics are
+        propagated from the previous step. The Gaussian modal-acceleration
+        offset is also sampled once here and held across all RK4 stages/substeps.
         """
         u_phys = self._scale_action(u)
+
+        if self.dynamics_uncertainty_std > 0.0 and self._rng is not None:
+            self._step_acceleration_disturbance = (
+                self.dynamics_uncertainty_std * self._rng.standard_normal(self.K)
+            )
+        else:
+            self._step_acceleration_disturbance.fill(0.0)
         self._last_omega = float(u_phys[0])
         self._last_ap = float(u_phys[1])
         self._last_ac = self._last_ap
@@ -848,12 +859,9 @@ class PlatePlant(ODEPlant):
                 f"but returned {x_dot.shape}."
             )
 
-        if self.dynamics_uncertainty_std > 0.0 and self._rng is not None:
+        if self.dynamics_uncertainty_std > 0.0:
             x_dot = x_dot.copy()
-            x_dot[1::2] += (
-                self.dynamics_uncertainty_std
-                * self._rng.standard_normal(self.K)
-            )
+            x_dot[1::2] += self._step_acceleration_disturbance
 
         return np.nan_to_num(x_dot, nan=0.0, posinf=1e8, neginf=-1e8)
 
@@ -896,6 +904,7 @@ class PlatePlant(ODEPlant):
                 self._episode_ap = float(self._ap_fixed)
 
         # 2. Reset force module history and internal kinematic states
+        self._step_acceleration_disturbance.fill(0.0)
         f_nonlinear2.reset_state_history()
         self._w_violation_streak = 0
         self._last_omega = float(self.omega_min)

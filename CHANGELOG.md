@@ -1,9 +1,8 @@
-# Minimal-change audit
+# Changelog
 
-| File | Change | Unaffected |
-|---|---|---|
-| `scripts/eval_policy.py` | Optional RL policy action hold with same fine safety-check step, adjustable reset seed, restricted init/noise overrides, metadata | Trained PPO policy, training, reward function, plant |
-| `scripts/MPC/mpc_face_milling_chatgpt_V3.py` | Optional paired reset seed, complete noise metadata, clarified console time labels | do-mpc objective, MHE, history states, prediction equations, sampling logic |
-| `scripts/compare_mpc_rl.py` | Validated reporting & safe, physically meaningful comparison | Controller inputs/dynamics |
+## v2 scientific re-audit
 
-There is deliberately **no optimizer or environment modification**. The branch-local physical failure remains an independent controller problem if replicated with a matched simulator/safety-check grid.
+- Trainer: correct stale rollout-size comment, retain default PPO and checkpoints, add opt-in `--callback-eval-seed` for a shared initial EvalCallback RNG seed and record its usage in training metadata.
+- Evaluator: full-step metrics + output-trajectory sampling, strict time/reward/sensor checks, physical termination guard, training-condition consistency, safe staged outputs, CSV outputs at replica and scenario levels, physical force and control variation metrics, measured inference latencies.
+- Plotter: timestamp-aligned continuous trajectories, piecewise-constant actions with final hold, SD undefined when fewer than two MC replicas remain, original-sample-first RMS envelopes, explicit finishing fixed-depth labeling, PDF/300dpi trajectory figures, grouped physical-outcome figure with sample-SD bars and scenario matching guard.
+- Tests: dependency-light synthetic end-to-end and plotting tests plus numerical plotting/alignment tests; no physics claim.

@@ -150,12 +150,16 @@ def plate_env_kwargs(
     extra = dict(extra)
     _translate_legacy_depth_kwargs(extra)
 
+    dynamics_uncertainty_std = float(dynamics_uncertainty_std)
+    if not np.isfinite(dynamics_uncertainty_std) or dynamics_uncertainty_std < 0.0:
+        raise ValueError("dynamics_uncertainty_std must be finite and non-negative.")
+
     kwargs: dict[str, Any] = {
         "reward_id": reward_id,
         "dt": float(dt),
         "n_substeps": int(n_substeps),
         "randomize_y0": bool(randomize_y0),
-        "dynamics_uncertainty_std": float(max(dynamics_uncertainty_std, 0.0)),
+        "dynamics_uncertainty_std": dynamics_uncertainty_std,
     }
     if max_episode_steps is not None:
         kwargs["max_episode_steps"] = int(max_episode_steps)

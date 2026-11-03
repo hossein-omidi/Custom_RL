@@ -71,7 +71,7 @@ class ODEControlEnv(gym.Env):
         process_noise_std:
             Standard deviation of additive state noise after integration.
         obs_noise_std:
-            Standard deviation of additive observation noise.
+            Standard deviation of noise on normalized sensor channels; cutter-path coordinates remain noise-free.
         history_module:
             Optional explicit regenerative-history module. For face milling this
             should be ``custom_rl.plants.f_nonlinear2_face_milling``. If omitted,
@@ -91,6 +91,11 @@ class ODEControlEnv(gym.Env):
         self.obs_noise_std = float(obs_noise_std)
         self.history_module = history_module
         self.auto_history_module = bool(auto_history_module)
+
+        if not np.isfinite(self.process_noise_std) or self.process_noise_std < 0.0:
+            raise ValueError("process_noise_std must be finite and non-negative.")
+        if not np.isfinite(self.obs_noise_std) or self.obs_noise_std < 0.0:
+            raise ValueError("obs_noise_std must be finite and non-negative.")
 
         if self.dt <= 0.0:
             raise ValueError("dt must be positive.")
@@ -322,8 +327,25 @@ class ODEControlEnv(gym.Env):
         return obs
 
     def _add_obs_noise(self, obs: np.ndarray) -> np.ndarray:
-        """Add observation noise if requested."""
+        """Noise measured sensor channels; leave known cutter-path coordinates exact."""
         obs = np.asarray(obs, dtype=np.float64)
-        if self.obs_noise_std > 0.0:
-            return obs + self.obs_noise_std * self.np_random.standard_normal(obs.shape)
-        return obs
+        if self.obs_noise_std <= 0.0:
+            return obs
+
+        if hasattr(self.plant, "n_sensors"):
+            # Plate observations are [all sensor displacements, all sensor
+            # velocities, normalized cutter x, normalized cutter y].
+            sensor_channels = 2 * int(self.plant.n_sensors)
+        else:
+            # Generic ODE plants without an explicit sensor count retain the
+            # previous behavior: treat their complete observation as measured.
+            sensor_channels = obs.size
+        sensor_channels = min(max(sensor_channels, 0), obs.size)
+
+        noisy_obs = obs.copy()
+        if sensor_channels:
+            noisy_obs[:sensor_channels] += (
+                self.obs_noise_std
+                * self.np_random.standard_normal(sensor_channels)
+            )
+        return noisy_obs
