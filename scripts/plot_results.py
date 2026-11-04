@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import sys
 from pathlib import Path
 
 from matplotlib.lines import Line2D
@@ -21,6 +22,11 @@ from custom_rl.eval.pipeline import (
     primary_episode_record,
 )
 from custom_rl.plants.plate import omega_to_rpm
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from run_paths import evaluation_dir, logs_dir, plots_dir, resolve_run_dir  # noqa: E402
 
 
 # A descriptive one-standard-deviation spread, not a confidence interval.
@@ -1425,9 +1431,73 @@ def _resolve_plot_seeds(
     return [], []
 
 
+
+def plot_reliability_selection(log_dir: Path, out_dir: Path, seeds: list[int]) -> None:
+    """Plot completion reliability and safety metrics used for checkpoint selection."""
+    specs = [
+        ("pass_completion_rate", "Pass completion rate", (0.0, 1.05)),
+        ("safety_termination_rate", "Safety-termination rate", (0.0, 1.05)),
+        ("median_completed_productivity", "Median productivity reward of completed passes", None),
+        ("median_progress", "Median final feed progress", (0.0, 1.05)),
+    ]
+    histories = {}
+    for seed in seeds:
+        path = log_dir / f"seed_{seed}" / "evaluations.npz"
+        if not path.is_file():
+            continue
+        try:
+            with np.load(path, allow_pickle=False) as data:
+                if "timesteps" not in data.files:
+                    continue
+                histories[seed] = {
+                    "timesteps": np.asarray(data["timesteps"], dtype=float),
+                    **{key: np.asarray(data[key], dtype=float) for key, _, _ in specs if key in data.files},
+                }
+        except Exception as exc:
+            print(f"Warning: could not load reliability history for seed {seed}: {exc}")
+    if not histories:
+        print("No reliability metrics found; reliability plot skipped.")
+        return
+
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8), sharex=True)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", [f"C{i}" for i in range(10)])
+    for ax, (key, title, ylim) in zip(axes.reshape(-1), specs):
+        plotted = False
+        for index, seed in enumerate(sorted(histories)):
+            h = histories[seed]
+            if key not in h:
+                continue
+            ax.plot(h["timesteps"], h[key], marker="o", markersize=3,
+                    linewidth=1.3, color=colors[index % len(colors)], label=f"Seed {seed}")
+            plotted = True
+        ax.set_title(title)
+        ax.set_xlabel("PPO transitions")
+        ax.grid(True, alpha=0.25)
+        if ylim:
+            ax.set_ylim(*ylim)
+        if plotted:
+            ax.legend(frameon=False, fontsize=8)
+        else:
+            ax.text(0.5, 0.5, "Metric unavailable", ha="center", va="center", transform=ax.transAxes)
+    fig.suptitle("PPO reliability and safety evaluation", y=0.995)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    for ext in ("png", "pdf"):
+        path = out_dir / f"ppo_reliability_metrics.{ext}"
+        fig.savefig(path, dpi=300, bbox_inches="tight")
+        print(f"Saved {path}")
+    plt.close(fig)
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Plot training and trajectory results")
 
+    parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "Organized experiment run directory. When set, logs/evaluation/plots "
+            "default to <run-dir>/{logs,evaluation,plots}."
+        ),
+    )
     parser.add_argument(
         "--log-dir",
         default=None,
@@ -1456,6 +1526,17 @@ def main() -> None:
     )
 
     args = parser.parse_args()
+
+    run_dir: Path | None = None
+    if args.run_dir is not None:
+        run_dir = resolve_run_dir(run_dir=args.run_dir)
+        if args.log_dir is None:
+            args.log_dir = str(logs_dir(run_dir))
+        if args.traj_dir is None:
+            args.traj_dir = str(evaluation_dir(run_dir))
+        if args.out_dir is None:
+            args.out_dir = str(plots_dir(run_dir))
+        print(f"Run directory  : {run_dir}")
 
     if args.log_dir is not None:
         log_dir = Path(args.log_dir).resolve()
@@ -1494,6 +1575,7 @@ def main() -> None:
 
     plot_learning_curve(log_dir, out_dir, log_seeds, smooth=args.smooth)
     plot_training_diagnostics(log_dir, out_dir, log_seeds)
+    plot_reliability_selection(log_dir, out_dir, log_seeds)
     plot_trajectory_summary(traj_dir, out_dir, traj_seeds)
     plot_physical_outcomes(traj_dir, out_dir, traj_seeds)
 

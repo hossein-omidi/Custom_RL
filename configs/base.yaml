@@ -1,0 +1,111 @@
+# Shared tunable defaults for roughing / finishing experiments.
+# Mode files (roughing.yaml, finishing.yaml) use `extends: base.yaml`
+# and only override what differs. Edit knobs here once when possible.
+#
+#   python scripts/experiment.py run --config configs/roughing.yaml
+
+output_root: runs/ppo
+run_name: null
+seeds: [0]
+
+# ---------------------------------------------------------------------------
+# Timing (env step / controller)
+# ---------------------------------------------------------------------------
+timing:
+  dt: 1.0e-4                 # RK4 substep [s]
+  n_substeps: 10             # env/safety step = dt * n_substeps
+  controller_hold_env_steps: 1
+  max_episode_steps: 250000
+
+# ---------------------------------------------------------------------------
+# Plant / safety (custom_rl.plants.plate + registration defaults)
+# ---------------------------------------------------------------------------
+plant:
+  rpm_min: 400.0             # -> omega_min
+  rpm_max: 4000.0            # -> omega_max
+  ap_min: 0.0                # [mm]
+  ap_max: 12.0               # [mm] (finishing overrides to feasible band)
+  ae_default: 28.0           # radial immersion [mm]
+  feed_per_tooth_mm: 0.20
+  w_limit: 3.0e-3            # hard displacement termination [m]
+  wdot_limit: 10.0           # hard velocity termination [m/s]
+  w_obs_scale: 5.0e-4        # observation scaling [m]
+  wdot_obs_scale: 0.5        # observation scaling [m/s]
+  modal_damping_ratio: 0.02
+  y_cutter: 0.20             # default milling line [m] when not randomizing
+
+# ---------------------------------------------------------------------------
+# Disturbance / noise options
+# ---------------------------------------------------------------------------
+noise:
+  dynamics_uncertainty_std: 0.001   # modal accel disturbance
+  process_noise_std: 0.0            # ODEControlEnv process noise
+  obs_noise_std: 0.0                # ODEControlEnv observation noise
+  initial_eta_std: 1.0e-7           # modal IC std
+  initial_etad_std: 0.0
+  randomize_y0: true
+
+# ---------------------------------------------------------------------------
+# Reward gains / weights (plate_rewards / train REWARD_KWARGS)
+# Mode files may override productivity_weight etc.
+# ---------------------------------------------------------------------------
+reward:
+  w_weight: 0.6
+  wdot_weight: 0.02
+  w_scale: 1.5e-3
+  wdot_scale: 1.0
+  action_weight: 0.0
+  negative_ap_weight: 2.0
+  ap_action_weight: 0.0
+  alive_bonus: 0.0
+  require_physical_info: true
+  w_clip: null
+  wdot_clip: null
+  ap_productive_target: 0.5
+  include_ae_in_productivity: true
+  productivity_weight: 240.0
+  omega_cost_weight: 3.0
+  termination_penalty: 500.0
+  truncation_penalty: 500.0
+  pass_completion_bonus: 1000.0
+  failure_progress_penalty_weight: 1.0
+  productivity_gate_enabled: true
+  productivity_w_gate: 1.0e-3
+  productivity_wdot_gate: 1.0
+  productivity_wdot_gate_weight: 0.05
+  productivity_gate_power: 2.0
+  productivity_gate_min: 0.0
+  running_reward_scale: 0.041666666666666664   # 1/24
+
+# ---------------------------------------------------------------------------
+# PPO / training hyperparameters
+# ---------------------------------------------------------------------------
+train:
+  total_timesteps: 1000000
+  n_envs: 3
+  vec_env: subproc
+  start_method: spawn
+  device: cpu
+  progress_bar: false
+  learning_rate: 2.5e-4
+  final_learning_rate: 2.5e-5
+  n_steps: 2048
+  batch_size: 256
+  n_epochs: 8
+  gamma: null                 # null => preserve 1 ms physical horizon
+  gae_lambda: null
+  clip_range: 0.20
+  final_clip_range: 0.10
+  n_eval_episodes: 10
+  eval_freq: 50000
+  checkpoint_freq: 200000
+  callback_eval_seed: null
+
+# ---------------------------------------------------------------------------
+# Post-training evaluation (experiment.py eval / run)
+# ---------------------------------------------------------------------------
+evaluation:
+  n_episodes: 5
+  n_mc: 5
+  prefer_final: false
+  overwrite: true

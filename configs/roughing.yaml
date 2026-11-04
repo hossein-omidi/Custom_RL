@@ -1,0 +1,16 @@
+# Roughing (first-mode): action = [omega, ap]
+# Shared knobs live in base.yaml — override only what this mode needs.
+extends: base.yaml
+
+env_id: CustomODEPlate-v0
+reward: productive
+
+# Optional local overrides (uncomment / edit as needed):
+# plant:
+#   ap_max: 12.0
+# reward:
+#   productivity_weight: 240.0
+# train:
+#   total_timesteps: 1000000
+# noise:
+#   dynamics_uncertainty_std: 0.001

@@ -47,6 +47,11 @@ from custom_rl.eval.pipeline import (
 )
 from custom_rl.plants.plate import omega_to_rpm
 
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from run_paths import evaluation_dir, models_dir, resolve_run_dir  # noqa: E402
+
 
 ENV_ID = "CustomODEPlate-v0"
 ENV_ID_FINISHING = "CustomODEPlateFinish-v0"
@@ -486,13 +491,22 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Evaluate policy and save trajectories")
 
     parser.add_argument(
+        "--run-dir",
+        default=None,
+        help=(
+            "Organized experiment run directory (contains models/, evaluation/). "
+            "When set, --model-dir and --out-dir default to <run-dir>/models and "
+            "<run-dir>/evaluation so you do not pass output paths by hand."
+        ),
+    )
+    parser.add_argument(
         "--model-dir",
         "--save-dir",
         dest="model_dir",
-        default=DEFAULT_MODEL_DIR,
+        default=None,
         help=(
-            "Directory with trained checkpoints "
-            f"(default: {DEFAULT_MODEL_DIR}, same as train_sb3_ppo.py --save-dir)"
+            "Directory with trained checkpoints. "
+            f"Default: <run-dir>/models when --run-dir is set, else {DEFAULT_MODEL_DIR}."
         ),
     )
     parser.add_argument(
@@ -506,7 +520,14 @@ def main() -> int:
         "--n-episodes", type=int, default=2,
         help="Outer test scenarios (default 2; recommended final evaluation: 5).",
     )
-    parser.add_argument("--out-dir", default=DEFAULT_TRAJ_DIR)
+    parser.add_argument(
+        "--out-dir",
+        default=None,
+        help=(
+            "Trajectory output directory. "
+            f"Default: <run-dir>/evaluation when --run-dir is set, else {DEFAULT_TRAJ_DIR}."
+        ),
+    )
     parser.add_argument(
         "--record-every", type=int, default=1,
         help=("Save each Nth environment-step sample and always the final sample; "
@@ -629,11 +650,25 @@ def main() -> int:
     if args.y_position and any(not np.isfinite(v) for v in args.y_position):
         raise SystemExit("--y-position values must be finite.")
 
-    model_dir = Path(args.model_dir).resolve()
-    out_dir = Path(args.out_dir).resolve()
+    run_dir: Path | None = None
+    if args.run_dir is not None:
+        try:
+            run_dir = resolve_run_dir(run_dir=args.run_dir)
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}")
+            return 1
+        if args.model_dir is None:
+            args.model_dir = str(models_dir(run_dir))
+        if args.out_dir is None:
+            args.out_dir = str(evaluation_dir(run_dir))
+
+    model_dir = Path(args.model_dir or DEFAULT_MODEL_DIR).resolve()
+    out_dir = Path(args.out_dir or DEFAULT_TRAJ_DIR).resolve()
     if not model_dir.is_dir():
         print(f"Error: model directory does not exist: {model_dir}")
         return 1
+    if run_dir is not None:
+        print(f"Run directory   : {run_dir}")
 
     seeds = _resolve_seeds(model_dir, args.seeds)
     print(f"Model directory : {model_dir}")
@@ -796,6 +831,9 @@ def main() -> int:
             "controller_sample_time_s": (
                 settings["dt"] * settings["n_substeps"] * settings["controller_hold_env_steps"]
             ),
+            "running_reward_scale": float(settings["training_env_kwargs"].get("running_reward_scale", 1.0)),
+            "reward_runtime_omega_cost_weight": float(settings["training_env_kwargs"].get("omega_cost_weight", 3.0)),
+            "reward_pass_completion_bonus": float(settings["training_env_kwargs"].get("pass_completion_bonus", 1000.0)),
             "gamma_controller": settings["gamma_controller"],
             "gamma_per_env_step": settings["gamma_per_env_step"],
             "max_episode_steps": settings["max_episode_steps"],
@@ -821,6 +859,15 @@ def main() -> int:
             ("controller_hold_env_steps", training_env.get("controller_hold_env_steps"), settings["controller_hold_env_steps"]),
             ("omega_cost_weight", training_kwargs.get("omega_cost_weight"), env_kwargs.get("omega_cost_weight")),
             ("pass_completion_bonus", training_kwargs.get("pass_completion_bonus"), env_kwargs.get("pass_completion_bonus")),
+            ("running_reward_scale", training_kwargs.get("running_reward_scale"), env_kwargs.get("running_reward_scale")),
+            ("productivity_weight", training_kwargs.get("productivity_weight"), env_kwargs.get("productivity_weight")),
+            ("termination_penalty", training_kwargs.get("termination_penalty"), env_kwargs.get("termination_penalty")),
+            ("truncation_penalty", training_kwargs.get("truncation_penalty"), env_kwargs.get("truncation_penalty")),
+            ("w_weight", training_kwargs.get("w_weight"), env_kwargs.get("w_weight")),
+            ("wdot_weight", training_kwargs.get("wdot_weight"), env_kwargs.get("wdot_weight")),
+            ("w_scale", training_kwargs.get("w_scale"), env_kwargs.get("w_scale")),
+            ("wdot_scale", training_kwargs.get("wdot_scale"), env_kwargs.get("wdot_scale")),
+            ("productivity_gate_enabled", training_kwargs.get("productivity_gate_enabled"), env_kwargs.get("productivity_gate_enabled")),
             ("ap_max", training_kwargs.get("ap_max"), env_kwargs.get("ap_max")),
             ("initial_eta_std", training_kwargs.get("initial_eta_std"), env_kwargs.get("initial_eta_std")),
             ("initial_etad_std", training_kwargs.get("initial_etad_std"), env_kwargs.get("initial_etad_std")),

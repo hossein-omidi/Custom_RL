@@ -19,7 +19,7 @@ Default roughing settings match eval_policy.py:
     reward                  productive
     RK4 dt                  1e-4 s
     n_substeps              10  -> environment/safety interval 1e-3 s
-    controller hold         5 environment steps -> controller sample 5e-3 s
+    controller hold         1 environment step -> controller sample 1e-3 s
     max_episode_steps       250000 environment steps
     dynamics_uncertainty    0.001
     randomize_y0            True
@@ -30,12 +30,18 @@ Outputs are isolated under:
     <run-dir>/logs/     seed_<seed>/*.monitor.csv, evaluations.npz,
                         training_config.json, tensorboard/
     <run-dir>/evaluation/  reserved for eval_policy.py trajectory output
+    <run-dir>/plots/       reserved for plot_results.py
 
-Run from the repository root. For three independent policies used in the
+Preferred workflow (config → train → eval → plot, automatic paths):
+    python scripts/experiment.py run --config configs/roughing.yaml
+
+Or call this trainer directly. For three independent policies used in the
 learning-curve figure, explicitly train all three seeds:
     python scripts/train_ppo_unified.py --seeds 0 1 2
 
 The CLI default remains a single seed (0) unless --seeds is supplied.
+A LATEST pointer is written under --output-root so later stages can use
+``python scripts/experiment.py eval --run latest``.
 
 For a quick environment/configuration check without training:
     python scripts/train_ppo_unified.py --preflight-only
@@ -64,13 +70,19 @@ import gymnasium as gym
 import numpy as np
 import torch
 from stable_baselines3 import PPO
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
+from stable_baselines3.common.callbacks import BaseCallback, CheckpointCallback
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import register_envs
 from custom_rl.eval.pipeline import plate_env_kwargs
 from custom_rl.plants.plate import omega_to_rpm
+from ppo_reliability import reliability_checkpoint_rank, summarize_reliability_episodes
+
+_SCRIPTS_DIR = Path(__file__).resolve().parent
+if str(_SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPTS_DIR))
+from run_paths import write_latest_pointer  # noqa: E402
 
 
 ENV_ID_ROUGHING = "CustomODEPlate-v0"
@@ -80,17 +92,16 @@ VALID_ENV_IDS = (ENV_ID_ROUGHING, ENV_ID_FINISHING)
 # ---------------------------------------------------------------------------
 # Balanced PPO defaults
 # ---------------------------------------------------------------------------
-# The 5 ms controller default keeps approximately the same physical rollout
-# and optimizer batch as the former 1 ms / (2048, 256) setup:
-# 3*400*5 = 6000 base environment steps per rollout and 1200/50 = 24 minibatches.
+# 1 ms controller baseline. With 3 workers, rollout_size=3*2048=6144;
+# batch_size=256 divides this exactly (24 minibatches per epoch).
 PPO_LEARNING_RATE = 2.5e-4
 PPO_FINAL_LEARNING_RATE = 2.5e-5
 PPO_N_STEPS = 2048
 PPO_BATCH_SIZE = 256
 PPO_N_EPOCHS = 8
 
-# Reference discounts are per 1 ms environment step. They are converted to
-# the controller decision interval after CLI parsing.
+# Long-horizon settings per 1 ms environment/controller transition.
+# gamma horizon ~= 200 s; GAE trace horizon ~= 2 s.
 PPO_GAMMA_PER_ENV_STEP = 0.999995
 PPO_GAE_LAMBDA_PER_ENV_STEP = 0.9995
 
@@ -101,17 +112,16 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.02
 PPO_NET_ARCH = [256, 256]
-PPO_LOG_STD_INIT = -1.0
+PPO_LOG_STD_INIT = -2.5
 PPO_ADAM_EPS = 1e-5
 
 # Initial action mean: mid-range spindle speed and a low initial ap in roughing.
 SAFE_AP_FRACTION = 0.05
 
-# These are PPO/controller transitions. At a 5 ms hold, 200k decisions
-# correspond to 1M underlying 1 ms environment steps, matching the former budget.
+# PPO transitions equal fine environment transitions because controller hold=1.
 DEFAULT_TOTAL_TIMESTEPS = 1_000_000
 DEFAULT_EVAL_FREQ = 50_000
-DEFAULT_N_EVAL_EPISODES = 3
+DEFAULT_N_EVAL_EPISODES = 10  # paired screening set for reliability-based checkpoint selection
 DEFAULT_CHECKPOINT_FREQ = 200_000
 
 DEFAULT_DT = 1.0e-4
@@ -119,6 +129,44 @@ DEFAULT_N_SUBSTEPS = 10
 DEFAULT_CONTROLLER_HOLD_ENV_STEPS = 1
 DEFAULT_MAX_EPISODE_STEPS = 250_000
 DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.001
+
+# Single-stage completion-priority reward. The existing physical reward terms
+# and their relative weights are preserved; only the accumulated running part
+# is scaled, while Terminal completion/failure adjustments remain unscaled.
+# The 1/24 factor is a first calibration based on the previous run's successful
+# episode return (~4.75e5 including a 1e3 completion bonus): it brings dense
+# running return to O(2e4) per pass, so a 1e3 completion bonus and 5e2--1e3
+# failure penalty are no longer numerically negligible. It is a tunable scale,
+# not a claimed universal optimum; verify with the pilot evaluation.
+DEFAULT_RUNNING_REWARD_SCALE = 1.0 / 24.0
+REWARD_KWARGS = {
+    "w_weight": 0.6,
+    "wdot_weight": 0.02,
+    "w_scale": 1.5e-3,
+    "wdot_scale": 1.0,
+    "action_weight": 0.0,
+    "negative_ap_weight": 2.0,
+    "ap_action_weight": 0.0,
+    "alive_bonus": 0.0,
+    "require_physical_info": True,
+    "w_clip": None,
+    "wdot_clip": None,
+    "ap_productive_target": 0.5,
+    "include_ae_in_productivity": True,
+    "productivity_weight": 240.0,
+    "omega_cost_weight": 3.0,
+    "termination_penalty": 500.0,
+    "truncation_penalty": 500.0,
+    "pass_completion_bonus": 1000.0,
+    "failure_progress_penalty_weight": 1.0,
+    "productivity_gate_enabled": True,
+    "productivity_w_gate": 1.0e-3,
+    "productivity_wdot_gate": 1.0,
+    "productivity_wdot_gate_weight": 0.05,
+    "productivity_gate_power": 2.0,
+    "productivity_gate_min": 0.0,
+    "running_reward_scale": DEFAULT_RUNNING_REWARD_SCALE,
+}
 
 
 Schedule = Callable[[float], float]
@@ -212,6 +260,199 @@ def make_registered_plate_env(
     return env
 
 
+
+class ReliabilityEvalCallback(BaseCallback):
+    """Deterministic policy evaluation with reliability-first checkpoint selection.
+
+    The evaluation environment remains stochastic (random milling line and
+    configured dynamics uncertainty), while the policy action is deterministic.
+    `evaluations.npz` retains SB3-compatible `timesteps`, `results`, and
+    `ep_lengths` arrays and adds reliability metrics for plotting.
+    """
+
+    def __init__(
+        self,
+        eval_env,
+        eval_freq: int,
+        n_eval_episodes: int,
+        best_model_path: Path,
+        log_dir: Path,
+        displacement_limit_m: float,
+        evaluation_seed: int,
+        verbose: int = 0,
+    ) -> None:
+        super().__init__(verbose=verbose)
+        self.eval_env = eval_env
+        self.eval_freq = int(eval_freq)
+        self.n_eval_episodes = int(n_eval_episodes)
+        self.best_model_path = Path(best_model_path)
+        self.log_dir = Path(log_dir)
+        self.displacement_limit_m = float(displacement_limit_m)
+        self.evaluation_seed = int(evaluation_seed)
+        self.best_rank = None
+        self.best_metrics = None
+        self.history = {
+            "timesteps": [], "results": [], "ep_lengths": [],
+            "pass_completion_rate": [], "safety_termination_rate": [],
+            "truncation_rate": [], "median_completed_return": [],
+            "median_completed_productivity": [], "median_progress": [], "mean_max_displacement_m": [],
+        }
+        self.episode_csv = self.log_dir / "evaluation_episodes.csv"
+        self.history_npz = self.log_dir / "evaluations.npz"
+
+    def _on_step(self) -> bool:
+        if self.n_calls % self.eval_freq != 0:
+            return True
+        episodes = self._evaluate_episodes()
+        metrics = summarize_reliability_episodes(episodes)
+        rank = reliability_checkpoint_rank(metrics)
+
+        self.history["timesteps"].append(int(self.num_timesteps))
+        self.history["results"].append([float(x["return"]) for x in episodes])
+        self.history["ep_lengths"].append([int(x["length"]) for x in episodes])
+        self.history["pass_completion_rate"].append(metrics["pass_completion_rate"])
+        self.history["safety_termination_rate"].append(metrics["safety_termination_rate"])
+        self.history["truncation_rate"].append(metrics["truncation_rate"])
+        self.history["median_completed_return"].append(metrics["median_completed_return"])
+        self.history["median_completed_productivity"].append(metrics["median_completed_productivity"])
+        self.history["median_progress"].append(metrics["median_progress"])
+        self.history["mean_max_displacement_m"].append(metrics["mean_max_displacement_m"])
+        np.savez_compressed(self.history_npz, **{
+            key: np.asarray(value, dtype=np.float64) for key, value in self.history.items()
+        })
+        self._append_episode_csv(episodes, metrics)
+
+        for key in (
+            "pass_completion_rate", "safety_termination_rate", "truncation_rate",
+            "median_completed_return", "median_completed_productivity", "median_progress", "mean_max_displacement_m",
+        ):
+            self.logger.record(f"eval/{key}", float(metrics[key]))
+
+        improved = self.best_rank is None or rank > self.best_rank
+        if improved:
+            self.best_rank = rank
+            self.best_metrics = dict(metrics)
+            self.best_model_path.parent.mkdir(parents=True, exist_ok=True)
+            self.model.save(str(self.best_model_path))
+            with (self.best_model_path.parent / "best_model_metrics.json").open("w", encoding="utf-8") as f:
+                json.dump({"rank": list(rank), "metrics": metrics, "timesteps": int(self.num_timesteps)}, f, indent=2)
+
+        if self.verbose:
+            print(
+                f"Reliability evaluation at {self.num_timesteps}: "
+                f"completion={metrics['pass_completion_rate']:.1%}, "
+                f"safety_termination={metrics['safety_termination_rate']:.1%}, "
+                f"median_completed_productivity={metrics['median_completed_productivity']:.3g}, "
+                f"median_progress={metrics['median_progress']:.3f}; "
+                f"{'new best checkpoint' if improved else 'checkpoint unchanged'}"
+            )
+        return True
+
+    def _evaluate_episodes(self) -> list[dict[str, Any]]:
+        episodes: list[dict[str, Any]] = []
+        n_sensors = max(1, (int(self.eval_env.observation_space.shape[0]) - 2) // 2)
+        progress_index = 2 * n_sensors
+
+        for episode_index in range(self.n_eval_episodes):
+            # Replay the same seeded evaluation scenarios at every checkpoint
+            # and across training seeds. This makes checkpoint comparisons paired.
+            episode_seed = self.evaluation_seed + episode_index
+            self.eval_env.seed(episode_seed)
+            obs = self.eval_env.reset()
+            episode_return = 0.0
+            episode_length = 0
+            max_displacement = 0.0
+            final_progress = 0.0
+            productivity_sum = 0.0
+            vibration_cost_sum = 0.0
+            omega_cost_sum = 0.0
+            terminated_final = False
+            truncated_final = False
+            final_info: dict[str, Any] = {}
+            while True:
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, rewards, dones, infos = self.eval_env.step(action)
+                info = dict(infos[0])
+                episode_return += float(rewards[0])
+                episode_length += 1
+
+                if "w_sensor" in info:
+                    w = np.asarray(info["w_sensor"], dtype=np.float64).reshape(-1)
+                    if w.size and np.all(np.isfinite(w)):
+                        max_displacement = max(max_displacement, float(np.max(np.abs(w))))
+                if "max_displacement_m" in info:
+                    max_displacement = max(max_displacement, float(info["max_displacement_m"]))
+                if "feed_progress" in info:
+                    final_progress = float(np.clip(info["feed_progress"], 0.0, 1.0))
+                else:
+                    # VecEnv auto-resets on done; use terminal_observation when
+                    # available instead of accidentally measuring the next reset.
+                    progress_obs = info.get("terminal_observation", obs)
+                    progress_obs = np.asarray(progress_obs)
+                    if progress_obs.ndim == 2 and progress_obs.shape[0] == 1:
+                        progress_obs = progress_obs[0]
+                    if progress_obs.ndim == 1 and progress_obs.size > progress_index:
+                        final_progress = float(np.clip(1.0 - float(progress_obs[progress_index]), 0.0, 1.0))
+
+                terms = info.get("reward_terms", {})
+                if isinstance(terms, dict):
+                    productivity_sum += float(terms.get("productivity_scaled", terms.get("productivity", 0.0)) or 0.0)
+                    vibration_cost_sum += float(terms.get("vibration_w_cost_scaled", terms.get("vibration_w_cost", 0.0)) or 0.0)
+                    vibration_cost_sum += float(terms.get("vibration_wdot_cost_scaled", terms.get("vibration_wdot_cost", 0.0)) or 0.0)
+                    omega_cost_sum += float(terms.get("omega_cost_scaled", terms.get("omega_cost", 0.0)) or 0.0)
+
+                if bool(dones[0]):
+                    final_info = info
+                    terminated_final = not bool(info.get("TimeLimit.truncated", False))
+                    truncated_final = bool(info.get("TimeLimit.truncated", False))
+                    break
+
+            reason = str(final_info.get("termination_reason") or (
+                "time_limit_truncated" if truncated_final else "terminated_failure" if terminated_final else "unknown"
+            ))
+            completed = bool(final_info.get("pass_completed", False)) or reason in {
+                "pass_completed", "pass_completed_90percent"
+            }
+            safety_failure = reason in {"excessive_sensor_displacement", "invalid_state"}
+            episodes.append({
+                "episode": episode_index + 1,
+                "evaluation_seed": int(episode_seed),
+                "return": float(episode_return),
+                "length": int(episode_length),
+                "pass_completed": bool(completed),
+                "termination_reason": reason,
+                "safety_termination": bool(safety_failure),
+                "truncated": bool(truncated_final),
+                "final_progress": float(final_progress),
+                "max_displacement_m": float(max_displacement),
+                "max_displacement_ratio": float(max_displacement / max(self.displacement_limit_m, 1e-12)),
+                "productivity_reward_sum": float(productivity_sum),
+                "vibration_cost_sum": float(vibration_cost_sum),
+                "omega_cost_sum": float(omega_cost_sum),
+            })
+        return episodes
+
+    def _append_episode_csv(self, episodes: list[dict[str, Any]], metrics: dict[str, float]) -> None:
+        import csv
+        fields = [
+            "timesteps", "episode", "evaluation_seed", "return", "length", "pass_completed",
+            "termination_reason", "safety_termination", "truncated", "final_progress",
+            "max_displacement_m", "max_displacement_ratio", "productivity_reward_sum",
+            "vibration_cost_sum", "omega_cost_sum", "checkpoint_completion_rate",
+            "checkpoint_safety_termination_rate",
+        ]
+        write_header = not self.episode_csv.exists()
+        with self.episode_csv.open("a", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=fields)
+            if write_header:
+                writer.writeheader()
+            for episode in episodes:
+                row = dict(episode)
+                row["timesteps"] = int(self.num_timesteps)
+                row["checkpoint_completion_rate"] = metrics["pass_completion_rate"]
+                row["checkpoint_safety_termination_rate"] = metrics["safety_termination_rate"]
+                writer.writerow(row)
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Train an evaluation-compatible PPO policy for the milling plate."
@@ -244,7 +485,7 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--total-timesteps", type=int, default=DEFAULT_TOTAL_TIMESTEPS,
-                        help="Total PPO/controller transitions across all workers (default 200k at 5 ms each).")
+                        help="Total PPO/controller transitions across all workers (default 1M at 1 ms each).")
     parser.add_argument("--n-envs", type=int, default=3)
     parser.add_argument("--vec-env", choices=["subproc", "dummy"], default="subproc")
     parser.add_argument(
@@ -259,7 +500,7 @@ def _parse_args() -> argparse.Namespace:
                         help="RK4 substeps per 1 ms environment/safety step.")
     parser.add_argument("--controller-hold-env-steps", type=int,
                         default=DEFAULT_CONTROLLER_HOLD_ENV_STEPS,
-                        help="Hold each PPO action for this many environment steps (default: 5 -> 5 ms).")
+                        help="Hold each PPO action for this many environment steps (default: 1 -> 1 ms).")
     parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS,
                         help="Episode cap in fine environment steps, not PPO decisions.")
     parser.add_argument(
@@ -292,7 +533,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-eval-episodes", type=int, default=DEFAULT_N_EVAL_EPISODES)
     parser.add_argument(
         "--callback-eval-seed", type=int, default=None,
-        help=("Optional shared EvalCallback RNG seed for every independently trained policy. "
+        help=("Optional shared ReliabilityEvalCallback RNG seed for every independently trained policy. "
               "Default None preserves the historical seed+10000 protocol. "
               "A shared seed improves comparability but does not guarantee identical "
               "disturbance paths if policies consume RNG differently."),
@@ -413,6 +654,8 @@ def _build_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         omega_cost_weight=3.0,
         pass_completion_bonus=1000.0,
     )
+    if args.reward in {"productive", "dense"}:
+        kwargs.update(REWARD_KWARGS)
     if args.env_id == ENV_ID_FINISHING:
         kwargs["ap_max"] = float(args.ap_max)
     return kwargs
@@ -647,43 +890,26 @@ def _validate_sb3_zip(path: Path) -> dict[str, Any]:
 def _print_evaluation_commands(
     args: argparse.Namespace, run_dir: Path, plant_snapshot: dict[str, Any]
 ) -> None:
-    model_dir = run_dir / "models"
-    trajectory_dir = run_dir / "evaluation"
-    common = (
-        f'python scripts/eval_policy.py --model-dir "{model_dir}" '
-        f'--out-dir "{trajectory_dir}" --seeds ' + " ".join(str(s) for s in args.seeds)
-        + f' --env-id {args.env_id} --reward {args.reward}'
-        + f' --dt {args.dt:g} --n-substeps {args.n_substeps}'
-        + f' --policy-hold-env-steps {args.controller_hold_env_steps}'
-        + f' --max-episode-steps {args.max_episode_steps}'
-        + f' --dynamics-uncertainty-std {args.dynamics_uncertainty_std:g}'
-        + f' --n-episodes 5 --n-mc 5'
-    )
-    common += " --randomize-y0" if args.randomize_y0 else " --no-randomize-y0"
-
-    print("\nEvaluation command (loads the saved best checkpoint by default):")
+    print("\nNext steps (paths are automatic via --run-dir / --run latest):")
+    print(f'  python scripts/experiment.py eval --run-dir "{run_dir}"')
+    print(f'  python scripts/experiment.py plot --run-dir "{run_dir}"')
+    print("  # or against the latest run pointer:")
+    print("  python scripts/experiment.py eval --run latest")
+    print("  python scripts/experiment.py plot --run latest")
+    print(f'  tensorboard --logdir "{run_dir / "logs"}"')
     if args.env_id == ENV_ID_FINISHING:
         ap_min = float(plant_snapshot.get("ap_min", 0.0))
         ap_max = float(plant_snapshot.get("ap_max", args.ap_max))
         test_ap = 0.5 * (ap_min + ap_max)
-        print(common)
         print(
             "Finishing evaluation: with no --ap argument, one ap value is sampled "
             "per outer episode from the configured range and held fixed across that "
             "episode's MC replicas."
         )
         print(
-            f"For a separate fixed-depth sensitivity case, append --ap {test_ap:g}."
+            f'For a fixed-depth sensitivity case: '
+            f'python scripts/experiment.py eval --run-dir "{run_dir}" --ap {test_ap:g}'
         )
-    else:
-        print(common)
-
-    print("\nCombined learning-curve, training-diagnostic, and trajectory plots:")
-    print(
-        f'python scripts/plot_results.py --log-dir "{run_dir / "logs"}" '
-        f'--traj-dir "{trajectory_dir}" --out-dir "{run_dir / "plots"}" '
-        f'--seeds ' + " ".join(str(s) for s in args.seeds)
-    )
 
 
 def _train_one_seed(
@@ -706,7 +932,7 @@ def _train_one_seed(
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     rollout_size = args.n_steps * args.n_envs
-    callback_eval_seed = int(args.callback_eval_seed if args.callback_eval_seed is not None else seed + 10_000)
+    callback_eval_seed = int(args.callback_eval_seed if args.callback_eval_seed is not None else 10_000)
     minibatches_per_update = (rollout_size // args.batch_size) * args.n_epochs
     eval_freq_calls = max(1, min(args.eval_freq, args.total_timesteps) // args.n_envs)
     checkpoint_freq_calls = max(1, args.checkpoint_freq // args.n_envs)
@@ -777,14 +1003,19 @@ def _train_one_seed(
             ),
             "episodes_per_evaluation": args.n_eval_episodes,
             "deterministic_policy": True,
+            "reliability_selection": True,
+            "running_reward_scale": env_kwargs.get("running_reward_scale", 1.0),
             "evaluation_env_seed": callback_eval_seed,
-            "evaluation_seed_shared_across_training_seeds": args.callback_eval_seed is not None,
-            "checkpoint_selection_metric": "mean evaluation episode reward",
+            "evaluation_seed_shared_across_training_seeds": True,
+            "checkpoint_selection_metric": (
+                "lexicographic: pass_completion_rate desc, safety_termination_rate asc, "
+                "median_completed_productivity desc, median_progress desc, mean_return desc"
+            ),
             "cross_seed_note": (
-                "The plotted between-seed SD describes observed seed-level means, "
-                "including stochastic evaluation-condition variability. A shared "
-                "initial EvalCallback seed does not guarantee identical disturbance "
-                "paths or eliminate test noise."
+                "Checkpoint selection replays the same fixed evaluation seed set "
+                "for every checkpoint and every training seed. This paired test set "
+                "reduces scenario-sampling noise in checkpoint comparisons; final "
+                "reliability claims still require a larger independent test set."
             ),
         },
         "tensorboard_diagnostics": {
@@ -849,13 +1080,14 @@ def _train_one_seed(
         env_kwargs=worker_env_kwargs,
     )
 
-    eval_callback = EvalCallback(
-        eval_env,
-        best_model_save_path=str(best_dir),
-        log_path=str(seed_log_dir),
+    eval_callback = ReliabilityEvalCallback(
+        eval_env=eval_env,
         eval_freq=eval_freq_calls,
         n_eval_episodes=args.n_eval_episodes,
-        deterministic=True,
+        best_model_path=best_dir / "best_model",
+        log_dir=seed_log_dir,
+        displacement_limit_m=float(env_kwargs.get("w_limit", 3.0e-3)),
+        evaluation_seed=callback_eval_seed,
         verbose=1,
     )
     checkpoint_callback = CheckpointCallback(
@@ -926,13 +1158,13 @@ def _train_one_seed(
             best_validation = _validate_sb3_zip(best_archive)
         else:
             raise RuntimeError(
-                f"EvalCallback did not create {best_archive}. Check evaluations.npz "
+                f"ReliabilityEvalCallback did not create {best_archive}. Check evaluations.npz "
                 "and the evaluation episode rewards; no best checkpoint can be claimed."
             )
 
         eval_npz = seed_log_dir / "evaluations.npz"
         if not eval_npz.is_file():
-            raise RuntimeError(f"Expected EvalCallback history is missing: {eval_npz}")
+            raise RuntimeError(f"Expected ReliabilityEvalCallback history is missing: {eval_npz}")
         with np.load(eval_npz) as evaluation_data:
             eval_history = {
                 key: {
@@ -953,10 +1185,11 @@ def _train_one_seed(
             ),
             "controller_sample_time_s": float(controller_sample_time),
             "best_mean_eval_reward": (
-                float(eval_callback.best_mean_reward)
-                if np.isfinite(eval_callback.best_mean_reward)
-                else None
+                float(eval_callback.best_metrics["mean_return"])
+                if eval_callback.best_metrics is not None else None
             ),
+            "best_evaluation_metrics": eval_callback.best_metrics,
+            "best_checkpoint_selection_rank": list(eval_callback.best_rank) if eval_callback.best_rank is not None else None,
             "best_checkpoint": best_validation,
             "final_checkpoint": final_validation,
             "evaluation_history": {
@@ -968,7 +1201,12 @@ def _train_one_seed(
             "normalization_used": False,
         }
         _write_json(seed_log_dir / "training_summary.json", summary)
-        print(f"Seed {seed} completed. Best mean evaluation reward: {summary['best_mean_eval_reward']}")
+        print(
+            f"Seed {seed} completed. Best completion rate: "
+            f"{(eval_callback.best_metrics or {}).get('pass_completion_rate', float('nan')):.3f}; "
+            f"median completed productivity reward: "
+            f"{(eval_callback.best_metrics or {}).get('median_completed_productivity', float('nan')):.3g}"
+        )
         return summary
     finally:
         env.close()
@@ -1009,7 +1247,16 @@ def main() -> int:
         f"minibatches/update: {(rollout_size // args.batch_size) * args.n_epochs}"
     )
     print(f"Safe initial action bias: {safe_bias}")
-    print("Observation/reward normalization: OFF (required for current eval_policy.py compatibility)")
+    print(f"Axial-depth action range: {float(plant_snapshot.get('ap_min', 0.0)):.3g}-"
+          f"{float(plant_snapshot.get('ap_max', 12.0)):.3g} mm")
+    print(f"PPO gamma={args.gamma:.8f}; GAE lambda={args.gae_lambda:.8f}; log_std_init={PPO_LOG_STD_INIT}")
+    print("Observation/reward normalization: OFF (raw observations; no VecNormalize)")
+    if "running_reward_scale" in env_kwargs:
+        print(
+            f"Reward: running terms x {env_kwargs['running_reward_scale']:.6g}; "
+            f"omega cost={env_kwargs['omega_cost_weight']}; "
+            f"completion bonus={env_kwargs['pass_completion_bonus']} (terminal terms unscaled)"
+        )
     print(
         f"Training budget: {args.total_timesteps} controller transitions "
         f"(approximately {args.total_timesteps * args.controller_hold_env_steps} "
@@ -1021,6 +1268,7 @@ def main() -> int:
         return 0
 
     run_dir = _make_run_dir(args)
+    write_latest_pointer(run_dir, Path(args.output_root).expanduser().resolve())
     run_manifest = {
         "schema_version": 1,
         "status": "running",
@@ -1067,6 +1315,7 @@ def main() -> int:
     print(f"  models     : {run_dir / 'models'}")
     print(f"  logs       : {run_dir / 'logs'}")
     print(f"  evaluation : {run_dir / 'evaluation'}")
+    print(f"  LATEST     : {Path(args.output_root).expanduser().resolve() / 'LATEST'}")
 
     summaries: list[dict[str, Any]] = []
     for seed in args.seeds:

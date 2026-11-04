@@ -1,0 +1,13 @@
+# Finishing (second-mode): action = [omega]; ap randomized per episode
+# Shared knobs live in base.yaml — only finishing-specific diffs below.
+extends: base.yaml
+
+env_id: CustomODEPlateFinish-v0
+reward: dense
+
+# Feasible finishing depth band + matched production scale (registration.py)
+ap_max: 2.0
+plant:
+  ap_max: 2.0
+reward:
+  productivity_weight: 40.0

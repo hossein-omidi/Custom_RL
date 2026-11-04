@@ -14,7 +14,7 @@ from custom_rl.plants.plate import (
     rpm_to_omega,
 )
 from custom_rl.rewards.plate_rewards import get_plate_reward
-
+#salam
 
 # Default dirs for train/eval/plot
 DEFAULT_LOG_DIR = "logs/ppo_plate"
@@ -71,30 +71,13 @@ DEFAULT_REWARD_W_SCALE = 1.5e-3          # displacement cost scale (midpoint of 
 DEFAULT_REWARD_WDOT_SCALE = 1.0          # 1 m/s velocity scale
 DEFAULT_REWARD_W_WEIGHT = 0.6
 DEFAULT_REWARD_WDOT_WEIGHT = 0.02
-# Production-first reward balance (numerically verified).
-#
-# Design: material removal is the FIRST-CLASS objective.  There is NO bonus for
-# merely reaching the pass end; instead, failing to reach it (chatter or timeout)
-# is penalized.  So the return is  (sum of dense production) - (failure penalty),
-# and the optimum is the deepest/most-productive operating point that stays
-# stable -- not "idle until the pass completes".
-#
-#   * pass_completion_bonus = 0   -> reaching the end earns nothing (no idling
-#                                    incentive); production must be earned per step.
-#   * termination/truncation_penalty = 500 -> penalty for NOT reaching the end.
-#   * productivity_weight = 240   -> the normalized MRR proxy divides by the
-#                                    ACTION bound ap_max (=12), so s_ap = ap/12 is
-#                                    throttled to <=1/8 over the feasible depth
-#                                    (<=~1.5 mm).  Scaling P by the same factor
-#                                    (30 -> 240 = 30 * 12/1.5) restores a full-range
-#                                    production gradient WITHOUT restricting the
-#                                    action space.  IMPORTANT: P is coupled to
-#                                    ap_max here; if ap_max changes, rescale P so
-#                                    P/ap_max stays ~= 20 per mm.
-#   * omega_cost_weight = 0.3     -> mild actuator/speed cost, kept well below the
-#                                    productive MRR so the high-rpm (better-lobe)
-#                                    regime is not avoided and a fast productive
-#                                    pass never goes net-negative.
+# Runtime reward defaults for the current roughing study.
+# The unified PPO trainer records these coefficients explicitly in its run
+# configuration. Its running_reward_scale scales only dense per-step terms;
+# pass-completion and failure/truncation adjustments remain unscaled.
+# Current runtime values: productivity=240, omega_cost=3, completion_bonus=1000,
+# termination/truncation_penalty=500, displacement_weight=0.6,
+# velocity_weight=0.02. Keep this comment aligned with the constants below.
 DEFAULT_REWARD_PRODUCTIVITY_WEIGHT = 240.0
 DEFAULT_REWARD_OMEGA_COST_WEIGHT = 3.0
 DEFAULT_REWARD_TERMINATION_PENALTY = 500.0
@@ -252,6 +235,7 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
         "eta_dot_weight",
         "action_weight",
         "productivity_weight",
+        "running_reward_scale",
         "negative_ap_weight",
         "negative_ac_weight",
         "ap_productive_target",

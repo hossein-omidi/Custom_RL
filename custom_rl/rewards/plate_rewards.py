@@ -247,6 +247,7 @@ class DenseProductivePlateReward:
         wdot_weight: float = 0.02,
         action_weight: float = 0.0,
         productivity_weight: float = 30.0,
+        running_reward_scale: float = 1.0,
         negative_ap_weight: float = 2.0,
         omega_cost_weight: float = 0.3,
         ap_action_weight: float = 0.0,
@@ -312,6 +313,9 @@ class DenseProductivePlateReward:
         self.wdot_weight = float(wdot_weight)
         self.action_weight = float(action_weight)
         self.productivity_weight = float(productivity_weight)
+        self.running_reward_scale = float(running_reward_scale)
+        if not np.isfinite(self.running_reward_scale) or self.running_reward_scale < 0.0:
+            raise ValueError("running_reward_scale must be finite and non-negative.")
         self.negative_ap_weight = float(negative_ap_weight)
         self.omega_cost_weight = float(omega_cost_weight)
         self.ap_action_weight = float(ap_action_weight)
@@ -501,7 +505,7 @@ class DenseProductivePlateReward:
         ap_action_cost = self.ap_action_weight * (ap_u**2)
         action_cost = float(np.sum(u_clipped**2))
 
-        reward = (
+        running_reward_unscaled = (
             self.alive_bonus
             + productivity_term
             - w_cost
@@ -511,6 +515,9 @@ class DenseProductivePlateReward:
             - ap_action_cost
             - self.action_weight * action_cost
         )
+        # Scale only dense running terms. Terminal completion/failure adjustments
+        # remain in their configured physical reward units and are not scaled.
+        reward = self.running_reward_scale * running_reward_unscaled
 
         terminal_adjustment, terminal_terms = _terminal_adjustment(
             terminated=bool(terminated),
@@ -537,6 +544,13 @@ class DenseProductivePlateReward:
             "productivity_w_gate_m": float(self.productivity_w_gate),
             "productivity_wdot_gate_m_s": float(self.productivity_wdot_gate),
             "productivity": float(productivity_term),
+            "running_reward_unscaled": float(running_reward_unscaled),
+            "running_reward_scale": float(self.running_reward_scale),
+            "running_reward_scaled": float(self.running_reward_scale * running_reward_unscaled),
+            "productivity_scaled": float(self.running_reward_scale * productivity_term),
+            "vibration_w_cost_scaled": float(self.running_reward_scale * w_cost),
+            "vibration_wdot_cost_scaled": float(self.running_reward_scale * wdot_cost),
+            "omega_cost_scaled": float(self.running_reward_scale * omega_cost),
             "omega_cost": float(omega_cost),
             "negative_ap_cost": float(self.negative_ap_weight * negative_ap_cost),
             "ap_action_cost": float(ap_action_cost),
