@@ -52,11 +52,13 @@ ENV_ID = "CustomODEPlate-v0"
 ENV_ID_FINISHING = "CustomODEPlateFinish-v0"
 PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 
-# Standalone evaluation defaults must match the uploaded training script.
-# Training uses RK4 dt=1e-4 with 10 RK4 substeps per environment/control step,
-# giving a 1 ms control interval while still resolving the 4000-rpm tooth delay.
+# Legacy-checkpoint fallback. New unified checkpoints carry the controller hold
+# and discount in training_config.json, which always takes precedence.
+# Older checkpoints from the former trainer used one policy decision per 1 ms
+# environment step, so their fallback remains 1 ms for backward compatibility.
 EVAL_DEFAULT_DT = 1.0e-4
 EVAL_DEFAULT_N_SUBSTEPS = 10
+EVAL_DEFAULT_CONTROLLER_HOLD_ENV_STEPS = 1
 # Legacy-checkpoint fallback only. Unified-run checkpoints load this cap from
 # their saved training_config.json, avoiding silent train/eval truncation mismatch.
 EVAL_DEFAULT_MAX_EPISODE_STEPS = 250000
@@ -241,10 +243,17 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
     env_id = args.env_id or env_cfg.get("env_id") or ENV_ID
     finishing = env_id == ENV_ID_FINISHING
     reward = args.reward or env_cfg.get("reward_id") or ("dense" if finishing else "productive")
+    ppo_cfg = (config or {}).get("ppo", {})
+    if not isinstance(ppo_cfg, dict):
+        ppo_cfg = {}
 
     def pick(cli_name: str, saved_value: Any, fallback: Any) -> Any:
         cli_value = getattr(args, cli_name)
         return cli_value if cli_value is not None else (saved_value if saved_value is not None else fallback)
+
+    saved_gamma = ppo_cfg.get("gamma", 1.0)
+    if saved_gamma is None:
+        saved_gamma = 1.0
 
     settings = {
         "env_id": env_id,
@@ -254,6 +263,12 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
         "max_episode_steps": int(pick("max_episode_steps", env_cfg.get("max_episode_steps"), EVAL_DEFAULT_MAX_EPISODE_STEPS)),
         "dynamics_uncertainty_std": float(pick("dynamics_uncertainty_std", env_cfg.get("dynamics_uncertainty_std"), EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD)),
         "randomize_y0": bool(pick("randomize_y0", env_cfg.get("randomize_y0"), EVAL_DEFAULT_RANDOMIZE_Y0)),
+        "controller_hold_env_steps": int(pick(
+            "policy_hold_env_steps",
+            env_cfg.get("controller_hold_env_steps"),
+            EVAL_DEFAULT_CONTROLLER_HOLD_ENV_STEPS,
+        )),
+        "gamma_controller": float(saved_gamma),
         "ap_max": args.ap_max if args.ap_max is not None else saved_kwargs.get("ap_max", 1.0 if finishing else None),
         "training_env_kwargs": dict(saved_kwargs),
     }
@@ -271,6 +286,18 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
         raise ValueError("Resolved dt, n_substeps and max_episode_steps must be positive.")
     if settings["dynamics_uncertainty_std"] < 0.0:
         raise ValueError("Resolved dynamics_uncertainty_std cannot be negative.")
+    if settings["controller_hold_env_steps"] <= 0:
+        raise ValueError("Resolved controller_hold_env_steps must be positive.")
+    if settings["max_episode_steps"] % settings["controller_hold_env_steps"] != 0:
+        raise ValueError(
+            "Resolved max_episode_steps must be divisible by controller_hold_env_steps "
+            "so time-limit truncation occurs at a controller boundary."
+        )
+    if not np.isfinite(settings["gamma_controller"]) or not (0.0 < settings["gamma_controller"] <= 1.0):
+        raise ValueError("Saved PPO gamma must be finite and in (0, 1].")
+    settings["gamma_per_env_step"] = float(
+        settings["gamma_controller"] ** (1.0 / settings["controller_hold_env_steps"])
+    )
     return settings
 
 
@@ -500,8 +527,8 @@ def main() -> int:
 
     parser.add_argument("--dt", type=float, default=None, help="Override saved training RK4 substep [s]")
     parser.add_argument("--n-substeps", type=int, default=None, help="Override saved training RK4 substeps")
-    parser.add_argument("--policy-hold-env-steps", type=int, default=1,
-                        help="Hold one RL policy action for this many environment steps; physical safety is checked every environment step.")
+    parser.add_argument("--policy-hold-env-steps", type=int, default=None,
+                        help="Hold one RL action for this many environment steps; defaults to the saved trainer config (legacy checkpoints: 1).")
     parser.add_argument("--evaluation-seed", "--reset-seed-offset", dest="evaluation_seed", type=int, default=1000,
                         help="Base held-out test seed, shared across all training seeds (default: 1000).")
     parser.add_argument("--plant-override", default=None,
@@ -589,7 +616,7 @@ def main() -> int:
         raise SystemExit("--n-mc must be positive.")
     if args.record_every <= 0:
         raise SystemExit("--record-every must be positive.")
-    if args.policy_hold_env_steps <= 0:
+    if args.policy_hold_env_steps is not None and args.policy_hold_env_steps <= 0:
         raise SystemExit("--policy-hold-env-steps must be positive.")
     if args.y0 is not None and args.y_position:
         raise SystemExit("Use either --y0 or --y-position, not both.")
@@ -677,6 +704,9 @@ def main() -> int:
             "Do not pool them in one between-seed scientific figure. Evaluate "
             "distinct experimental conditions in separate output directories."
         )
+    args.policy_hold_env_steps = int(
+        settings_by_seed[seeds[0]]["controller_hold_env_steps"]
+    )
 
     register_envs()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -761,6 +791,13 @@ def main() -> int:
             "reward": settings["reward"],
             "dt": settings["dt"],
             "n_substeps": settings["n_substeps"],
+            "environment_step_s": settings["dt"] * settings["n_substeps"],
+            "controller_hold_env_steps": settings["controller_hold_env_steps"],
+            "controller_sample_time_s": (
+                settings["dt"] * settings["n_substeps"] * settings["controller_hold_env_steps"]
+            ),
+            "gamma_controller": settings["gamma_controller"],
+            "gamma_per_env_step": settings["gamma_per_env_step"],
             "max_episode_steps": settings["max_episode_steps"],
             "dynamics_uncertainty_std": settings["dynamics_uncertainty_std"],
             "randomize_y0": settings["randomize_y0"],
@@ -781,6 +818,9 @@ def main() -> int:
             ("max_episode_steps", training_env.get("max_episode_steps"), settings["max_episode_steps"]),
             ("dynamics_uncertainty_std", training_env.get("dynamics_uncertainty_std"), settings["dynamics_uncertainty_std"]),
             ("randomize_y0", training_env.get("randomize_y0"), settings["randomize_y0"]),
+            ("controller_hold_env_steps", training_env.get("controller_hold_env_steps"), settings["controller_hold_env_steps"]),
+            ("omega_cost_weight", training_kwargs.get("omega_cost_weight"), env_kwargs.get("omega_cost_weight")),
+            ("pass_completion_bonus", training_kwargs.get("pass_completion_bonus"), env_kwargs.get("pass_completion_bonus")),
             ("ap_max", training_kwargs.get("ap_max"), env_kwargs.get("ap_max")),
             ("initial_eta_std", training_kwargs.get("initial_eta_std"), env_kwargs.get("initial_eta_std")),
             ("initial_etad_std", training_kwargs.get("initial_etad_std"), env_kwargs.get("initial_etad_std")),
@@ -830,6 +870,9 @@ def main() -> int:
         metadata["eval_control_step_s"] = float(control_dt * args.policy_hold_env_steps)
         metadata["eval_environment_step_s"] = float(control_dt)
         metadata["eval_policy_hold_env_steps"] = int(args.policy_hold_env_steps)
+        metadata["controller_sample_time_s"] = float(control_dt * args.policy_hold_env_steps)
+        metadata["gamma_controller"] = float(settings["gamma_controller"])
+        metadata["gamma_per_environment_step"] = float(settings["gamma_per_env_step"])
         metadata["signal_timestamp_semantics"] = "post-step environment time"
         metadata["action_timestamp_semantics"] = "time at action application start"
         metadata["eval_seed_base"] = int(args.evaluation_seed)
@@ -965,7 +1008,10 @@ def main() -> int:
                         full_w_sum_sq += float(np.dot(w_full, w_full))
                         full_w_count += int(w_full.size)
                         full_w_max = max(full_w_max, float(np.max(np.abs(w_full))))
-                    full_reward_sum += float(reward)
+                    reward_offset_in_hold = (fair_eval_step - 1) % args.policy_hold_env_steps
+                    full_reward_sum += (
+                        settings["gamma_per_env_step"] ** reward_offset_in_hold
+                    ) * float(reward)
                     if "F_total_N" in info:
                         force = np.asarray(info["F_total_N"], dtype=np.float64).reshape(-1)
                         if not np.all(np.isfinite(force)):
@@ -1047,6 +1093,16 @@ def main() -> int:
                     "rewards": rewards,
                     "return": float(full_reward_sum),
                     "length": int(fair_eval_step),
+                    "controller_decisions": int(
+                        (fair_eval_step + args.policy_hold_env_steps - 1)
+                        // args.policy_hold_env_steps
+                    ),
+                    "controller_sample_time_s": float(
+                        control_dt * args.policy_hold_env_steps
+                    ),
+                    "reward_discount_gamma_per_env_step": float(
+                        settings["gamma_per_env_step"]
+                    ),
                     "recorded_length": int(len(rewards)),
                     "rewards_are_subsampled": bool(args.record_every > 1),
                     "terminated": bool(terminated_final),
@@ -1151,6 +1207,10 @@ def main() -> int:
             "trajectory_file": str(out_path),
             "env_id": args.env_id,
             "reward": settings["reward"],
+            "controller_hold_env_steps": int(settings["controller_hold_env_steps"]),
+            "controller_sample_time_s": float(
+                settings["dt"] * settings["n_substeps"] * settings["controller_hold_env_steps"]
+            ),
             "evaluation_seed_base": int(args.evaluation_seed),
         })
         print(f"Staged {args.n_episodes} episodes for {out_path}")
@@ -1178,6 +1238,10 @@ def main() -> int:
         "models": manifest_models,
     }
     manifest["trajectory_record_every"] = int(args.record_every)
+    manifest["controller_hold_env_steps"] = int(args.policy_hold_env_steps)
+    manifest["controller_sample_time_s"] = float(
+        manifest_models[0].get("controller_sample_time_s", np.nan)
+    ) if manifest_models else None
     manifest["metrics_use_full_simulation_rate"] = True
     with (stage_dir / "evaluation_manifest.json").open("w", encoding="utf-8") as stream:
         json.dump(_to_jsonable(manifest), stream, indent=2, allow_nan=False)

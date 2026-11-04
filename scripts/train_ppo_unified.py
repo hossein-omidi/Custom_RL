@@ -17,9 +17,10 @@ changed. This file preserves the current evaluator's raw-observation pipeline.
 Default roughing settings match eval_policy.py:
     env_id                  CustomODEPlate-v0
     reward                  productive
-    dt                      1e-4 s
-    n_substeps              10  -> control interval 1e-3 s
-    max_episode_steps       250000
+    RK4 dt                  1e-4 s
+    n_substeps              10  -> environment/safety interval 1e-3 s
+    controller hold         5 environment steps -> controller sample 5e-3 s
+    max_episode_steps       250000 environment steps
     dynamics_uncertainty    0.001
     randomize_y0            True
 
@@ -79,20 +80,19 @@ VALID_ENV_IDS = (ENV_ID_ROUGHING, ENV_ID_FINISHING)
 # ---------------------------------------------------------------------------
 # Balanced PPO defaults
 # ---------------------------------------------------------------------------
-# Rollout samples per update equal --n-envs × --n-steps (by default
-# 3 × 2048 = 6144). Eight epochs are used for the baseline. The [256, 256] network avoids the unnecessary capacity
-# increase of the 384-384-256 alternative for this baseline experiment.
+# The 5 ms controller default keeps approximately the same physical rollout
+# and optimizer batch as the former 1 ms / (2048, 256) setup:
+# 3*400*5 = 6000 base environment steps per rollout and 1200/50 = 24 minibatches.
 PPO_LEARNING_RATE = 2.5e-4
 PPO_FINAL_LEARNING_RATE = 2.5e-5
 PPO_N_STEPS = 2048
 PPO_BATCH_SIZE = 256
 PPO_N_EPOCHS = 8
 
-# Long-horizon discounting is retained from train_sb3_ppo.py. With a 1 ms
-# control interval, gamma=0.9999 has an approximate 1/e discount horizon of
-# 1/(1-gamma)=10,000 control steps, i.e. about 10 seconds.
-PPO_GAMMA = 0.9999
-PPO_GAE_LAMBDA = 0.98
+# Reference discounts are per 1 ms environment step. They are converted to
+# the controller decision interval after CLI parsing.
+PPO_GAMMA_PER_ENV_STEP = 0.999995
+PPO_GAE_LAMBDA_PER_ENV_STEP = 0.9995
 
 PPO_CLIP_RANGE = 0.20
 PPO_FINAL_CLIP_RANGE = 0.10
@@ -107,13 +107,16 @@ PPO_ADAM_EPS = 1e-5
 # Initial action mean: mid-range spindle speed and a low initial ap in roughing.
 SAFE_AP_FRACTION = 0.05
 
+# These are PPO/controller transitions. At a 5 ms hold, 200k decisions
+# correspond to 1M underlying 1 ms environment steps, matching the former budget.
 DEFAULT_TOTAL_TIMESTEPS = 1_000_000
-DEFAULT_EVAL_FREQ = 50_000       # total environment transitions, not VecEnv calls
+DEFAULT_EVAL_FREQ = 50_000
 DEFAULT_N_EVAL_EPISODES = 3
 DEFAULT_CHECKPOINT_FREQ = 200_000
 
 DEFAULT_DT = 1.0e-4
 DEFAULT_N_SUBSTEPS = 10
+DEFAULT_CONTROLLER_HOLD_ENV_STEPS = 1
 DEFAULT_MAX_EPISODE_STEPS = 250_000
 DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.001
 
@@ -133,14 +136,80 @@ def linear_schedule(initial_value: float, final_value: float) -> Schedule:
     return schedule
 
 
-def make_registered_plate_env(_env_id: str = ENV_ID_ROUGHING, **env_kwargs: Any) -> gym.Env:
-    """Register and instantiate the environment inside each worker process.
+class ControllerSampleTimeWrapper(gym.Wrapper):
+    """Hold each PPO action across several fine environment/safety steps.
 
-    This top-level factory is required for reliable SubprocVecEnv spawning on
-    Windows and avoids relying on registration performed only in the parent.
+    Rewards are discounted and accumulated within the held-action interval.
+    The PPO gamma is therefore specified per controller decision, while the
+    wrapper applies its per-environment-step root to the intermediate rewards.
+    """
+
+    def __init__(
+        self,
+        env: gym.Env,
+        hold_env_steps: int,
+        gamma_per_env_step: float,
+    ) -> None:
+        super().__init__(env)
+        self.hold_env_steps = int(hold_env_steps)
+        self.gamma_per_env_step = float(gamma_per_env_step)
+        if self.hold_env_steps <= 0:
+            raise ValueError("hold_env_steps must be positive.")
+        if not np.isfinite(self.gamma_per_env_step) or not (0.0 < self.gamma_per_env_step <= 1.0):
+            raise ValueError("gamma_per_env_step must be finite and in (0, 1].")
+        base_env = env.unwrapped
+        self.environment_step_s = float(
+            getattr(base_env, "_step_dt", float(base_env.dt) * int(base_env.n_substeps))
+        )
+        self.controller_sample_time_s = self.environment_step_s * self.hold_env_steps
+
+    def step(self, action):
+        total_reward = 0.0
+        reward_discount = 1.0
+        observation = None
+        terminated = truncated = False
+        info: dict[str, Any] = {}
+
+        steps_taken = 0
+        for steps_taken in range(1, self.hold_env_steps + 1):
+            observation, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += reward_discount * float(reward)
+            reward_discount *= self.gamma_per_env_step
+            if terminated or truncated:
+                break
+
+        info = dict(info)
+        info["controller_hold_env_steps"] = int(steps_taken)
+        info["controller_sample_time_s"] = float(
+            self.environment_step_s * steps_taken
+        )
+        info["controller_reward_discount_gamma_per_env_step"] = float(
+            self.gamma_per_env_step
+        )
+        return observation, float(total_reward), bool(terminated), bool(truncated), info
+
+
+def make_registered_plate_env(
+    _env_id: str = ENV_ID_ROUGHING,
+    _controller_hold_env_steps: int = 1,
+    _gamma_per_env_step: float = 1.0,
+    **env_kwargs: Any,
+) -> gym.Env:
+    """Build the same fine-step plant and controller wrapper in every worker.
+
+    The plant still integrates and checks termination at its configured
+    environment interval (1 ms by default). PPO receives one transition only
+    after the held action has advanced the plant by 5 ms.
     """
     register_envs()
-    return gym.make(_env_id, **env_kwargs)
+    env = gym.make(_env_id, **env_kwargs)
+    if int(_controller_hold_env_steps) > 1:
+        env = ControllerSampleTimeWrapper(
+            env,
+            hold_env_steps=int(_controller_hold_env_steps),
+            gamma_per_env_step=float(_gamma_per_env_step),
+        )
+    return env
 
 
 def _parse_args() -> argparse.Namespace:
@@ -174,7 +243,8 @@ def _parse_args() -> argparse.Namespace:
         help="Optional unique run folder name. If omitted, a timestamped name is generated.",
     )
 
-    parser.add_argument("--total-timesteps", type=int, default=DEFAULT_TOTAL_TIMESTEPS)
+    parser.add_argument("--total-timesteps", type=int, default=DEFAULT_TOTAL_TIMESTEPS,
+                        help="Total PPO/controller transitions across all workers (default 200k at 5 ms each).")
     parser.add_argument("--n-envs", type=int, default=3)
     parser.add_argument("--vec-env", choices=["subproc", "dummy"], default="subproc")
     parser.add_argument(
@@ -185,8 +255,13 @@ def _parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument("--dt", type=float, default=DEFAULT_DT, help="RK4 integration substep [s].")
-    parser.add_argument("--n-substeps", type=int, default=DEFAULT_N_SUBSTEPS)
-    parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS)
+    parser.add_argument("--n-substeps", type=int, default=DEFAULT_N_SUBSTEPS,
+                        help="RK4 substeps per 1 ms environment/safety step.")
+    parser.add_argument("--controller-hold-env-steps", type=int,
+                        default=DEFAULT_CONTROLLER_HOLD_ENV_STEPS,
+                        help="Hold each PPO action for this many environment steps (default: 5 -> 5 ms).")
+    parser.add_argument("--max-episode-steps", type=int, default=DEFAULT_MAX_EPISODE_STEPS,
+                        help="Episode cap in fine environment steps, not PPO decisions.")
     parser.add_argument(
         "--dynamics-uncertainty-std",
         type=float,
@@ -202,11 +277,15 @@ def _parse_args() -> argparse.Namespace:
     # optimizer settings are deliberately fixed in the versioned script.
     parser.add_argument("--learning-rate", type=float, default=PPO_LEARNING_RATE)
     parser.add_argument("--final-learning-rate", type=float, default=PPO_FINAL_LEARNING_RATE)
-    parser.add_argument("--n-steps", type=int, default=PPO_N_STEPS)
-    parser.add_argument("--batch-size", type=int, default=PPO_BATCH_SIZE)
+    parser.add_argument("--n-steps", type=int, default=PPO_N_STEPS,
+                        help="Rollout controller transitions per environment.")
+    parser.add_argument("--batch-size", type=int, default=PPO_BATCH_SIZE,
+                        help="PPO minibatch size in controller transitions.")
     parser.add_argument("--n-epochs", type=int, default=PPO_N_EPOCHS)
-    parser.add_argument("--gamma", type=float, default=PPO_GAMMA)
-    parser.add_argument("--gae-lambda", type=float, default=PPO_GAE_LAMBDA)
+    parser.add_argument("--gamma", type=float, default=None,
+                        help="Discount per PPO/controller transition; default preserves the 1 ms physical discount horizon.")
+    parser.add_argument("--gae-lambda", type=float, default=None,
+                        help="GAE lambda per PPO/controller transition; default preserves the 1 ms trace horizon.")
     parser.add_argument("--clip-range", type=float, default=PPO_CLIP_RANGE)
     parser.add_argument("--final-clip-range", type=float, default=PPO_FINAL_CLIP_RANGE)
 
@@ -218,8 +297,10 @@ def _parse_args() -> argparse.Namespace:
               "A shared seed improves comparability but does not guarantee identical "
               "disturbance paths if policies consume RNG differently."),
     )
-    parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ)
-    parser.add_argument("--checkpoint-freq", type=int, default=DEFAULT_CHECKPOINT_FREQ)
+    parser.add_argument("--eval-freq", type=int, default=DEFAULT_EVAL_FREQ,
+                        help="Evaluate every this many aggregate controller transitions.")
+    parser.add_argument("--checkpoint-freq", type=int, default=DEFAULT_CHECKPOINT_FREQ,
+                        help="Save periodic checkpoints every this many aggregate controller transitions.")
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     parser.add_argument(
         "--progress-bar",
@@ -237,6 +318,13 @@ def _parse_args() -> argparse.Namespace:
 def _resolve_mode_defaults(args: argparse.Namespace) -> None:
     if args.reward is None:
         args.reward = "dense" if args.env_id == ENV_ID_FINISHING else "productive"
+
+    if args.controller_hold_env_steps <= 0:
+        raise ValueError("--controller-hold-env-steps must be positive.")
+    if args.gamma is None:
+        args.gamma = PPO_GAMMA_PER_ENV_STEP ** args.controller_hold_env_steps
+    if args.gae_lambda is None:
+        args.gae_lambda = PPO_GAE_LAMBDA_PER_ENV_STEP ** args.controller_hold_env_steps
 
     if args.env_id == ENV_ID_FINISHING:
         if args.ap_max is None:
@@ -286,6 +374,13 @@ def _validate_args(args: argparse.Namespace) -> None:
 
     if args.dt <= 0.0 or args.n_substeps <= 0 or args.max_episode_steps <= 0:
         raise ValueError("dt, n_substeps and max_episode_steps must all be positive.")
+    if args.controller_hold_env_steps <= 0:
+        raise ValueError("--controller-hold-env-steps must be positive.")
+    if args.max_episode_steps % args.controller_hold_env_steps != 0:
+        raise ValueError(
+            "--max-episode-steps must be divisible by --controller-hold-env-steps "
+            "so time-limit truncations occur at a controller boundary."
+        )
     if args.dynamics_uncertainty_std < 0.0:
         raise ValueError("dynamics_uncertainty_std cannot be negative.")
     if args.callback_eval_seed is not None and args.callback_eval_seed < 0:
@@ -315,6 +410,8 @@ def _build_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         max_episode_steps=args.max_episode_steps,
         dynamics_uncertainty_std=args.dynamics_uncertainty_std,
         randomize_y0=args.randomize_y0,
+        omega_cost_weight=3.0,
+        pass_completion_bonus=1000.0,
     )
     if args.env_id == ENV_ID_FINISHING:
         kwargs["ap_max"] = float(args.ap_max)
@@ -487,7 +584,12 @@ def _preflight(args: argparse.Namespace, env_kwargs: dict[str, Any]) -> tuple[di
 
         snapshot = _plant_snapshot(plant, probe)
         snapshot["minimum_tooth_delay_s"] = float(minimum_tooth_delay)
-        snapshot["control_dt_s"] = float(args.dt * args.n_substeps)
+        snapshot["environment_step_dt_s"] = float(args.dt * args.n_substeps)
+        snapshot["controller_hold_env_steps"] = int(args.controller_hold_env_steps)
+        snapshot["controller_sample_time_s"] = float(
+            args.dt * args.n_substeps * args.controller_hold_env_steps
+        )
+        snapshot["control_dt_s"] = snapshot["controller_sample_time_s"]
         snapshot["reset_observation_finite"] = True
         snapshot["safe_action_bias"] = safe_bias
         snapshot["normalized_action_bounds"] = bool(normalized_action_bounds)
@@ -552,6 +654,7 @@ def _print_evaluation_commands(
         f'--out-dir "{trajectory_dir}" --seeds ' + " ".join(str(s) for s in args.seeds)
         + f' --env-id {args.env_id} --reward {args.reward}'
         + f' --dt {args.dt:g} --n-substeps {args.n_substeps}'
+        + f' --policy-hold-env-steps {args.controller_hold_env_steps}'
         + f' --max-episode-steps {args.max_episode_steps}'
         + f' --dynamics-uncertainty-std {args.dynamics_uncertainty_std:g}'
         + f' --n-episodes 5 --n-mc 5'
@@ -607,6 +710,9 @@ def _train_one_seed(
     minibatches_per_update = (rollout_size // args.batch_size) * args.n_epochs
     eval_freq_calls = max(1, min(args.eval_freq, args.total_timesteps) // args.n_envs)
     checkpoint_freq_calls = max(1, args.checkpoint_freq // args.n_envs)
+    gamma_per_env_step = float(args.gamma ** (1.0 / args.controller_hold_env_steps))
+    environment_step_dt = float(args.dt * args.n_substeps)
+    controller_sample_time = environment_step_dt * args.controller_hold_env_steps
 
     seed_config = {
         "schema_version": 1,
@@ -622,7 +728,10 @@ def _train_one_seed(
             "minimum_tooth_delay_s": minimum_tooth_delay,
             "dt_s": args.dt,
             "n_substeps": args.n_substeps,
-            "control_dt_s": args.dt * args.n_substeps,
+            "environment_step_dt_s": environment_step_dt,
+            "controller_hold_env_steps": args.controller_hold_env_steps,
+            "controller_sample_time_s": controller_sample_time,
+            "control_dt_s": controller_sample_time,
             "max_episode_steps": args.max_episode_steps,
             "dynamics_uncertainty_std": args.dynamics_uncertainty_std,
             "randomize_y0": args.randomize_y0,
@@ -633,11 +742,18 @@ def _train_one_seed(
             "n_steps": args.n_steps,
             "n_envs": args.n_envs,
             "rollout_size": rollout_size,
+            "rollout_environment_steps": rollout_size * args.controller_hold_env_steps,
+            "rollout_duration_s": args.n_steps * controller_sample_time,
             "batch_size": args.batch_size,
             "n_epochs": args.n_epochs,
             "optimizer_minibatches_per_update": minibatches_per_update,
             "gamma": args.gamma,
+            "gamma_per_environment_step": gamma_per_env_step,
             "gae_lambda": args.gae_lambda,
+            "gae_lambda_per_environment_step": float(
+                args.gae_lambda ** (1.0 / args.controller_hold_env_steps)
+            ),
+            "controller_hold_env_steps": args.controller_hold_env_steps,
             "clip_range_initial": args.clip_range,
             "clip_range_final": args.final_clip_range,
             "ent_coef": PPO_ENT_COEF,
@@ -653,9 +769,12 @@ def _train_one_seed(
             "safe_action_bias": safe_bias,
         },
         "evaluation_callback": {
-            "frequency_env_transitions_requested": args.eval_freq,
+            "frequency_controller_transitions_requested": args.eval_freq,
             "frequency_vecenv_calls_actual": eval_freq_calls,
-            "frequency_env_transitions_actual": eval_freq_calls * args.n_envs,
+            "frequency_controller_transitions_actual": eval_freq_calls * args.n_envs,
+            "frequency_environment_transitions_actual": (
+                eval_freq_calls * args.n_envs * args.controller_hold_env_steps
+            ),
             "episodes_per_evaluation": args.n_eval_episodes,
             "deterministic_policy": True,
             "evaluation_env_seed": callback_eval_seed,
@@ -680,9 +799,12 @@ def _train_one_seed(
             ],
         },
         "periodic_checkpoint": {
-            "frequency_env_transitions_requested": args.checkpoint_freq,
+            "frequency_controller_transitions_requested": args.checkpoint_freq,
             "frequency_vecenv_calls_actual": checkpoint_freq_calls,
-            "frequency_env_transitions_actual": checkpoint_freq_calls * args.n_envs,
+            "frequency_controller_transitions_actual": checkpoint_freq_calls * args.n_envs,
+            "frequency_environment_transitions_actual": (
+                checkpoint_freq_calls * args.n_envs * args.controller_hold_env_steps
+            ),
         },
         "software": {
             "python": sys.version,
@@ -694,7 +816,12 @@ def _train_one_seed(
     }
     _write_json(seed_log_dir / "training_config.json", seed_config)
 
-    worker_env_kwargs = {**env_kwargs, "_env_id": args.env_id}
+    worker_env_kwargs = {
+        **env_kwargs,
+        "_env_id": args.env_id,
+        "_controller_hold_env_steps": args.controller_hold_env_steps,
+        "_gamma_per_env_step": gamma_per_env_step,
+    }
     start_kwargs = {"start_method": args.start_method}
 
     train_vec_cls = SubprocVecEnv if args.vec_env == "subproc" else DummyVecEnv
@@ -820,6 +947,11 @@ def _train_one_seed(
             "seed": int(seed),
             "status": "completed",
             "timesteps_reported_by_model": int(model.num_timesteps),
+            "controller_transitions_reported": int(model.num_timesteps),
+            "environment_transitions_reported": int(
+                model.num_timesteps * args.controller_hold_env_steps
+            ),
+            "controller_sample_time_s": float(controller_sample_time),
             "best_mean_eval_reward": (
                 float(eval_callback.best_mean_reward)
                 if np.isfinite(eval_callback.best_mean_reward)
@@ -856,8 +988,12 @@ def main() -> int:
     print("\n========== PPO PREFLIGHT: PASS ==========")
     print(f"Environment: {args.env_id}; reward: {args.reward}")
     print(
-        f"Integrator: dt={args.dt:g} s, n_substeps={args.n_substeps}, "
-        f"control_dt={control_dt:g} s"
+        f"RK4: dt={args.dt:g} s x {args.n_substeps}; "
+        f"environment/safety step={control_dt:g} s"
+    )
+    print(
+        f"Controller: hold={args.controller_hold_env_steps} environment steps; "
+        f"sample_time={control_dt * args.controller_hold_env_steps:g} s"
     )
     print(
         f"Minimum tooth delay: {minimum_tooth_delay:.6g} s; "
@@ -874,6 +1010,11 @@ def main() -> int:
     )
     print(f"Safe initial action bias: {safe_bias}")
     print("Observation/reward normalization: OFF (required for current eval_policy.py compatibility)")
+    print(
+        f"Training budget: {args.total_timesteps} controller transitions "
+        f"(approximately {args.total_timesteps * args.controller_hold_env_steps} "
+        "fine environment steps across all workers)."
+    )
 
     if args.preflight_only:
         print("Preflight-only requested; no run directory was created and no training was started.")
@@ -889,6 +1030,11 @@ def main() -> int:
         "arguments": vars(args),
         "environment_probe": plant_snapshot,
         "resolved_env_kwargs": env_kwargs,
+        "controller": {
+            "environment_step_dt_s": float(args.dt * args.n_substeps),
+            "hold_environment_steps": int(args.controller_hold_env_steps),
+            "sample_time_s": float(args.dt * args.n_substeps * args.controller_hold_env_steps),
+        },
         "ppo_defaults": {
             "learning_rate_initial": args.learning_rate,
             "learning_rate_final": args.final_learning_rate,

@@ -285,7 +285,7 @@ def plot_learning_curve(
                label="Individual evaluation episode returns")
     )
 
-    ax.set_xlabel("Training timesteps (aggregate environment transitions)")
+    ax.set_xlabel("PPO controller transitions")
     ax.set_ylabel("Evaluation episode return")
     ax.set_title(f"PPO learning curve: {len(histories)} independent training policies")
     ax.grid(True, alpha=0.25)
@@ -461,7 +461,7 @@ def plot_training_diagnostics(log_dir: Path, out_dir: Path, seeds: list[int]) ->
     reward_plotted = _plot_seed_metric(ax_reward, scalar_data, seeds, "rollout/ep_rew_mean", color_by_seed)
     ax_reward.set_title("Training performance")
     ax_reward.set_ylabel("Mean training episode return (rolling window)")
-    ax_reward.set_xlabel("Training timesteps")
+    ax_reward.set_xlabel("PPO controller transitions")
     if reward_plotted:
         ax_reward.legend(frameon=False, fontsize=8)
 
@@ -469,7 +469,7 @@ def plot_training_diagnostics(log_dir: Path, out_dir: Path, seeds: list[int]) ->
     ax_ev.axhline(0.0, color="0.35", linestyle="--", linewidth=1.0, label="0: no predictive skill")
     ax_ev.set_title("Value-function fit")
     ax_ev.set_ylabel("Explained variance")
-    ax_ev.set_xlabel("Training timesteps")
+    ax_ev.set_xlabel("PPO controller transitions")
     ax_ev.legend(frameon=False, fontsize=8)
 
     kl_plotted = _plot_seed_metric(
@@ -478,7 +478,7 @@ def plot_training_diagnostics(log_dir: Path, out_dir: Path, seeds: list[int]) ->
     )
     ax_kl.set_title("PPO policy-update stability")
     ax_kl.set_ylabel("Approximate KL divergence")
-    ax_kl.set_xlabel("Training timesteps")
+    ax_kl.set_xlabel("PPO controller transitions")
     ax_clip = ax_kl.twinx()
     clip_plotted = _plot_seed_metric(
         ax_clip, scalar_data, seeds, "train/clip_fraction", color_by_seed,
@@ -524,7 +524,7 @@ def plot_training_diagnostics(log_dir: Path, out_dir: Path, seeds: list[int]) ->
         ax_std.set_ylabel("Entropy loss (negative entropy)")
         if entropy_plotted:
             ax_std.legend(frameon=False, fontsize=8)
-    ax_std.set_xlabel("Training timesteps")
+    ax_std.set_xlabel("PPO controller transitions")
     if std_plotted:
         ax_std.legend(frameon=False, fontsize=8)
 
