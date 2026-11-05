@@ -38,6 +38,7 @@ import numpy as np
 from stable_baselines3 import PPO
 
 from custom_rl import DEFAULT_MODEL_DIR, DEFAULT_TRAJ_DIR, register_envs
+from custom_rl.envs.registration import gym_make_plate
 from custom_rl.eval.monte_carlo import face_milling_process_from_info
 from custom_rl.eval.pipeline import (
     discover_model_seeds,
@@ -61,7 +62,7 @@ PASS_COMPLETED_REASONS = {"pass_completed_90percent", "pass_completed"}
 # and discount in training_config.json, which always takes precedence.
 # Older checkpoints from the former trainer used one policy decision per 1 ms
 # environment step, so their fallback remains 1 ms for backward compatibility.
-EVAL_DEFAULT_DT = 1.0e-4
+EVAL_DEFAULT_DT = 1.0e-3
 EVAL_DEFAULT_N_SUBSTEPS = 10
 EVAL_DEFAULT_CONTROLLER_HOLD_ENV_STEPS = 1
 # Legacy-checkpoint fallback only. Unified-run checkpoints load this cap from
@@ -251,6 +252,9 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
     ppo_cfg = (config or {}).get("ppo", {})
     if not isinstance(ppo_cfg, dict):
         ppo_cfg = {}
+    probe = env_cfg.get("probe")
+    if not isinstance(probe, dict):
+        probe = {}
 
     def pick(cli_name: str, saved_value: Any, fallback: Any) -> Any:
         cli_value = getattr(args, cli_name)
@@ -260,12 +264,35 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
     if saved_gamma is None:
         saved_gamma = 1.0
 
+    # Prefer the episode cap the training env *actually* used. Older runs could
+    # request 250000 via gym.make while Gymnasium stole that name for TimeLimit,
+    # so ODEControlEnv silently fell back to an auto-estimated horizon (~25k).
+    requested_max_steps = pick(
+        "max_episode_steps",
+        env_cfg.get("max_episode_steps", saved_kwargs.get("max_episode_steps")),
+        EVAL_DEFAULT_MAX_EPISODE_STEPS,
+    )
+    effective_max_steps = probe.get("max_episode_steps_env", requested_max_steps)
+    if (
+        args.max_episode_steps is None
+        and effective_max_steps is not None
+        and requested_max_steps is not None
+        and int(effective_max_steps) != int(requested_max_steps)
+    ):
+        print(
+            f"NOTE: using training-effective max_episode_steps={int(effective_max_steps)} "
+            f"(saved request was {int(requested_max_steps)}; gym.make previously "
+            "did not forward that reserved name into ODEControlEnv)."
+        )
+
     settings = {
         "env_id": env_id,
         "reward": reward,
         "dt": float(pick("dt", env_cfg.get("dt_s"), EVAL_DEFAULT_DT)),
         "n_substeps": int(pick("n_substeps", env_cfg.get("n_substeps"), EVAL_DEFAULT_N_SUBSTEPS)),
-        "max_episode_steps": int(pick("max_episode_steps", env_cfg.get("max_episode_steps"), EVAL_DEFAULT_MAX_EPISODE_STEPS)),
+        "max_episode_steps": int(
+            pick("max_episode_steps", effective_max_steps, EVAL_DEFAULT_MAX_EPISODE_STEPS)
+        ),
         "dynamics_uncertainty_std": float(pick("dynamics_uncertainty_std", env_cfg.get("dynamics_uncertainty_std"), EVAL_DEFAULT_DYNAMICS_UNCERTAINTY_STD)),
         "randomize_y0": bool(pick("randomize_y0", env_cfg.get("randomize_y0"), EVAL_DEFAULT_RANDOMIZE_Y0)),
         "controller_hold_env_steps": int(pick(
@@ -277,6 +304,8 @@ def _resolve_eval_settings(args: argparse.Namespace, config: dict[str, Any] | No
         "ap_max": args.ap_max if args.ap_max is not None else saved_kwargs.get("ap_max", 1.0 if finishing else None),
         "training_env_kwargs": dict(saved_kwargs),
     }
+    # Keep kwargs consistent with the resolved effective horizon.
+    settings["training_env_kwargs"]["max_episode_steps"] = int(settings["max_episode_steps"])
     if finishing:
         settings["ap_max"] = float(settings["ap_max"] if settings["ap_max"] is not None else 1.0)
         if settings["ap_max"] <= 0.0:
@@ -389,9 +418,12 @@ def make_registered_plate_env(_env_id: str = ENV_ID, **env_kwargs: Any) -> gym.E
     ``_env_id`` selects the control mode:
         "CustomODEPlate-v0"        first-mode / roughing (action = [omega, ap])
         "CustomODEPlateFinish-v0"  second-mode / finishing (action = [omega])
+
+    Uses ``gym_make_plate`` so ``max_episode_steps`` reaches ``ODEControlEnv``
+    (plain ``gym.make`` steals that name for its outer TimeLimit wrapper).
     """
     register_envs()
-    return gym.make(_env_id, **env_kwargs)
+    return gym_make_plate(_env_id, **env_kwargs)
 
 
 def _episode_y_line(
@@ -849,11 +881,19 @@ def main() -> int:
         training_kwargs = training_env.get("kwargs", {})
         if not isinstance(training_kwargs, dict):
             training_kwargs = {}
+        # Prefer the env-effective horizon from the training probe when present.
+        # Older runs requested max_episode_steps via gym.make, which Gymnasium
+        # intercepted, so the saved request can disagree with what training used.
+        probe_meta = training_env.get("probe") if isinstance(training_env.get("probe"), dict) else {}
+        trained_max_steps = probe_meta.get(
+            "max_episode_steps_env",
+            training_env.get("max_episode_steps"),
+        )
         comparison_pairs = [
             ("reward", training_env.get("reward_id"), settings["reward"]),
             ("dt", training_env.get("dt_s"), settings["dt"]),
             ("n_substeps", training_env.get("n_substeps"), settings["n_substeps"]),
-            ("max_episode_steps", training_env.get("max_episode_steps"), settings["max_episode_steps"]),
+            ("max_episode_steps", trained_max_steps, settings["max_episode_steps"]),
             ("dynamics_uncertainty_std", training_env.get("dynamics_uncertainty_std"), settings["dynamics_uncertainty_std"]),
             ("randomize_y0", training_env.get("randomize_y0"), settings["randomize_y0"]),
             ("controller_hold_env_steps", training_env.get("controller_hold_env_steps"), settings["controller_hold_env_steps"]),

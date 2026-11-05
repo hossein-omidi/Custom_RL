@@ -42,6 +42,7 @@ except Exception as exc:
 import gymnasium as gym
 
 from custom_rl import DEFAULT_TRAJ_DIR, register_envs
+from custom_rl.envs.registration import gym_make_plate
 from custom_rl.eval.monte_carlo import face_milling_process_from_info
 from custom_rl.eval.pipeline import plate_env_kwargs, plant_plot_metadata
 from custom_rl.plants.plate import omega_to_rpm
@@ -1755,7 +1756,9 @@ def main() -> int:
             dynamics_uncertainty_std=a.dynamics_uncertainty_std,
             randomize_y0=a.randomize_y0)
         kw.update(override)
-        return gym.make(a.env_id, **kw)
+        # gym_make_plate forwards max_episode_steps into ODEControlEnv
+        # (plain gym.make steals that name for TimeLimit and drops it).
+        return gym_make_plate(a.env_id, **kw)
 
     # ---- AUTO sizing ----
     probe = _make(1.0e-4)

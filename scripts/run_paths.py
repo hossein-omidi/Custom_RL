@@ -7,8 +7,10 @@ Canonical layout (created by train_ppo_unified / experiment.py):
       config.yaml          # frozen experiment settings (optional)
       models/
       logs/seed_<n>/...
-      evaluation/
-      plots/
+      evaluation/          # eval_policy.py trajectories
+      plots/               # plot_results.py
+      mpc/                 # NMPC trajectories (mpc_face_milling_chatgpt_V4)
+      comparison/          # compare_mpc_rl.py outputs
 
 A pointer file ``runs/ppo/LATEST`` stores the absolute path of the most recent
 completed (or started) run so ``--run latest`` needs no manual paths.
@@ -23,7 +25,7 @@ from typing import Any
 DEFAULT_OUTPUT_ROOT = Path("runs/ppo")
 LATEST_FILENAME = "LATEST"
 MANIFEST_FILENAME = "run_manifest.json"
-SUBDIRS = ("models", "logs", "evaluation", "plots")
+SUBDIRS = ("models", "logs", "evaluation", "plots", "mpc", "comparison")
 
 
 def default_output_root() -> Path:
@@ -136,6 +138,14 @@ def evaluation_dir(run_dir: Path | str) -> Path:
 
 def plots_dir(run_dir: Path | str) -> Path:
     return run_subdir(run_dir, "plots")
+
+
+def mpc_dir(run_dir: Path | str) -> Path:
+    return run_subdir(run_dir, "mpc")
+
+
+def comparison_dir(run_dir: Path | str) -> Path:
+    return run_subdir(run_dir, "comparison")
 
 
 def load_json(path: Path | str) -> dict[str, Any]:

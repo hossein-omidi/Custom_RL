@@ -258,13 +258,36 @@ def _clean_json(v):
 
 def main(argv=None):
     p = argparse.ArgumentParser(description='Validated physical RL vs MPC performance comparison')
-    p.add_argument('--rl-dir', default='eval_trajectories')
-    p.add_argument('--mpc-dir', default='mpc_phase_trajectories')
-    p.add_argument('--out-dir', default='plots/mpc_vs_rl')
+    p.add_argument(
+        '--run-dir',
+        default=None,
+        help='Organized experiment run directory. Sets --rl-dir/--mpc-dir/--out-dir to '
+             '<run-dir>/{evaluation,mpc,comparison} when those flags are omitted.',
+    )
+    p.add_argument('--rl-dir', default=None)
+    p.add_argument('--mpc-dir', default=None)
+    p.add_argument('--out-dir', default=None)
     p.add_argument('--seeds', type=int, nargs='*', default=None)
     p.add_argument('--strict', dest='strict', action='store_true', default=True, help='Refuse misleading plots if scenarios cannot be verified')
     p.add_argument('--allow-mismatch', dest='strict', action='store_false', help='Produce explicitly exploratory plots for unpaired data')
     a = p.parse_args(argv)
+
+    if a.run_dir is not None:
+        run_dir = Path(a.run_dir).expanduser().resolve()
+        if a.rl_dir is None:
+            a.rl_dir = str(run_dir / 'evaluation')
+        if a.mpc_dir is None:
+            a.mpc_dir = str(run_dir / 'mpc')
+        if a.out_dir is None:
+            a.out_dir = str(run_dir / 'comparison')
+    else:
+        if a.rl_dir is None:
+            a.rl_dir = 'eval_trajectories'
+        if a.mpc_dir is None:
+            a.mpc_dir = 'mpc_phase_trajectories'
+        if a.out_dir is None:
+            a.out_dir = 'plots/mpc_vs_rl'
+
     rl, mpc = _load(Path(a.rl_dir)), _load(Path(a.mpc_dir))
     out = Path(a.out_dir)
     out.mkdir(parents=True, exist_ok=True)

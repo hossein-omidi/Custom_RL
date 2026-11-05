@@ -31,11 +31,14 @@ if str(_SCRIPTS_DIR) not in sys.path:
 
 from run_paths import (  # noqa: E402
     DEFAULT_OUTPUT_ROOT,
+    comparison_dir,
     evaluation_dir,
     list_runs,
     load_run_manifest,
+    load_training_config,
     logs_dir,
     models_dir,
+    mpc_dir,
     plots_dir,
     resolve_run_dir,
     write_latest_pointer,
@@ -56,6 +59,48 @@ def _load_yaml(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise SystemExit(f"Config must be a mapping: {path}")
     return data
+
+
+def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    """Recursively merge override onto a copy of base (dicts only)."""
+    out = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = _deep_merge(out[key], value)
+        else:
+            out[key] = value
+    return out
+
+
+def _load_experiment_config(path: Path, *, _stack: tuple[Path, ...] = ()) -> dict[str, Any]:
+    """Load YAML and resolve ``extends:`` relative to the config file."""
+    path = path.resolve()
+    if path in _stack:
+        chain = " -> ".join(str(p) for p in _stack + (path,))
+        raise SystemExit(f"Config extends cycle: {chain}")
+    raw = _load_yaml(path)
+    extends = raw.pop("extends", None)
+    if not extends:
+        return raw
+    parent = Path(str(extends)).expanduser()
+    if not parent.is_absolute():
+        parent = (path.parent / parent).resolve()
+    return _deep_merge(_load_experiment_config(parent, _stack=_stack + (path,)), raw)
+
+
+def _flatten_train_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """Lift nested timing/train/noise keys to the flat trainer CLI namespace."""
+    flat = dict(cfg)
+    for section in ("timing", "train", "noise"):
+        block = flat.pop(section, None)
+        if isinstance(block, dict):
+            for key, value in block.items():
+                flat.setdefault(key, value)
+    # Plant ap_max also drives finishing CLI --ap-max when present.
+    plant = flat.get("plant")
+    if isinstance(plant, dict) and flat.get("ap_max") is None and plant.get("ap_max") is not None:
+        flat["ap_max"] = plant["ap_max"]
+    return flat
 
 
 def _dump_yaml(path: Path, data: dict[str, Any]) -> None:
@@ -223,7 +268,7 @@ def cmd_train(args: argparse.Namespace) -> int:
         config_path = config_path.resolve()
     if not config_path.is_file():
         raise SystemExit(f"Config not found: {config_path}")
-    cfg = _load_yaml(config_path)
+    cfg = _flatten_train_cfg(_load_experiment_config(config_path))
     output_root = _resolve_output_root(args.output_root or cfg.get("output_root"))
 
     before = {p.resolve() for p in list_runs(output_root)}
@@ -328,6 +373,110 @@ def cmd_plot(args: argparse.Namespace) -> int:
     return 0
 
 
+def _training_settings_for_mpc(run_dir: Path) -> dict[str, Any]:
+    """Pull plant/timing settings from the run so NMPC matches RL evaluation."""
+    cfg = load_training_config(run_dir)
+    if cfg is None:
+        raise SystemExit(
+            f"No training_config.json under {run_dir / 'logs'}. "
+            "Train/eval this run first so MPC can inherit matching settings."
+        )
+    env = cfg.get("environment", {})
+    if not isinstance(env, dict):
+        env = {}
+    kwargs = env.get("kwargs", {})
+    if not isinstance(kwargs, dict):
+        kwargs = {}
+    probe = env.get("probe", {})
+    if not isinstance(probe, dict):
+        probe = {}
+    max_steps = probe.get("max_episode_steps_env", env.get("max_episode_steps", kwargs.get("max_episode_steps")))
+    return {
+        "env_id": env.get("env_id", "CustomODEPlate-v0"),
+        "reward": env.get("reward_id", "productive"),
+        "dt": env.get("dt_s", kwargs.get("dt")),
+        "n_substeps": env.get("n_substeps", kwargs.get("n_substeps")),
+        "max_episode_steps": max_steps,
+        "dynamics_uncertainty_std": env.get(
+            "dynamics_uncertainty_std", kwargs.get("dynamics_uncertainty_std", 0.0)
+        ),
+        "randomize_y0": env.get("randomize_y0", kwargs.get("randomize_y0", True)),
+    }
+
+
+def cmd_mpc(args: argparse.Namespace) -> int:
+    """Run phase-domain NMPC into ``<run-dir>/mpc`` with RL-matched settings."""
+    output_root = _resolve_output_root(getattr(args, "output_root", None))
+    run_dir = resolve_run_dir(
+        run=None if args.run_dir else args.run,
+        run_dir=args.run_dir,
+        output_root=output_root,
+    )
+    settings = _training_settings_for_mpc(run_dir)
+    out = mpc_dir(run_dir)
+    argv = [
+        _python(),
+        str(_SCRIPTS_DIR / "MPC" / "mpc_face_milling_chatgpt_V4.py"),
+        "--env-id",
+        str(settings["env_id"]),
+        "--reward",
+        str(settings["reward"]),
+        "--out-dir",
+        str(out),
+        "--n-episodes",
+        str(int(args.n_episodes or 1)),
+    ]
+    if settings["dt"] is not None:
+        argv.extend(["--dt", str(settings["dt"])])
+    if settings["n_substeps"] is not None:
+        argv.extend(["--n-substeps", str(int(settings["n_substeps"]))])
+    if settings["max_episode_steps"] is not None:
+        argv.extend(["--max-episode-steps", str(int(settings["max_episode_steps"]))])
+    if settings["dynamics_uncertainty_std"] is not None:
+        argv.extend(["--dynamics-uncertainty-std", str(settings["dynamics_uncertainty_std"])])
+    argv.extend(
+        ["--randomize-y0"] if settings["randomize_y0"] else ["--no-randomize-y0"]
+    )
+    if args.seeds:
+        argv.extend(["--seeds", *[str(int(s)) for s in args.seeds]])
+    else:
+        try:
+            manifest = load_run_manifest(run_dir)
+            seeds = manifest.get("arguments", {}).get("seeds")
+            if seeds:
+                argv.extend(["--seeds", *[str(int(s)) for s in seeds]])
+        except FileNotFoundError:
+            pass
+    if args.extra:
+        argv.extend(args.extra)
+    _run_subprocess(argv)
+    print(f"\nMPC artifacts: {out}")
+    return 0
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    """Compare RL evaluation vs NMPC under ``<run-dir>/comparison``."""
+    output_root = _resolve_output_root(getattr(args, "output_root", None))
+    run_dir = resolve_run_dir(
+        run=None if args.run_dir else args.run,
+        run_dir=args.run_dir,
+        output_root=output_root,
+    )
+    argv = [
+        _python(),
+        str(_SCRIPTS_DIR / "compare_mpc_rl.py"),
+        "--run-dir",
+        str(run_dir),
+    ]
+    if args.allow_mismatch:
+        argv.append("--allow-mismatch")
+    if args.seeds:
+        argv.extend(["--seeds", *[str(int(s)) for s in args.seeds]])
+    _run_subprocess(argv)
+    print(f"\nComparison artifacts: {comparison_dir(run_dir)}")
+    return 0
+
+
 def cmd_run(args: argparse.Namespace) -> int:
     """Full cycle: train → eval → plot into one auto-created run directory."""
     rc = cmd_train(args)
@@ -367,6 +516,9 @@ def cmd_run(args: argparse.Namespace) -> int:
     print(f"  evaluation  : {evaluation_dir(run_dir)}")
     print(f"  plots       : {plots_dir(run_dir)}")
     print(f"TensorBoard   : tensorboard --logdir \"{logs_dir(run_dir)}\"")
+    print("Optional NMPC comparison:")
+    print(f'  python scripts/experiment.py mpc --run-dir "{run_dir}"')
+    print(f'  python scripts/experiment.py compare --run-dir "{run_dir}"')
     return 0
 
 
@@ -481,6 +633,34 @@ def build_parser() -> argparse.ArgumentParser:
     _add_run_select_args(p_plot)
     p_plot.add_argument("--seeds", nargs="*", type=int, default=None)
     p_plot.set_defaults(func=cmd_plot)
+
+    p_mpc = sub.add_parser(
+        "mpc",
+        help="Run NMPC (V4) into <run-dir>/mpc using this run's plant/timing settings.",
+    )
+    _add_run_select_args(p_mpc)
+    p_mpc.add_argument("--seeds", nargs="*", type=int, default=None)
+    p_mpc.add_argument("--n-episodes", type=int, default=1)
+    p_mpc.add_argument(
+        "--extra",
+        nargs=argparse.REMAINDER,
+        default=[],
+        help="Extra args forwarded to mpc_face_milling_chatgpt_V4.py after --.",
+    )
+    p_mpc.set_defaults(func=cmd_mpc)
+
+    p_compare = sub.add_parser(
+        "compare",
+        help="Compare RL evaluation vs NMPC under <run-dir>/comparison.",
+    )
+    _add_run_select_args(p_compare)
+    p_compare.add_argument("--seeds", nargs="*", type=int, default=None)
+    p_compare.add_argument(
+        "--allow-mismatch",
+        action="store_true",
+        help="Exploratory plots even when scenario metadata do not match.",
+    )
+    p_compare.set_defaults(func=cmd_compare)
 
     p_list = sub.add_parser("list", help="List organized runs under runs/ppo/.")
     p_list.add_argument("--output-root", default=str(DEFAULT_OUTPUT_ROOT))

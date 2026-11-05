@@ -124,6 +124,27 @@ def _translate_legacy_depth_kwargs(kwargs: dict[str, Any]) -> None:
         kwargs.pop("ac_max", None)
 
 
+def gym_make_plate(env_id: str, **env_kwargs: Any) -> gym.Env:
+    """``gym.make`` wrapper that correctly forwards the episode step cap.
+
+    Gymnasium treats ``max_episode_steps`` as a *reserved* ``gym.make`` argument:
+    it builds an outer ``TimeLimit`` wrapper and does **not** forward the value to
+    the environment entry point.  Callers that intend to set
+    ``ODEControlEnv.max_episode_steps`` must therefore not pass that reserved
+    name through ``gym.make``.  This helper remaps it to ``episode_step_limit``,
+    which ``make_plate_env`` understands, and never installs a conflicting
+    Gymnasium ``TimeLimit``.
+    """
+    register_envs()
+    kwargs = dict(env_kwargs)
+    cap = kwargs.pop("max_episode_steps", None)
+    if cap is None:
+        cap = kwargs.pop("episode_step_limit", None)
+    if cap is not None:
+        kwargs["episode_step_limit"] = int(cap)
+    return gym.make(env_id, **kwargs)
+
+
 def make_plate_env(**kwargs: Any) -> ODEControlEnv:
     """Factory for CustomODEPlate env. Used by ``gymnasium.make()``.
 
@@ -146,6 +167,11 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     Backward-compatible input:
         ac_min/ac_max are accepted and translated to ap_min/ap_max for the plant.
+
+    Episode horizon:
+        Prefer ``episode_step_limit`` (or ``max_episode_steps`` when calling this
+        factory directly).  Do not rely on ``gym.make(..., max_episode_steps=...)``
+        — that reserved name never reaches this factory; use ``gym_make_plate``.
     """
     kwargs = dict(kwargs)
 
@@ -153,7 +179,10 @@ def make_plate_env(**kwargs: Any) -> ODEControlEnv:
 
     dt = kwargs.pop("dt", DEFAULT_ENV_DT)
     n_substeps = kwargs.pop("n_substeps", DEFAULT_ENV_N_SUBSTEPS)
+    # gym.make steals max_episode_steps; gym_make_plate remaps to episode_step_limit.
     max_episode_steps = kwargs.pop("max_episode_steps", None)
+    if max_episode_steps is None:
+        max_episode_steps = kwargs.pop("episode_step_limit", None)
     process_noise_std = kwargs.pop("process_noise_std", 0.0)
     obs_noise_std = kwargs.pop("obs_noise_std", 0.0)
     history_module = kwargs.pop("history_module", None)

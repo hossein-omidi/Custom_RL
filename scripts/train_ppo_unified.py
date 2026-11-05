@@ -75,6 +75,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import register_envs
+from custom_rl.envs.registration import gym_make_plate
 from custom_rl.eval.pipeline import plate_env_kwargs
 from custom_rl.plants.plate import omega_to_rpm
 from ppo_reliability import reliability_checkpoint_rank, summarize_reliability_episodes
@@ -250,7 +251,7 @@ def make_registered_plate_env(
     after the held action has advanced the plant by 5 ms.
     """
     register_envs()
-    env = gym.make(_env_id, **env_kwargs)
+    env = gym_make_plate(_env_id, **env_kwargs)
     if int(_controller_hold_env_steps) > 1:
         env = ControllerSampleTimeWrapper(
             env,
