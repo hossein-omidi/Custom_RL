@@ -12,7 +12,7 @@ seeds: [0]
 # Timing (env step / controller)
 # ---------------------------------------------------------------------------
 timing:
-  dt: 1.0e-4                 # RK4 substep [s]
+  dt: 1.0e-3                 # RK4 substep [s]
   n_substeps: 10             # env/safety step = dt * n_substeps
   controller_hold_env_steps: 1
   max_episode_steps: 250000
@@ -50,7 +50,7 @@ noise:
 # Mode files may override productivity_weight etc.
 # ---------------------------------------------------------------------------
 reward:
-  w_weight: 0.6
+  w_weight: 0.4
   wdot_weight: 0.02
   w_scale: 1.5e-3
   wdot_scale: 1.0
@@ -63,18 +63,18 @@ reward:
   wdot_clip: null
   ap_productive_target: 0.5
   include_ae_in_productivity: true
-  productivity_weight: 240.0
-  omega_cost_weight: 3.0
-  termination_penalty: 500.0
-  truncation_penalty: 500.0
-  pass_completion_bonus: 1000.0
+  productivity_weight: 340
+  omega_cost_weight: 2
+  termination_penalty: 425
+  truncation_penalty: 425
+  pass_completion_bonus: 750
   failure_progress_penalty_weight: 1.0
   productivity_gate_enabled: true
-  productivity_w_gate: 1.0e-3
+  productivity_w_gate: 1.5e-3
   productivity_wdot_gate: 1.0
   productivity_wdot_gate_weight: 0.05
   productivity_gate_power: 2.0
-  productivity_gate_min: 0.0
+  productivity_gate_min: 0.1
   running_reward_scale: 0.041666666666666664   # 1/24
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ train:
   clip_range: 0.20
   final_clip_range: 0.10
   n_eval_episodes: 10
-  eval_freq: 50000
+  eval_freq: 100000
   checkpoint_freq: 200000
   callback_eval_seed: null
 

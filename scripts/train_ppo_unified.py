@@ -113,15 +113,15 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.02
 PPO_NET_ARCH = [256, 256]
-PPO_LOG_STD_INIT = -2.5
+PPO_LOG_STD_INIT = -1.5
 PPO_ADAM_EPS = 1e-5
 
 # Initial action mean: mid-range spindle speed and a low initial ap in roughing.
-SAFE_AP_FRACTION = 0.05
+SAFE_AP_FRACTION = 0.07
 
 # PPO transitions equal fine environment transitions because controller hold=1.
 DEFAULT_TOTAL_TIMESTEPS = 1_000_000
-DEFAULT_EVAL_FREQ = 50_000
+DEFAULT_EVAL_FREQ = 100_000
 DEFAULT_N_EVAL_EPISODES = 10  # paired screening set for reliability-based checkpoint selection
 DEFAULT_CHECKPOINT_FREQ = 200_000
 
@@ -141,7 +141,7 @@ DEFAULT_DYNAMICS_UNCERTAINTY_STD = 0.001
 # not a claimed universal optimum; verify with the pilot evaluation.
 DEFAULT_RUNNING_REWARD_SCALE = 1.0 / 24.0
 REWARD_KWARGS = {
-    "w_weight": 0.6,
+    "w_weight": 0.4,
     "wdot_weight": 0.02,
     "w_scale": 1.5e-3,
     "wdot_scale": 1.0,
@@ -154,18 +154,18 @@ REWARD_KWARGS = {
     "wdot_clip": None,
     "ap_productive_target": 0.5,
     "include_ae_in_productivity": True,
-    "productivity_weight": 240.0,
-    "omega_cost_weight": 3.0,
-    "termination_penalty": 500.0,
-    "truncation_penalty": 500.0,
-    "pass_completion_bonus": 1000.0,
+    "productivity_weight": 420,
+    "omega_cost_weight": 2.0,
+    "termination_penalty": 350,
+    "truncation_penalty": 350,
+    "pass_completion_bonus": 500,
     "failure_progress_penalty_weight": 1.0,
     "productivity_gate_enabled": True,
-    "productivity_w_gate": 1.0e-3,
+    "productivity_w_gate": 1.5e-3,
     "productivity_wdot_gate": 1.0,
     "productivity_wdot_gate_weight": 0.05,
     "productivity_gate_power": 2.0,
-    "productivity_gate_min": 0.0,
+    "productivity_gate_min": 0.1,
     "running_reward_scale": DEFAULT_RUNNING_REWARD_SCALE,
 }
 

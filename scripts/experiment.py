@@ -198,18 +198,22 @@ def _config_to_train_argv(cfg: dict[str, Any], overrides: argparse.Namespace) ->
         seeds = [seeds]
     argv.extend(["--seeds", *[str(int(s)) for s in seeds]])
 
-    def add_opt(flag: str, key: str, *, as_bool: bool = False) -> None:
+    def add_opt(flag: str, key: str, *, as_bool: bool = False, condition: bool = True) -> None:
+        if not condition:
+            return
         if key not in merged or merged[key] is None:
             return
+        
         value = merged[key]
         if as_bool:
             argv.extend(_bool_flag(flag, bool(value)))
         else:
             argv.extend([flag, str(value)])
 
+    is_finishing = str(merged.get("env_id", "") or "") == "CustomODEPlateFinish-v0"
     add_opt("--env-id", "env_id")
     add_opt("--reward", "reward")
-    add_opt("--ap-max", "ap_max")
+    add_opt("--ap-max", "ap_max", condition=is_finishing)
     add_opt("--output-root", "output_root")
     add_opt("--run-name", "run_name")
     add_opt("--total-timesteps", "total_timesteps")
