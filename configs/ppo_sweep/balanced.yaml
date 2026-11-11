@@ -1,5 +1,7 @@
 # Balanced PPO configuration: preserve the November 11 trainer baseline.
-# Shared physical settings are inherited from configs/base.yaml.
+# Shared timing and exposed stochastic settings are inherited from configs/base.yaml.
+# Plant/reward dictionaries are not forwarded by the current trainer CLI;
+# their effective values come from the existing registration/trainer defaults.
 # Mode (roughing/finishing) is selected by scripts/sweep_ppo.py.
 extends: ../base.yaml
 
@@ -23,11 +25,11 @@ train:
   n_steps: 2048
   batch_size: 256
   n_epochs: 8
-  gamma: 0.9999
-  gae_lambda: 0.98
+  gamma: 0.999995
+  gae_lambda: 0.9995
   clip_range: 0.20
   final_clip_range: 0.10
   n_eval_episodes: 10
-  eval_freq: 100000
+  eval_freq: 50000
   checkpoint_freq: 200000
   callback_eval_seed: 10000

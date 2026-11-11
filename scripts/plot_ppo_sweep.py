@@ -1,232 +1,686 @@
 #!/usr/bin/env python
-"""Compare PPO evaluation learning curves across Fast/Balanced/Precise sweeps.
+"""Plot cross-seed PPO learning, optimization and reliability comparisons.
 
-Each seed contributes its mean over evaluation episodes at each checkpoint.
-The plotted line is the mean across independent training seeds; the band is
-plus/minus one sample standard deviation across those seed-level means.
+Evaluation metrics are first averaged within each training seed. Mean and
+sample SD are then calculated across independent training seeds. Training
+TensorBoard diagnostics are aggregated in the same seed-first order.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import json
+import math
 from pathlib import Path
 from typing import Any
 
 import matplotlib.pyplot as plt
 import numpy as np
 
+RELIABILITY_METRICS = {
+    "pass_completion_rate": {
+        "title": "Pass completion rate",
+        "ylabel": "Rate [%]",
+        "scale": 100.0,
+        "ylim": (0.0, 100.0),
+    },
+    "safety_termination_rate": {
+        "title": "Safety-termination rate",
+        "ylabel": "Rate [%]",
+        "scale": 100.0,
+        "ylim": (0.0, 100.0),
+    },
+    "truncation_rate": {
+        "title": "Time-limit truncation rate",
+        "ylabel": "Rate [%]",
+        "scale": 100.0,
+        "ylim": (0.0, 100.0),
+    },
+    "median_completed_productivity": {
+        "title": "Completed-pass productivity reward",
+        "ylabel": "Seed-averaged median cumulative reward [reward units]",
+        "scale": 1.0,
+        "ylim": None,
+    },
+    "median_progress": {
+        "title": "Final pass progress",
+        "ylabel": "Seed-averaged median progress [%]",
+        "scale": 100.0,
+        "ylim": (0.0, 100.0),
+    },
+    "mean_max_displacement_m": {
+        "title": "Episode-wise peak sensor displacement",
+        "ylabel": "Mean peak displacement [mm]",
+        "scale": 1000.0,
+        "ylim": None,
+    },
+}
 
-def load_seed_curve(run_dir: Path, seed: int) -> tuple[np.ndarray, np.ndarray] | None:
+DIAGNOSTIC_SPECS = {
+    "rollout/ep_rew_mean": ("Training episode return", "Mean rolling episode return"),
+    "train/explained_variance": ("Value-function fit", "Explained variance"),
+    "train/approx_kl": ("Policy-update size", "Approximate KL divergence"),
+    "train/clip_fraction": ("Policy clipping", "Clip fraction"),
+    "train/std": ("Policy exploration", "Action standard deviation [normalized units]"),
+    "train/entropy_loss": ("Policy exploration", "Entropy loss"),
+}
+
+
+def _read_json(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"Expected a JSON object: {path}")
+    return data
+
+
+def _canonical_hash(value: Any) -> str:
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    import hashlib
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _clean_curve(steps: np.ndarray, values: np.ndarray, *, source: Path) -> tuple[np.ndarray, np.ndarray]:
+    steps = np.asarray(steps, dtype=np.float64).reshape(-1)
+    values = np.asarray(values, dtype=np.float64).reshape(-1)
+    if steps.size != values.size or steps.size < 2:
+        raise ValueError(f"Invalid curve lengths in {source}: {steps.size} steps, {values.size} values.")
+    if not np.all(np.isfinite(steps)) or not np.all(np.isfinite(values)):
+        raise ValueError(f"Non-finite values found in {source}; refusing to silently drop observations.")
+    if np.any(np.diff(steps) <= 0):
+        raise ValueError(f"Timesteps must be strictly increasing with no duplicates in {source}.")
+    return steps, values
+
+
+def load_seed_metrics(
+    run_dir: Path,
+    seed: int,
+    *,
+    expected_eval_episodes: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Load one seed's callback history, preserving episode-first aggregation."""
     path = run_dir / "logs" / f"seed_{seed}" / "evaluations.npz"
     if not path.is_file():
-        print(f"WARNING: missing evaluation history: {path}")
-        return None
-    try:
-        with np.load(path, allow_pickle=False) as data:
-            if not {"timesteps", "results"}.issubset(data.files):
-                raise ValueError("expected arrays 'timesteps' and 'results'")
-            steps = np.asarray(data["timesteps"], dtype=float).reshape(-1)
-            results = np.asarray(data["results"], dtype=float)
-    except Exception as exc:
-        print(f"WARNING: cannot read {path}: {exc}")
-        return None
+        raise FileNotFoundError(f"Missing evaluation history for training seed {seed}: {path}")
+
+    required = {
+        "timesteps", "results", "ep_lengths", *RELIABILITY_METRICS.keys(),
+        "median_completed_return",
+    }
+    with np.load(path, allow_pickle=False) as data:
+        missing = sorted(required.difference(data.files))
+        if missing:
+            raise ValueError(f"{path} is missing required callback arrays: {missing}")
+        steps = np.asarray(data["timesteps"], dtype=np.float64).reshape(-1)
+        results = np.asarray(data["results"], dtype=np.float64)
+        lengths = np.asarray(data["ep_lengths"], dtype=np.float64)
+        metric_arrays = {
+            key: np.asarray(data[key], dtype=np.float64).reshape(-1)
+            for key in RELIABILITY_METRICS
+        }
+        completed_return = np.asarray(data["median_completed_return"], dtype=np.float64).reshape(-1)
+
     if results.ndim == 1:
         results = results.reshape(-1, 1)
-    if results.ndim != 2 or results.shape[0] != steps.size:
-        print(f"WARNING: invalid shapes in {path}: steps={steps.shape}, results={results.shape}")
-        return None
-    results[~np.isfinite(results)] = np.nan
-    finite_counts = np.isfinite(results).sum(axis=1)
-    seed_mean = np.divide(
-        np.nansum(results, axis=1),
-        finite_counts,
-        out=np.full(steps.shape, np.nan, dtype=float),
-        where=finite_counts > 0,
-    )
-    valid = np.isfinite(steps) & np.isfinite(seed_mean)
-    steps, seed_mean = steps[valid], seed_mean[valid]
-    if not steps.size:
-        return None
-    order = np.argsort(steps, kind="stable")
-    steps, seed_mean = steps[order], seed_mean[order]
-    # Keep the last value if a resumed history contains duplicate step values.
-    last: dict[float, int] = {}
-    for i, step in enumerate(steps):
-        last[float(step)] = i
-    keep = np.asarray(sorted(last.values()), dtype=int)
-    return steps[keep], seed_mean[keep]
+    expected_shape = (steps.size, int(expected_eval_episodes))
+    if results.shape != expected_shape:
+        raise ValueError(f"Expected results shape {expected_shape} in {path}; received {results.shape}.")
+    if lengths.shape != results.shape:
+        raise ValueError(f"Episode-length array shape {lengths.shape} does not match results {results.shape} in {path}.")
+    if not np.all(np.isfinite(results)) or not np.all(np.isfinite(lengths)):
+        raise ValueError(f"Non-finite episode returns or lengths found in {path}.")
+
+    steps, _ = _clean_curve(steps, np.arange(steps.size, dtype=float), source=path)
+    return_mean = np.mean(results, axis=1)
+    curves: dict[str, tuple[np.ndarray, np.ndarray]] = {
+        "evaluation_return": (steps, return_mean),
+    }
+    for key, values in metric_arrays.items():
+        if values.size != steps.size:
+            raise ValueError(f"Invalid {key!r} length in {path}: expected {steps.size}, received {values.size}.")
+        curves[key] = _clean_curve(steps, values, source=path)
+    if completed_return.size != steps.size or not np.all(np.isfinite(completed_return)):
+        raise ValueError(f"Invalid median_completed_return values in {path}.")
+    return curves
 
 
 def build_common_grid(curves: list[tuple[np.ndarray, np.ndarray]]) -> tuple[np.ndarray, bool]:
-    """Build a shared grid; interpolate only within the common observed range."""
+    """Require identical evaluation checkpoints; do not interpolate missing evaluations."""
     if not curves:
-        raise ValueError("No valid learning curves were found.")
-    lower = max(float(x[0]) for x, _ in curves)
-    upper = min(float(x[-1]) for x, _ in curves)
-    if upper < lower:
-        raise ValueError("The configurations have no overlapping evaluation-timestep range.")
-    common = curves[0][0][(curves[0][0] >= lower) & (curves[0][0] <= upper)]
-    for x, _ in curves[1:]:
-        common = np.intersect1d(common, x[(x >= lower) & (x <= upper)])
-    if common.size:
-        return common.astype(float), False
-    grid = np.unique(np.concatenate([x[(x >= lower) & (x <= upper)] for x, _ in curves]))
-    if not grid.size:
-        raise ValueError("Could not construct a common evaluation-timestep grid.")
-    return grid.astype(float), True
+        raise ValueError("No valid learning curves were supplied.")
+    reference = curves[0][0]
+    for index, (steps, _) in enumerate(curves[1:], start=2):
+        if not np.array_equal(steps, reference):
+            raise ValueError(
+                f"Evaluation checkpoint schedule mismatch in curve {index}. "
+                "All configurations and training seeds must use the same evaluation frequency and budget."
+            )
+    if reference.size < 2:
+        raise ValueError("At least two common evaluation checkpoints are required.")
+    return reference.copy(), False
 
 
 def aggregate_seed_curves(
-    curves: list[tuple[np.ndarray, np.ndarray]], grid: np.ndarray
+    curves: list[tuple[np.ndarray, np.ndarray]], grid: np.ndarray | None = None
 ) -> tuple[np.ndarray, np.ndarray]:
-    matrix = np.vstack([np.interp(grid, x, y) for x, y in curves])
-    mean = np.mean(matrix, axis=0)
-    if matrix.shape[0] >= 2:
-        sd = np.std(matrix, axis=0, ddof=1)
-    else:
-        sd = np.full(grid.shape, np.nan, dtype=float)
-    return mean, sd
+    """Return mean and sample SD across seed-level metrics at matched checkpoints."""
+    if len(curves) < 2:
+        raise ValueError("At least two independent training seeds are required for sample SD.")
+    reference = curves[0][0]
+    for steps, _ in curves[1:]:
+        if not np.array_equal(steps, reference):
+            raise ValueError("Seed curves must have identical checkpoints; interpolation is not used for evaluation metrics.")
+    if grid is not None and not np.array_equal(np.asarray(grid), reference):
+        raise ValueError("Requested aggregation grid differs from the recorded evaluation checkpoints.")
+    matrix = np.vstack([values for _, values in curves])
+    return np.mean(matrix, axis=0), np.std(matrix, axis=0, ddof=1)
 
 
-def _write_raw_csv(path: Path, raw_rows: list[list[Any]]) -> None:
+def _validate_run_records(
+    run_dir: Path,
+    entry: dict[str, Any],
+    manifest: dict[str, Any],
+    seeds: list[int],
+) -> dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]:
+    run_manifest_path = run_dir / "run_manifest.json"
+    if not run_manifest_path.is_file():
+        raise FileNotFoundError(f"Missing run_manifest.json: {run_manifest_path}")
+    run_manifest = _read_json(run_manifest_path)
+    if run_manifest.get("status") != "completed":
+        raise ValueError(f"Run is not marked completed: {run_dir}")
+
+    total = int(manifest["effective_total_timesteps_per_seed"])
+    mode = str(manifest.get("mode"))
+    if mode not in {"roughing", "finishing"}:
+        raise ValueError(f"Unsupported sweep mode in manifest: {mode!r}.")
+    expected_env = "CustomODEPlate-v0" if mode == "roughing" else "CustomODEPlateFinish-v0"
+    expected_reward = "productive" if mode == "roughing" else "dense"
+    if manifest.get("environment") != expected_env or manifest.get("reward") != expected_reward:
+        raise ValueError("Sweep manifest environment/reward identifiers are inconsistent with its mode.")
+    expected_ap_max = manifest.get("ap_max_mm")
+    if mode == "finishing":
+        if expected_ap_max is None or not math.isfinite(float(expected_ap_max)) or float(expected_ap_max) <= 0.0:
+            raise ValueError("Finishing sweep manifest must contain a finite, positive ap_max_mm.")
+    elif expected_ap_max is not None:
+        raise ValueError("Roughing sweep manifest must not specify a finishing-only ap_max_mm.")
+    expected_hyper = entry["hyperparameters"]
+    expected_episodes = int(manifest["common_training_settings"]["n_eval_episodes"])
+    expected_seeds = [int(seed) for seed in seeds]
+    histories: dict[int, dict[str, tuple[np.ndarray, np.ndarray]]] = {}
+    run_signature = entry.get("effective_run_signature")
+    if not isinstance(run_signature, dict):
+        raise ValueError(f"Missing effective run signature for configuration {entry.get('name')}.")
+    environment_signature = run_signature.get("environment")
+    fixed_ppo_signature = run_signature.get("fixed_ppo")
+    software_signature = run_signature.get("software")
+
+    for seed in expected_seeds:
+        seed_dir = run_dir / "logs" / f"seed_{seed}"
+        config_path = seed_dir / "training_config.json"
+        summary_path = seed_dir / "training_summary.json"
+        if not config_path.is_file() or not summary_path.is_file():
+            raise FileNotFoundError(f"Incomplete training records for seed {seed} in {run_dir}.")
+        config = _read_json(config_path)
+        summary = _read_json(summary_path)
+        if int(config.get("seed", -1)) != seed:
+            raise ValueError(f"Training config seed mismatch in {config_path}.")
+        if summary.get("status") != "completed" or int(summary.get("seed", -1)) != seed:
+            raise ValueError(f"Training summary is incomplete for seed {seed}: {summary_path}")
+        if int(summary.get("timesteps_reported_by_model", -1)) != total:
+            raise ValueError(f"Training seed {seed} did not complete the prescribed transition budget.")
+
+        actual_args = config.get("arguments", {})
+        if mode == "finishing":
+            actual_arg_ap = actual_args.get("ap_max")
+            if actual_arg_ap is None or not math.isclose(float(actual_arg_ap), float(expected_ap_max), rel_tol=1e-10, abs_tol=1e-9):
+                raise ValueError(f"Finishing ap_max argument mismatch for seed {seed} in {run_dir}.")
+        elif actual_args.get("ap_max") is not None:
+            raise ValueError(f"Roughing run unexpectedly contains a finishing-only ap_max argument for seed {seed}.")
+        for key, expected in manifest["common_training_settings"].items():
+            if actual_args.get(key) != expected:
+                raise ValueError(f"Actual training argument {key} differs from the sweep manifest for seed {seed}.")
+
+        ppo = config.get("ppo", {})
+        ppo_map = {
+            "learning_rate": "learning_rate_initial",
+            "final_learning_rate": "learning_rate_final",
+            "n_steps": "n_steps",
+            "n_envs": "n_envs",
+            "batch_size": "batch_size",
+            "n_epochs": "n_epochs",
+            "gamma": "gamma",
+            "gae_lambda": "gae_lambda",
+            "clip_range": "clip_range_initial",
+            "final_clip_range": "clip_range_final",
+        }
+        for manifest_key, config_key in ppo_map.items():
+            expected = expected_hyper[manifest_key]
+            actual = ppo.get(config_key)
+            if isinstance(expected, (int, float)) and not isinstance(expected, bool):
+                if actual is None or not math.isclose(float(actual), float(expected), rel_tol=1e-10, abs_tol=1e-12):
+                    raise ValueError(
+                        f"Actual PPO parameter {config_key}={actual!r} for seed {seed} "
+                        f"does not match sweep manifest value {expected!r}."
+                    )
+            elif actual != expected:
+                raise ValueError(f"Actual PPO parameter {config_key} does not match sweep manifest.")
+
+        env = config.get("environment", {})
+        if env.get("env_id") != expected_env or env.get("reward_id") != expected_reward:
+            raise ValueError(f"Environment/reward mismatch for seed {seed} in {run_dir}.")
+        if mode == "finishing":
+            actual_kwargs_ap = env.get("kwargs", {}).get("ap_max")
+            actual_probe_ap = env.get("probe", {}).get("ap_max")
+            for source, actual in (("environment kwargs", actual_kwargs_ap), ("plant probe", actual_probe_ap)):
+                if actual is None or not math.isclose(float(actual), float(expected_ap_max), rel_tol=1e-10, abs_tol=1e-9):
+                    raise ValueError(
+                        f"Finishing ap_max mismatch in {source} for seed {seed}: "
+                        f"recorded {actual!r}, expected {expected_ap_max:g} mm."
+                    )
+        actual_environment_signature = {
+            "dt_s": env.get("dt_s"),
+            "n_substeps": env.get("n_substeps"),
+            "controller_hold_env_steps": env.get("controller_hold_env_steps"),
+            "max_episode_steps": env.get("max_episode_steps"),
+            "dynamics_uncertainty_std": env.get("dynamics_uncertainty_std"),
+            "randomize_y0": env.get("randomize_y0"),
+            "env_id": env.get("env_id"),
+            "reward_id": env.get("reward_id"),
+            "controller_sample_time_s": env.get("controller_sample_time_s"),
+            "env_kwargs_sha256": _canonical_hash(env.get("kwargs", {})),
+            "plant_probe_sha256": _canonical_hash(env.get("probe", {})),
+        }
+        if actual_environment_signature != environment_signature:
+            raise ValueError(f"Effective environment signature mismatch for seed {seed} in {run_dir}.")
+
+        fixed_keys = (
+            "ent_coef", "vf_coef", "max_grad_norm", "target_kl", "net_arch",
+            "log_std_init", "adam_epsilon", "normalize_observations",
+            "normalize_rewards", "safe_action_bias",
+        )
+        actual_fixed_ppo = {key: ppo.get(key) for key in fixed_keys}
+        if actual_fixed_ppo != fixed_ppo_signature:
+            raise ValueError(f"Fixed PPO settings differ from the sweep manifest for seed {seed}.")
+        software = config.get("software", {})
+        actual_software = {
+            "git_commit": software.get("git_commit"),
+            "script_sha256": software.get("script_sha256"),
+            "python": software.get("python"),
+            "packages": software.get("packages"),
+        }
+        if actual_software != software_signature:
+            raise ValueError(f"Software/trainer version mismatch for seed {seed} in {run_dir}.")
+
+        callback = config.get("evaluation_callback", {})
+        if int(callback.get("episodes_per_evaluation", -1)) != expected_episodes:
+            raise ValueError(f"Evaluation episode count mismatch for seed {seed}.")
+        expected_eval_seed = int(manifest["common_training_settings"]["callback_eval_seed"])
+        if int(callback.get("evaluation_env_seed", -1)) != expected_eval_seed:
+            raise ValueError(f"Evaluation seed mismatch for seed {seed}.")
+        if int(callback.get("frequency_controller_transitions_actual", -1)) != int(manifest["actual_evaluation_interval_transitions"]):
+            raise ValueError(f"Evaluation frequency mismatch for seed {seed}.")
+        histories[seed] = load_seed_metrics(run_dir, seed, expected_eval_episodes=expected_episodes)
+
+    all_curves = [histories[seed]["evaluation_return"] for seed in expected_seeds]
+    build_common_grid(all_curves)
+    return histories
+
+
+def _write_csv(path: Path, header: list[str], rows: list[list[Any]]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
-        writer.writerow(["configuration", "training_seed", "training_timesteps", "evaluation_episode", "episode_return"])
-        writer.writerows(raw_rows)
+        writer.writerow(header)
+        writer.writerows(rows)
+
+
+def _plot_return_curve(
+    histories: dict[str, dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]],
+    labels: dict[str, str],
+    seeds: list[int],
+    out_dir: Path,
+) -> tuple[list[list[Any]], list[list[Any]]]:
+    all_curves = [histories[name][seed]["evaluation_return"] for name in histories for seed in seeds]
+    grid, _ = build_common_grid(all_curves)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+    fig, ax = plt.subplots(figsize=(9.0, 5.6), constrained_layout=True)
+    stats_rows: list[list[Any]] = []
+    summary_rows: list[list[Any]] = []
+
+    for index, name in enumerate(histories):
+        seed_curves = [histories[name][seed]["evaluation_return"] for seed in seeds]
+        mean, sd = aggregate_seed_curves(seed_curves, grid)
+        color = colors[index % len(colors)]
+        ax.plot(grid, mean, color=color, linewidth=2.1, label=f"{labels[name]} (n={len(seeds)})")
+        ax.fill_between(grid, mean - sd, mean + sd, color=color, alpha=0.17, linewidth=0)
+        for j, step in enumerate(grid):
+            per_seed = [float(histories[name][seed]["evaluation_return"][1][j]) for seed in seeds]
+            stats_rows.append([name, int(step), len(seeds), float(mean[j]), float(sd[j]), *per_seed])
+        peak = int(np.argmax(mean))
+        summary_rows.append([
+            name, labels[name], len(seeds), int(grid[-1]), float(mean[-1]), float(sd[-1]),
+            int(grid[peak]), float(mean[peak]),
+        ])
+
+    ax.set_xlabel("PPO transitions (summed across parallel environments)")
+    ax.set_ylabel("Mean evaluation episode return")
+    ax.set_title("PPO evaluation learning curves")
+    ax.grid(True, alpha=0.25)
+    ax.legend(frameon=False)
+    for suffix in (".png", ".pdf"):
+        fig.savefig(out_dir / f"ppo_sweep_learning_curve{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
+    plt.close(fig)
+    return stats_rows, summary_rows
+
+
+def _plot_reliability_metrics(
+    histories: dict[str, dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]],
+    labels: dict[str, str],
+    seeds: list[int],
+    out_dir: Path,
+) -> list[list[Any]]:
+    metric_keys = list(RELIABILITY_METRICS)
+    fig, axes = plt.subplots(3, 2, figsize=(12.0, 9.6), sharex=True, constrained_layout=True)
+    axes_flat = list(axes.flat)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+    stats_rows: list[list[Any]] = []
+
+    for panel_index, metric in enumerate(metric_keys):
+        spec = RELIABILITY_METRICS[metric]
+        ax = axes_flat[panel_index]
+        for config_index, name in enumerate(histories):
+            curves = [histories[name][seed][metric] for seed in seeds]
+            grid, _ = build_common_grid(curves)
+            mean, sd = aggregate_seed_curves(curves, grid)
+            scale = float(spec["scale"])
+            color = colors[config_index % len(colors)]
+            ax.plot(grid, mean * scale, color=color, linewidth=1.7, label=labels[name])
+            ax.fill_between(grid, (mean - sd) * scale, (mean + sd) * scale,
+                            color=color, alpha=0.15, linewidth=0)
+            for j, step in enumerate(grid):
+                seed_values = [float(histories[name][seed][metric][1][j]) for seed in seeds]
+                stats_rows.append([metric, name, int(step), len(seeds), float(mean[j]), float(sd[j]), *seed_values])
+        ax.set_title(spec["title"])
+        ax.set_ylabel(spec["ylabel"])
+        ax.grid(True, alpha=0.22)
+        if spec["ylim"] is not None:
+            ax.set_ylim(*spec["ylim"])
+        if panel_index >= 4:
+            ax.set_xlabel("PPO transitions (summed across parallel environments)")
+
+    handles, legend_labels = axes_flat[0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper center", ncol=len(histories), frameon=False)
+    fig.suptitle("PPO evaluation reliability metrics")
+    for suffix in (".png", ".pdf"):
+        fig.savefig(out_dir / f"ppo_sweep_reliability_metrics{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
+    plt.close(fig)
+    return stats_rows
+
+
+def _load_tensorboard_scalars(seed_log_dir: Path) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    event_files = list(seed_log_dir.rglob("events.out.tfevents.*"))
+    if not event_files:
+        return {}
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    except ImportError as exc:
+        raise RuntimeError(
+            "TensorBoard event files exist but TensorBoard is not installed. "
+            "Install it in the project environment with: pip install tensorboard"
+        ) from exc
+
+    by_tag: dict[str, dict[int, tuple[float, float]]] = {}
+    for event_dir in sorted({path.parent for path in event_files}):
+        accumulator = EventAccumulator(str(event_dir), size_guidance={"scalars": 0, "tensors": 0})
+        accumulator.Reload()
+        tags = accumulator.Tags()
+        for tag in tags.get("scalars", []):
+            for event in accumulator.Scalars(tag):
+                step, value = int(event.step), float(event.value)
+                if math.isfinite(value):
+                    previous = by_tag.setdefault(tag, {}).get(step)
+                    if previous is None or float(event.wall_time) >= previous[0]:
+                        by_tag[tag][step] = (float(event.wall_time), value)
+        tensor_tags = tags.get("tensors", [])
+        if tensor_tags:
+            try:
+                from tensorboard.util import tensor_util
+            except ImportError:
+                tensor_util = None
+            if tensor_util is not None:
+                for tag in tensor_tags:
+                    for event in accumulator.Tensors(tag):
+                        try:
+                            array = np.asarray(tensor_util.make_ndarray(event.tensor_proto)).reshape(-1)
+                            value = float(array[0]) if array.size else float("nan")
+                        except Exception:
+                            continue
+                        if math.isfinite(value):
+                            step = int(event.step)
+                            previous = by_tag.setdefault(tag, {}).get(step)
+                            if previous is None or float(event.wall_time) >= previous[0]:
+                                by_tag[tag][step] = (float(event.wall_time), value)
+
+    output: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+    for tag, values in by_tag.items():
+        ordered = np.asarray(sorted(values), dtype=np.float64)
+        output[tag] = (ordered, np.asarray([values[int(step)][1] for step in ordered], dtype=np.float64))
+    return output
+
+
+def _aggregate_diagnostic_series(
+    series: list[tuple[np.ndarray, np.ndarray]],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
+    """Aggregate TensorBoard series over their common observed range only."""
+    if len(series) < 2:
+        return None
+    for x, y in series:
+        if x.size != y.size or x.size < 2 or not np.all(np.isfinite(x)) or not np.all(np.isfinite(y)):
+            return None
+        if np.any(np.diff(x) <= 0):
+            return None
+    lower = max(float(x[0]) for x, _ in series)
+    upper = min(float(x[-1]) for x, _ in series)
+    if upper <= lower:
+        return None
+    grid = np.unique(np.concatenate([x[(x >= lower) & (x <= upper)] for x, _ in series]))
+    if grid.size < 2:
+        return None
+    matrix = np.vstack([np.interp(grid, x, y) for x, y in series])
+    return grid, np.mean(matrix, axis=0), np.std(matrix, axis=0, ddof=1)
+
+
+def _plot_training_diagnostics(
+    run_dirs: dict[str, Path],
+    labels: dict[str, str],
+    seeds: list[int],
+    out_dir: Path,
+) -> list[list[Any]]:
+    scalar_data: dict[str, dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]] = {}
+    try:
+        for name, run_dir in run_dirs.items():
+            scalar_data[name] = {}
+            for seed in seeds:
+                scalar_data[name][seed] = _load_tensorboard_scalars(run_dir / "logs" / f"seed_{seed}")
+    except RuntimeError as exc:
+        print(f"WARNING: PPO TensorBoard diagnostics were skipped: {exc}")
+        return []
+
+    if not any(series for config in scalar_data.values() for series in config.values()):
+        print("WARNING: no TensorBoard event files were found; optimization-diagnostic figure was not generated.")
+        return []
+
+    # Prefer train/std only when it is available for every seed/configuration;
+    # otherwise use entropy_loss consistently rather than mixing quantities.
+    std_tag = None
+    for candidate in ("train/std", "train/entropy_loss"):
+        if all(candidate in scalar_data[name][seed] for name in scalar_data for seed in seeds):
+            std_tag = candidate
+            break
+
+    tag_specs = [
+        ("rollout/ep_rew_mean", "Training episode return", "Mean rolling episode return"),
+        ("train/explained_variance", "Value-function fit", "Explained variance"),
+        ("train/approx_kl", "Policy-update size", "Approximate KL divergence (epoch average)"),
+        ("train/clip_fraction", "Policy clipping", "Clip fraction"),
+    ]
+    if std_tag is not None:
+        if std_tag == "train/std":
+            tag_specs.append((std_tag, "Policy exploration", "Action standard deviation [normalized units]"))
+        else:
+            tag_specs.append((std_tag, "Policy exploration", "Entropy loss"))
+
+    # Only retain tags recorded for every seed of every configuration.
+    available_specs = [
+        spec for spec in tag_specs
+        if all(spec[0] in scalar_data[name][seed] for name in scalar_data for seed in seeds)
+    ]
+    if not available_specs:
+        print("WARNING: TensorBoard files contain no common PPO diagnostic tags across all runs.")
+        return []
+
+    ncols = 2
+    nrows = int(math.ceil(len(available_specs) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(12.0, 3.7 * nrows), squeeze=False, constrained_layout=True)
+    axes_flat = list(axes.flat)
+    colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
+    stats_rows: list[list[Any]] = []
+    for panel_index, (tag, title, ylabel) in enumerate(available_specs):
+        ax = axes_flat[panel_index]
+        for config_index, name in enumerate(run_dirs):
+            series = [scalar_data[name][seed][tag] for seed in seeds]
+            aggregated = _aggregate_diagnostic_series(series)
+            if aggregated is None:
+                raise ValueError(f"Could not align TensorBoard metric {tag!r} across seeds for {name}.")
+            grid, mean, sd = aggregated
+            color = colors[config_index % len(colors)]
+            ax.plot(grid, mean, color=color, linewidth=1.7, label=labels[name])
+            ax.fill_between(grid, mean - sd, mean + sd, color=color, alpha=0.15, linewidth=0)
+            for j, step in enumerate(grid):
+                per_seed = [float(np.interp(step, *scalar_data[name][seed][tag])) for seed in seeds]
+                stats_rows.append([tag, name, int(step), len(seeds), float(mean[j]), float(sd[j]), *per_seed])
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.set_xlabel("PPO transitions (summed across parallel environments)")
+        ax.grid(True, alpha=0.22)
+
+    for ax in axes_flat[len(available_specs):]:
+        ax.set_visible(False)
+    handles, legend_labels = axes_flat[0].get_legend_handles_labels()
+    fig.legend(handles, legend_labels, loc="upper center", ncol=len(run_dirs), frameon=False)
+    fig.suptitle("PPO optimization diagnostics across independent training seeds")
+    if "train/approx_kl" in [spec[0] for spec in available_specs]:
+        fig.text(
+            0.01, 0.002,
+            "Note: approx_kl is logged as an epoch-level mean; SB3 applies target_kl stopping to individual minibatches.",
+            ha="left", va="bottom", fontsize=8,
+        )
+    for suffix in (".png", ".pdf"):
+        fig.savefig(out_dir / f"ppo_sweep_training_diagnostics{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
+    plt.close(fig)
+    return stats_rows
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Plot the cross-seed learning-curve comparison for a PPO sweep.")
-    parser.add_argument("--manifest", required=True, help="Path to sweep_manifest.json created by sweep_ppo.py")
-    parser.add_argument("--out-dir", default=None, help="Output directory (default: <sweep-root>/plots)")
+    parser = argparse.ArgumentParser(description="Plot cross-seed PPO learning, diagnostics and reliability comparisons.")
+    parser.add_argument("--manifest", required=True, help="sweep_manifest.json created by sweep_ppo.py")
+    parser.add_argument("--out-dir", default=None)
     args = parser.parse_args(argv)
 
     manifest_path = Path(args.manifest).expanduser().resolve()
     if not manifest_path.is_file():
         raise SystemExit(f"Sweep manifest not found: {manifest_path}")
-    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    seeds = [int(s) for s in manifest.get("seeds", [])]
+    manifest = _read_json(manifest_path)
+    if manifest.get("schema_version") != 3 or manifest.get("status") != "completed":
+        raise SystemExit("Only a fully completed schema-version-3 sweep can be plotted.")
+
+    seeds = [int(seed) for seed in manifest.get("seeds", [])]
     entries = manifest.get("configurations", [])
-    if not seeds or not entries:
-        raise SystemExit("Manifest does not contain training seeds and configurations.")
+    if len(seeds) < 2 or len(set(seeds)) != len(seeds):
+        raise SystemExit("At least two unique training seeds are required for mean ± sample-SD plots.")
+    if len(entries) < 2:
+        raise SystemExit("At least two completed configurations are required for comparison plots.")
+
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else manifest_path.parent / "plots"
     out_dir.mkdir(parents=True, exist_ok=True)
-
-    histories: dict[str, dict[int, tuple[np.ndarray, np.ndarray]]] = {}
+    histories: dict[str, dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]] = {}
     labels: dict[str, str] = {}
+    run_dirs: dict[str, Path] = {}
     raw_rows: list[list[Any]] = []
-    all_curves: list[tuple[np.ndarray, np.ndarray]] = []
+    seen_names: set[str] = set()
 
     for entry in entries:
         name = str(entry.get("name"))
-        label = str(entry.get("label") or name.title())
-        run_value = entry.get("run_dir")
-        if not run_value:
-            print(f"WARNING: {name} has no completed run directory in the manifest; skipped.")
-            continue
-        run_dir = Path(run_value).expanduser().resolve()
-        seed_curves: dict[int, tuple[np.ndarray, np.ndarray]] = {}
+        if name in seen_names:
+            raise SystemExit(f"Duplicate configuration entry in manifest: {name}")
+        seen_names.add(name)
+        if entry.get("status") != "completed" or not entry.get("run_dir"):
+            raise SystemExit(f"Configuration {name!r} is incomplete in the sweep manifest.")
+        run_value = Path(str(entry["run_dir"])).expanduser()
+        run_dir = run_value.resolve() if run_value.is_absolute() else (manifest_path.parent / run_value).resolve()
+        if not run_dir.is_dir():
+            raise SystemExit(f"Run directory for {name!r} does not exist: {run_dir}")
+        seed_histories = _validate_run_records(run_dir, entry, manifest, seeds)
+        histories[name] = seed_histories
+        labels[name] = str(entry.get("label") or name.title())
+        run_dirs[name] = run_dir
+
         for seed in seeds:
-            curve = load_seed_curve(run_dir, seed)
-            if curve is None:
-                continue
-            seed_curves[seed] = curve
-            # Preserve the raw per-episode evaluation returns for auditability.
             npz_path = run_dir / "logs" / f"seed_{seed}" / "evaluations.npz"
             with np.load(npz_path, allow_pickle=False) as data:
-                steps = np.asarray(data["timesteps"], dtype=float).reshape(-1)
-                results = np.asarray(data["results"], dtype=float)
+                steps = np.asarray(data["timesteps"], dtype=np.int64).reshape(-1)
+                results = np.asarray(data["results"], dtype=np.float64)
             if results.ndim == 1:
                 results = results.reshape(-1, 1)
             for step, row in zip(steps, results):
-                for ep_index, value in enumerate(row, start=1):
-                    if np.isfinite(step) and np.isfinite(value):
-                        raw_rows.append([name, seed, int(step), ep_index, float(value)])
-        if seed_curves:
-            histories[name] = seed_curves
-            labels[name] = label
-            all_curves.extend(seed_curves.values())
-            if len(seed_curves) < 2:
-                print(f"WARNING: {name} has only {len(seed_curves)} seed; no sample-SD band can be estimated.")
+                for episode_index, value in enumerate(row, start=1):
+                    raw_rows.append([name, seed, int(step), episode_index, float(value)])
 
-    if not histories:
-        raise SystemExit("No evaluation histories were found. Ensure the sweep training runs completed.")
+    # Require one exact evaluation schedule across all configurations and seeds.
+    all_return_curves = [histories[name][seed]["evaluation_return"] for name in histories for seed in seeds]
+    common_steps, _ = build_common_grid(all_return_curves)
 
-    grid, interpolated = build_common_grid(all_curves)
-    color_cycle = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
-    fig, ax = plt.subplots(figsize=(9.4, 5.8))
-    summary_rows: list[list[Any]] = []
-    stats_rows: list[list[Any]] = []
+    return_stats, summary_rows = _plot_return_curve(histories, labels, seeds, out_dir)
+    reliability_stats = _plot_reliability_metrics(histories, labels, seeds, out_dir)
+    diagnostic_stats = _plot_training_diagnostics(run_dirs, labels, seeds, out_dir)
 
-    for index, entry in enumerate(entries):
-        name = str(entry.get("name"))
-        if name not in histories:
-            continue
-        seed_curves = histories[name]
-        ordered_seeds = sorted(seed_curves)
-        aligned = [seed_curves[s] for s in ordered_seeds]
-        mean, sd = aggregate_seed_curves(aligned, grid)
-        color = color_cycle[index % len(color_cycle)]
-        ax.plot(grid, mean, color=color, linewidth=2.0,
-                label=f"{labels[name]} (n={len(ordered_seeds)} seeds)")
-        if len(ordered_seeds) >= 2:
-            ax.fill_between(grid, mean - sd, mean + sd, color=color, alpha=0.18, linewidth=0)
-        for j, step in enumerate(grid):
-            per_seed_values = [
-                float(np.interp(step, seed_curves[s][0], seed_curves[s][1])) if s in seed_curves else ""
-                for s in sorted(seeds)
-            ]
-            stats_rows.append([
-                name, int(step), len(ordered_seeds), float(mean[j]),
-                float(sd[j]) if np.isfinite(sd[j]) else "",
-                *per_seed_values,
-            ])
-        best_i = int(np.nanargmax(mean))
-        summary_rows.append([
-            name, labels[name], len(ordered_seeds), int(grid[-1]), float(mean[-1]),
-            float(sd[-1]) if np.isfinite(sd[-1]) else "",
-            int(grid[best_i]), float(mean[best_i]),
-        ])
+    _write_csv(out_dir / "ppo_sweep_raw_evaluation_returns.csv", [
+        "configuration", "training_seed", "training_transitions", "evaluation_episode", "episode_return",
+    ], raw_rows)
+    _write_csv(out_dir / "ppo_sweep_learning_curve_stats.csv", [
+        "configuration", "training_transitions", "n_training_seeds", "mean_eval_return",
+        "sample_sd_across_seeds", *[f"seed_{seed}_mean_return" for seed in seeds],
+    ], return_stats)
+    _write_csv(out_dir / "ppo_sweep_reliability_metrics_stats.csv", [
+        "metric", "configuration", "training_transitions", "n_training_seeds", "mean_across_seeds",
+        "sample_sd_across_seeds", *[f"seed_{seed}_value" for seed in seeds],
+    ], reliability_stats)
+    if diagnostic_stats:
+        _write_csv(out_dir / "ppo_sweep_training_diagnostics_stats.csv", [
+            "tensorboard_tag", "configuration", "training_transitions", "n_training_seeds", "mean_across_seeds",
+            "sample_sd_across_seeds", *[f"seed_{seed}_value" for seed in seeds],
+        ], diagnostic_stats)
 
-    ax.set_xlabel("PPO training transitions")
-    ax.set_ylabel("Mean evaluation episode return")
-    ax.set_title("PPO configuration comparison")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False)
-    fig.tight_layout()
-    for suffix in (".png", ".pdf"):
-        fig.savefig(out_dir / f"ppo_sweep_learning_curve{suffix}", dpi=300 if suffix == ".png" else None,
-                    bbox_inches="tight")
-    plt.close(fig)
+    _write_csv(out_dir / "ppo_sweep_final_summary.csv", [
+        "configuration", "label", "n_training_seeds", "final_common_timestep", "final_mean_eval_return",
+        "final_sample_sd", "peak_mean_return_timestep", "peak_mean_return",
+    ], summary_rows)
 
-    raw_path = out_dir / "ppo_sweep_raw_evaluation_returns.csv"
-    _write_raw_csv(raw_path, raw_rows)
-    stats_path = out_dir / "ppo_sweep_learning_curve_stats.csv"
-    with stats_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow([
-            "configuration", "training_timesteps", "n_training_seeds", "mean_eval_return",
-            "sample_sd_across_seeds", *[f"seed_{s}_mean_return" for s in sorted(seeds)],
-        ])
-        writer.writerows(stats_rows)
-    summary_path = out_dir / "ppo_sweep_final_summary.csv"
-    with summary_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        writer.writerow([
-            "configuration", "label", "n_training_seeds", "final_timestep", "final_mean_return",
-            "final_sample_sd", "best_timestep", "best_mean_return",
-        ])
-        writer.writerows(summary_rows)
-
-    print(f"Saved: {out_dir / 'ppo_sweep_learning_curve.png'}")
-    print(f"Saved: {out_dir / 'ppo_sweep_learning_curve.pdf'}")
-    print(f"Saved: {raw_path}")
-    print(f"Saved: {stats_path}")
-    print(f"Saved: {summary_path}")
-    if interpolated:
-        print("Note: checkpoint grids differed; interpolation was restricted to the shared observed timestep range.")
-    print("Band: mean ± 1 sample SD across independent training-seed means (not across MC episodes).")
+    print(f"Evaluation checkpoints: {common_steps[0]:,} to {common_steps[-1]:,} ({len(common_steps)} points).")
+    for filename in (
+        "ppo_sweep_learning_curve.png", "ppo_sweep_learning_curve.pdf",
+        "ppo_sweep_reliability_metrics.png", "ppo_sweep_reliability_metrics.pdf",
+    ):
+        print(f"Saved: {out_dir / filename}")
+    if diagnostic_stats:
+        print(f"Saved: {out_dir / 'ppo_sweep_training_diagnostics.png'}")
+        print(f"Saved: {out_dir / 'ppo_sweep_training_diagnostics.pdf'}")
+    else:
+        print("Training-diagnostic figure was not generated because common TensorBoard tags were unavailable.")
+    print(f"Saved: {out_dir / 'ppo_sweep_raw_evaluation_returns.csv'}")
+    print(f"Saved: {out_dir / 'ppo_sweep_learning_curve_stats.csv'}")
+    print(f"Saved: {out_dir / 'ppo_sweep_reliability_metrics_stats.csv'}")
+    print(f"Saved: {out_dir / 'ppo_sweep_final_summary.csv'}")
+    print("Bands: mean ± 1 sample SD across independent training seeds; not confidence intervals.")
+    print("Evaluation episode returns are averaged within each seed before cross-seed statistics are computed.")
     return 0
 
 

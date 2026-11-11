@@ -65,7 +65,7 @@ reward:
   include_ae_in_productivity: true
   productivity_weight: 500
   omega_cost_weight: 2
-  termination_penalty: 425
+  termination_penalty: 1000
   truncation_penalty: 425
   pass_completion_bonus: 500
   failure_progress_penalty_weight: 1.0
