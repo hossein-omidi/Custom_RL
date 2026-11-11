@@ -14,8 +14,8 @@ seeds: [0]
 timing:
   dt: 1.0e-3                 # RK4 substep [s]
   n_substeps: 10             # env/safety step = dt * n_substeps
-  controller_hold_env_steps: 1
-  max_episode_steps: 250000
+  controller_hold_env_steps: 5
+  max_episode_steps: 100000
 
 # ---------------------------------------------------------------------------
 # Plant / safety (custom_rl.plants.plate + registration defaults)
@@ -63,11 +63,11 @@ reward:
   wdot_clip: null
   ap_productive_target: 0.5
   include_ae_in_productivity: true
-  productivity_weight: 340
+  productivity_weight: 500
   omega_cost_weight: 2
   termination_penalty: 425
   truncation_penalty: 425
-  pass_completion_bonus: 750
+  pass_completion_bonus: 500
   failure_progress_penalty_weight: 1.0
   productivity_gate_enabled: true
   productivity_w_gate: 1.5e-3
@@ -81,16 +81,16 @@ reward:
 # PPO / training hyperparameters
 # ---------------------------------------------------------------------------
 train:
-  total_timesteps: 1000000
+  total_timesteps: 2000000
   n_envs: 3
   vec_env: subproc
   start_method: spawn
   device: cpu
-  progress_bar: false
+  progress_bar: true
   learning_rate: 2.5e-4
   final_learning_rate: 2.5e-5
-  n_steps: 2048
-  batch_size: 256
+  n_steps: 4096
+  batch_size: 512
   n_epochs: 8
   gamma: null                 # null => preserve 1 ms physical horizon
   gae_lambda: null

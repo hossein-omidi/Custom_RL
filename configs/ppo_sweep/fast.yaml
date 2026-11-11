@@ -1,0 +1,33 @@
+# Fast PPO configuration: lower optimizer cost per collected transition.
+# Shared physical settings are inherited from configs/base.yaml.
+# Mode (roughing/finishing) is selected by scripts/sweep_ppo.py.
+extends: ../base.yaml
+
+seeds: [0, 1, 2]
+run_name: null
+
+# Prevent the inherited plant.ap_max from being passed to roughing as --ap-max.
+# Finishing receives its explicit --ap-max from the sweep runner.
+plant:
+  ap_max: null
+
+train:
+  total_timesteps: 1007616
+  n_envs: 3
+  vec_env: subproc
+  start_method: spawn
+  device: cpu
+  progress_bar: false
+  learning_rate: 0.0003
+  final_learning_rate: 0.00003
+  n_steps: 1024
+  batch_size: 512
+  n_epochs: 4
+  gamma: 0.9999
+  gae_lambda: 0.98
+  clip_range: 0.20
+  final_clip_range: 0.10
+  n_eval_episodes: 10
+  eval_freq: 100000
+  checkpoint_freq: 200000
+  callback_eval_seed: 10000

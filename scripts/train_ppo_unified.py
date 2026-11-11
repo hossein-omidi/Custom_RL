@@ -103,8 +103,8 @@ PPO_N_EPOCHS = 8
 
 # Long-horizon settings per 1 ms environment/controller transition.
 # gamma horizon ~= 200 s; GAE trace horizon ~= 2 s.
-PPO_GAMMA_PER_ENV_STEP = 0.999995
-PPO_GAE_LAMBDA_PER_ENV_STEP = 0.9995
+PPO_GAMMA_PER_ENV_STEP = 0.9999
+PPO_GAE_LAMBDA_PER_ENV_STEP = 0.98
 
 PPO_CLIP_RANGE = 0.20
 PPO_FINAL_CLIP_RANGE = 0.10
@@ -113,11 +113,11 @@ PPO_VF_COEF = 0.5
 PPO_MAX_GRAD_NORM = 0.5
 PPO_TARGET_KL = 0.02
 PPO_NET_ARCH = [256, 256]
-PPO_LOG_STD_INIT = -1.5
+PPO_LOG_STD_INIT = -1.0
 PPO_ADAM_EPS = 1e-5
 
 # Initial action mean: mid-range spindle speed and a low initial ap in roughing.
-SAFE_AP_FRACTION = 0.07
+SAFE_AP_FRACTION = 0.15
 
 # PPO transitions equal fine environment transitions because controller hold=1.
 DEFAULT_TOTAL_TIMESTEPS = 1_000_000
