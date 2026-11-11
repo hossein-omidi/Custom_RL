@@ -9,5 +9,3 @@ reward: dense
 ap_max: 2.0
 plant:
   ap_max: 2.0
-reward:
-  productivity_weight: 40.0

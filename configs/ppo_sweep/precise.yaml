@@ -20,7 +20,7 @@ train:
   vec_env: subproc
   start_method: spawn
   device: cpu
-  progress_bar: false
+  progress_bar: true
   learning_rate: 0.00015
   final_learning_rate: 0.000015
   n_steps: 4096

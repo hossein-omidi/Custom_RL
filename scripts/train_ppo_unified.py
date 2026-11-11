@@ -75,7 +75,10 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import DummyVecEnv, SubprocVecEnv
 
 from custom_rl import register_envs
-from custom_rl.envs.registration import gym_make_plate
+from custom_rl.envs.registration import (
+    DEFAULT_FINISH_PRODUCTIVITY_WEIGHT,
+    gym_make_plate,
+)
 from custom_rl.eval.pipeline import plate_env_kwargs
 from custom_rl.plants.plate import omega_to_rpm
 from ppo_reliability import reliability_checkpoint_rank, summarize_reliability_episodes
@@ -659,6 +662,10 @@ def _build_env_kwargs(args: argparse.Namespace) -> dict[str, Any]:
         kwargs.update(REWARD_KWARGS)
     if args.env_id == ENV_ID_FINISHING:
         kwargs["ap_max"] = float(args.ap_max)
+        # REWARD_KWARGS above sets productivity_weight=420 for all dense/productive
+        # runs; finishing must keep the registration-specific weight (40.0) so the
+        # finishing objective is not silently changed to the roughing scale.
+        kwargs["productivity_weight"] = DEFAULT_FINISH_PRODUCTIVITY_WEIGHT
     return kwargs
 
 
