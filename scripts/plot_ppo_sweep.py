@@ -38,13 +38,13 @@ RELIABILITY_METRICS = {
     },
     "median_completed_productivity": {
         "title": "Completed-pass productivity reward",
-        "ylabel": "Seed-averaged median cumulative reward [reward units]",
+        "ylabel": "Cumulative reward",
         "scale": 1.0,
         "ylim": None,
     },
     "median_progress": {
         "title": "Final pass progress",
-        "ylabel": "Seed-averaged median progress [%]",
+        "ylabel": "Pass progress [%]",
         "scale": 100.0,
         "ylim": (0.0, 100.0),
     },
@@ -61,7 +61,7 @@ DIAGNOSTIC_SPECS = {
     "train/explained_variance": ("Value-function fit", "Explained variance"),
     "train/approx_kl": ("Policy-update size", "Approximate KL divergence"),
     "train/clip_fraction": ("Policy clipping", "Clip fraction"),
-    "train/std": ("Policy exploration", "Action standard deviation [normalized units]"),
+    "train/std": ("Policy exploration", "Policy distribution SD (pre-action clipping)"),
     "train/entropy_loss": ("Policy exploration", "Entropy loss"),
 }
 
@@ -341,7 +341,7 @@ def _plot_return_curve(
     all_curves = [histories[name][seed]["evaluation_return"] for name in histories for seed in seeds]
     grid, _ = build_common_grid(all_curves)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
-    fig, ax = plt.subplots(figsize=(9.0, 5.6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(7.4, 4.5), constrained_layout=True)
     stats_rows: list[list[Any]] = []
     summary_rows: list[list[Any]] = []
 
@@ -349,7 +349,8 @@ def _plot_return_curve(
         seed_curves = [histories[name][seed]["evaluation_return"] for seed in seeds]
         mean, sd = aggregate_seed_curves(seed_curves, grid)
         color = colors[index % len(colors)]
-        ax.plot(grid, mean, color=color, linewidth=2.1, label=f"{labels[name]} (n={len(seeds)})")
+        ax.plot(grid, mean, color=color, linewidth=2.0, marker="o", markersize=3.2,
+                label=f"{labels[name]} (n={len(seeds)})")
         ax.fill_between(grid, mean - sd, mean + sd, color=color, alpha=0.17, linewidth=0)
         for j, step in enumerate(grid):
             per_seed = [float(histories[name][seed]["evaluation_return"][1][j]) for seed in seeds]
@@ -360,11 +361,12 @@ def _plot_return_curve(
             int(grid[peak]), float(mean[peak]),
         ])
 
-    ax.set_xlabel("PPO transitions (summed across parallel environments)")
-    ax.set_ylabel("Mean evaluation episode return")
-    ax.set_title("PPO evaluation learning curves")
-    ax.grid(True, alpha=0.25)
-    ax.legend(frameon=False)
+    ax.set_xlabel("Training transitions (across all environments)")
+    ax.set_ylabel("Evaluation episode return")
+    ax.grid(axis="y", alpha=0.22, linewidth=0.65)
+    ax.legend(frameon=False, loc="lower center", bbox_to_anchor=(0.5, 1.015),
+              ncol=len(histories), borderaxespad=0.0)
+    ax.margins(x=0.01)
     for suffix in (".png", ".pdf"):
         fig.savefig(out_dir / f"ppo_sweep_learning_curve{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
     plt.close(fig)
@@ -376,42 +378,79 @@ def _plot_reliability_metrics(
     labels: dict[str, str],
     seeds: list[int],
     out_dir: Path,
+    *,
+    excluded_metrics: frozenset[str] = frozenset(),
 ) -> list[list[Any]]:
+    """Main 2x2 reliability panel and supplementary 1x2 panel.
+
+    Statistical data are *not* clipped. Only the displayed SD envelope is
+    bounded for quantities that are physically confined to [0, 100] percent.
+    """
     metric_keys = list(RELIABILITY_METRICS)
-    fig, axes = plt.subplots(3, 2, figsize=(12.0, 9.6), sharex=True, constrained_layout=True)
-    axes_flat = list(axes.flat)
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["C0", "C1", "C2"])
     stats_rows: list[list[Any]] = []
+    main_keys = (
+        "pass_completion_rate", "safety_termination_rate",
+        "median_completed_productivity", "median_progress",
+    )
+    supplemental_keys = ("truncation_rate", "mean_max_displacement_m")
 
-    for panel_index, metric in enumerate(metric_keys):
-        spec = RELIABILITY_METRICS[metric]
-        ax = axes_flat[panel_index]
-        for config_index, name in enumerate(histories):
-            curves = [histories[name][seed][metric] for seed in seeds]
-            grid, _ = build_common_grid(curves)
-            mean, sd = aggregate_seed_curves(curves, grid)
-            scale = float(spec["scale"])
-            color = colors[config_index % len(colors)]
-            ax.plot(grid, mean * scale, color=color, linewidth=1.7, label=labels[name])
-            ax.fill_between(grid, (mean - sd) * scale, (mean + sd) * scale,
-                            color=color, alpha=0.15, linewidth=0)
-            for j, step in enumerate(grid):
-                seed_values = [float(histories[name][seed][metric][1][j]) for seed in seeds]
-                stats_rows.append([metric, name, int(step), len(seeds), float(mean[j]), float(sd[j]), *seed_values])
-        ax.set_title(spec["title"])
-        ax.set_ylabel(spec["ylabel"])
-        ax.grid(True, alpha=0.22)
-        if spec["ylim"] is not None:
-            ax.set_ylim(*spec["ylim"])
-        if panel_index >= 4:
-            ax.set_xlabel("PPO transitions (summed across parallel environments)")
+    def render(keys: tuple[str, ...], filename: str) -> None:
+        fig, axes = plt.subplots(
+            2 if len(keys) == 4 else 1, 2,
+            figsize=(10.2, 6.9 if len(keys) == 4 else 3.65),
+            squeeze=False, sharex=True, constrained_layout=True,
+        )
+        axs = list(axes.flat)
+        for i, metric in enumerate(keys):
+            spec = RELIABILITY_METRICS[metric]
+            ax = axs[i]
+            if metric in excluded_metrics:
+                ax.set_title(f"({chr(ord('a') + i)}) {spec['title']}", loc="left")
+                ax.text(0.5, 0.5, "Not reported\nHeld-action callback omits\nintermediate-step data",
+                        ha="center", va="center", transform=ax.transAxes, fontsize=10)
+                ax.set_xticks([])
+                ax.set_yticks([])
+                for spine in ax.spines.values():
+                    spine.set_visible(False)
+                continue
+            for config_index, name in enumerate(histories):
+                curves = [histories[name][seed][metric] for seed in seeds]
+                grid, _ = build_common_grid(curves)
+                mean, sd = aggregate_seed_curves(curves, grid)
+                color = colors[config_index % len(colors)]
+                scale = float(spec["scale"])
+                lower, upper = (mean - sd) * scale, (mean + sd) * scale
+                if spec["ylim"] is not None:
+                    lower = np.clip(lower, *spec["ylim"])
+                    upper = np.clip(upper, *spec["ylim"])
+                ax.plot(grid, mean * scale, color=color, linewidth=1.8,
+                        marker="o", markersize=2.8, label=labels[name])
+                ax.fill_between(grid, lower, upper, color=color, alpha=0.16, linewidth=0)
+                if metric not in metric_set_recorded:
+                    for j, step in enumerate(grid):
+                        values = [float(histories[name][seed][metric][1][j]) for seed in seeds]
+                        stats_rows.append([
+                            metric, name, int(step), len(seeds), float(mean[j]), float(sd[j]), *values
+                        ])
+            metric_set_recorded.add(metric)
+            ax.set_title(f"({chr(ord('a') + i)}) {spec['title']}", loc="left")
+            ax.set_ylabel(spec["ylabel"])
+            ax.grid(axis="y", alpha=0.24, linewidth=0.6)
+            if spec["ylim"] is not None:
+                ax.set_ylim(*spec["ylim"])
+            ax.margins(x=0.01)
+            if len(keys) == 2 or i >= 2:
+                ax.set_xlabel("Training transitions (across all environments)")
+        handles, captions = axs[0].get_legend_handles_labels()
+        fig.legend(handles, captions, loc="upper center", bbox_to_anchor=(0.5, 1.055), ncol=len(histories), frameon=False)
+        fig.savefig(out_dir / (filename + ".png"), dpi=300, bbox_inches="tight")
+        fig.savefig(out_dir / (filename + ".pdf"), bbox_inches="tight")
+        plt.close(fig)
 
-    handles, legend_labels = axes_flat[0].get_legend_handles_labels()
-    fig.legend(handles, legend_labels, loc="upper center", ncol=len(histories), frameon=False)
-    fig.suptitle("PPO evaluation reliability metrics")
-    for suffix in (".png", ".pdf"):
-        fig.savefig(out_dir / f"ppo_sweep_reliability_metrics{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
-    plt.close(fig)
+    metric_set_recorded: set[str] = set()
+    render(main_keys, "ppo_sweep_reliability_metrics")
+    render(supplemental_keys, "ppo_sweep_reliability_supplement")
     return stats_rows
 
 
@@ -469,7 +508,13 @@ def _load_tensorboard_scalars(seed_log_dir: Path) -> dict[str, tuple[np.ndarray,
 def _aggregate_diagnostic_series(
     series: list[tuple[np.ndarray, np.ndarray]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
-    """Aggregate TensorBoard series over their common observed range only."""
+    """Aggregate at shared, actually recorded TensorBoard steps; do not interpolate.
+
+    Different PPO configurations may log after different rollout sizes. Within
+    one configuration, independent seeds should share update-step coordinates.
+    If an event is missing, use the intersection of observed steps instead of
+    fabricating a value at an unobserved optimizer update.
+    """
     if len(series) < 2:
         return None
     for x, y in series:
@@ -477,14 +522,18 @@ def _aggregate_diagnostic_series(
             return None
         if np.any(np.diff(x) <= 0):
             return None
-    lower = max(float(x[0]) for x, _ in series)
-    upper = min(float(x[-1]) for x, _ in series)
-    if upper <= lower:
-        return None
-    grid = np.unique(np.concatenate([x[(x >= lower) & (x <= upper)] for x, _ in series]))
+    grid = np.asarray(series[0][0], dtype=np.float64)
+    for x, _ in series[1:]:
+        grid = np.intersect1d(grid, x, assume_unique=True)
     if grid.size < 2:
         return None
-    matrix = np.vstack([np.interp(grid, x, y) for x, y in series])
+    rows = []
+    for x, y in series:
+        indices = np.searchsorted(x, grid)
+        if np.any(indices >= x.size) or not np.array_equal(x[indices], grid):
+            raise ValueError("Internal error: common TensorBoard steps could not be mapped to raw samples.")
+        rows.append(y[indices])
+    matrix = np.vstack(rows)
     return grid, np.mean(matrix, axis=0), np.std(matrix, axis=0, ddof=1)
 
 
@@ -494,6 +543,7 @@ def _plot_training_diagnostics(
     seeds: list[int],
     out_dir: Path,
 ) -> list[list[Any]]:
+    out_dir.mkdir(parents=True, exist_ok=True)
     scalar_data: dict[str, dict[int, dict[str, tuple[np.ndarray, np.ndarray]]]] = {}
     try:
         for name, run_dir in run_dirs.items():
@@ -524,7 +574,7 @@ def _plot_training_diagnostics(
     ]
     if std_tag is not None:
         if std_tag == "train/std":
-            tag_specs.append((std_tag, "Policy exploration", "Action standard deviation [normalized units]"))
+            tag_specs.append((std_tag, "Policy exploration", "Policy Gaussian SD (pre-clipping)"))
         else:
             tag_specs.append((std_tag, "Policy exploration", "Entropy loss"))
 
@@ -555,24 +605,28 @@ def _plot_training_diagnostics(
             ax.plot(grid, mean, color=color, linewidth=1.7, label=labels[name])
             ax.fill_between(grid, mean - sd, mean + sd, color=color, alpha=0.15, linewidth=0)
             for j, step in enumerate(grid):
-                per_seed = [float(np.interp(step, *scalar_data[name][seed][tag])) for seed in seeds]
+                per_seed = []
+                for seed in seeds:
+                    raw_x, raw_y = scalar_data[name][seed][tag]
+                    raw_idx = np.searchsorted(raw_x, step)
+                    if raw_idx >= raw_x.size or raw_x[raw_idx] != step:
+                        raise ValueError(f"Unobserved TensorBoard step {step:g}: {name}/seed_{seed}/{tag}")
+                    per_seed.append(float(raw_y[raw_idx]))
                 stats_rows.append([tag, name, int(step), len(seeds), float(mean[j]), float(sd[j]), *per_seed])
         ax.set_title(title)
         ax.set_ylabel(ylabel)
-        ax.set_xlabel("PPO transitions (summed across parallel environments)")
-        ax.grid(True, alpha=0.22)
+        ax.set_xlabel("Training transitions (across all environments)")
+        ax.grid(axis="y", alpha=0.24, linewidth=0.6)
 
     for ax in axes_flat[len(available_specs):]:
         ax.set_visible(False)
     handles, legend_labels = axes_flat[0].get_legend_handles_labels()
     fig.legend(handles, legend_labels, loc="upper center", ncol=len(run_dirs), frameon=False)
-    fig.suptitle("PPO optimization diagnostics across independent training seeds")
-    if "train/approx_kl" in [spec[0] for spec in available_specs]:
-        fig.text(
-            0.01, 0.002,
-            "Note: approx_kl is logged as an epoch-level mean; SB3 applies target_kl stopping to individual minibatches.",
-            ha="left", va="bottom", fontsize=8,
-        )
+    fig.suptitle("PPO optimization diagnostics across training configurations")
+    # PPO configurations have different optimizer-update schedules, so each
+    # configuration retains its own observed x-coordinates. Within a profile,
+    # only TensorBoard steps recorded for EVERY training seed are aggregated.
+    # No interpolation, extrapolation or visual smoothing is performed.
     for suffix in (".png", ".pdf"):
         fig.savefig(out_dir / f"ppo_sweep_training_diagnostics{suffix}", dpi=300 if suffix == ".png" else None, bbox_inches="tight")
     plt.close(fig)
@@ -639,7 +693,17 @@ def main(argv: list[str] | None = None) -> int:
     common_steps, _ = build_common_grid(all_return_curves)
 
     return_stats, summary_rows = _plot_return_curve(histories, labels, seeds, out_dir)
-    reliability_stats = _plot_reliability_metrics(histories, labels, seeds, out_dir)
+    held_steps = int(next(iter(manifest["configurations"]))["effective_run_signature"]["environment"]["controller_hold_env_steps"])
+    excluded_metrics = (
+        frozenset({"median_completed_productivity", "mean_max_displacement_m"})
+        if held_steps > 1 else frozenset()
+    )
+    if excluded_metrics:
+        print("WARNING: held-action callback did not aggregate intermediate-step reward components/peaks; "
+              "the affected reliability panels have been suppressed.")
+    reliability_stats = _plot_reliability_metrics(
+        histories, labels, seeds, out_dir, excluded_metrics=excluded_metrics
+    )
     diagnostic_stats = _plot_training_diagnostics(run_dirs, labels, seeds, out_dir)
 
     _write_csv(out_dir / "ppo_sweep_raw_evaluation_returns.csv", [

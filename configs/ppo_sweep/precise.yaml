@@ -15,7 +15,7 @@ plant:
   ap_max: null
 
 train:
-  total_timesteps: 1007616
+  total_timesteps: 491520
   n_envs: 3
   vec_env: subproc
   start_method: spawn
@@ -30,7 +30,7 @@ train:
   gae_lambda: 0.9995
   clip_range: 0.15
   final_clip_range: 0.075
-  n_eval_episodes: 10
-  eval_freq: 50000
-  checkpoint_freq: 200000
+  n_eval_episodes: 5
+  eval_freq: 122880
+  checkpoint_freq: 245760
   callback_eval_seed: 10000
