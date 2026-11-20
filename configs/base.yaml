@@ -81,7 +81,7 @@ reward:
 # PPO / training hyperparameters
 # ---------------------------------------------------------------------------
 train:
-  total_timesteps: 737,280
+  total_timesteps: 737280
   n_envs: 3
   vec_env: subproc
   start_method: spawn
@@ -96,10 +96,10 @@ train:
   gae_lambda: null
   clip_range: 0.20
   final_clip_range: 0.10
-  n_eval_episodes: 10
-  eval_freq: 100000
-  checkpoint_freq: 200000
-  callback_eval_seed: null
+  n_eval_episodes: 5
+  eval_freq: 73728
+  checkpoint_freq: 245760
+  callback_eval_seed: 10000
 
 # ---------------------------------------------------------------------------
 # Post-training evaluation (experiment.py eval / run)

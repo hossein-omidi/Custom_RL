@@ -1,7 +1,7 @@
 # Balanced PPO configuration: preserve the November 11 trainer baseline.
 # Shared timing and exposed stochastic settings are inherited from configs/base.yaml.
-# Plant/reward dictionaries are not forwarded by the current trainer CLI;
-# their effective values come from the existing registration/trainer defaults.
+# The reward_params mapping in base.yaml is forwarded to the reward object and
+# checked against the actual runtime attributes during trainer preflight.
 # Mode (roughing/finishing) is selected by scripts/sweep_ppo.py.
 extends: ../base.yaml
 
@@ -14,7 +14,7 @@ plant:
   ap_max: null
 
 train:
-  total_timesteps: 491520
+  total_timesteps: 737280
   n_envs: 3
   vec_env: subproc
   start_method: spawn
@@ -30,6 +30,6 @@ train:
   clip_range: 0.20
   final_clip_range: 0.10
   n_eval_episodes: 5
-  eval_freq: 122880
+  eval_freq: 73728
   checkpoint_freq: 245760
   callback_eval_seed: 10000
